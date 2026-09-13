@@ -19,6 +19,7 @@ function harness() {
   const events = new EventTarget()
   const h = {
     timers,
+    now: 0,
     consoleErrors: [],
     workers: [],
     canvasError: null,
@@ -94,7 +95,7 @@ function harness() {
     Blob,
     ArrayBuffer,
     Uint8ClampedArray,
-    performance,
+    performance: { now: () => h.now },
     console: { error: (...args) => h.consoleErrors.push(args) },
     navigator: { userAgent: 'test-browser', hardwareConcurrency: 4 },
     document: {
@@ -232,6 +233,58 @@ for (const started of [false, true]) {
   })
 }
 
+test('timeout retains encoder frame progress and bounds the stage timeline', async () => {
+  const h = harness()
+  const d = h.diagnostic()
+  const result = h.converter.convert(bitmaps, info, d)
+  let settled = false
+  result.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  const worker = await h.waitForPost()
+  const id = worker.messages[0].id
+  worker.emit('message', { data: { id, type: 'started' } })
+  for (let index = 0; index < 3; index++) {
+    h.now = 1000 + index * 250
+    worker.emit('message', {
+      data: {
+        id,
+        type: 'progress',
+        progress: {
+          stage: 'compress-frame',
+          frameCount: 275,
+          framesCompressed: index,
+          frame: { index, width: 426, height: 240 },
+          lastFrameMs: 250,
+        },
+      },
+    })
+  }
+  await Promise.resolve()
+  assert.equal(settled, false)
+  assert.equal(h.timers.size, 1)
+  h.now = 2500
+  ;[...h.timers.values()][0].fn()
+  await assert.rejects(result, /timeout after 120000 ms/)
+  const report = d.failure(new Error('timeout')).report
+  assert.equal(report.diagnosticsVersion, 'apng-failure-v2')
+  assert.equal(report.stage, 'worker-compress-frame')
+  assert.equal(report.details.workerProgress.framesCompressed, 2)
+  assert.equal(report.details.workerProgress.frame.index, 2)
+  assert.equal(report.details.workerLastProgressAgeMs, 1000)
+  assert.equal(
+    report.timeline.filter((item) => item.stage === 'worker-compress-frame')
+      .length,
+    1
+  )
+  assert.equal(h.timers.size, 0)
+})
+
 for (const type of ['error', 'messageerror']) {
   test(`worker ${type} rejects concurrent requests immediately`, async () => {
     const h = harness()
@@ -326,7 +379,7 @@ test('frame decode failure releases the conversion slot and produces a report', 
   }
 })
 
-test('real worker protocol preserves encoder exceptions and encodes a tiny APNG', () => {
+test('real worker reports progress, preserves output and restores hooks after failure', () => {
   const messages = []
   const scope = vm.createContext({
     performance,
@@ -340,30 +393,71 @@ test('real worker protocol preserves encoder exceptions and encodes a tiny APNG'
   }
   vm.runInContext(
     `
-    onmessage({ data: {
+    var input = {
       id: 1, width: 1, height: 1,
       arrayBuffList: [new Uint8Array([255, 0, 0, 255]).buffer, new Uint8Array([0, 255, 0, 255]).buffer],
       delayList: [80, 120]
-    } })
+    }
+    var baseline = UPNG.encode(input.arrayBuffList, 1, 1, 0, input.delayList)
+    var originalFramize = UPNG.encode.framize
+    var originalFilter = UPNG.encode._filterZero
+    onmessage({ data: input })
   `,
     scope
   )
   assert.equal(messages[0].type, 'started')
-  assert.equal(messages[1].id, 1)
+  const encoded = messages.find((message) => message.result)
+  assert.equal(encoded.id, 1)
   assert.deepEqual(
-    [...new Uint8Array(messages[1].result).slice(0, 8)],
-    [137, 80, 78, 71, 13, 10, 26, 10]
+    new Uint8Array(encoded.result),
+    new Uint8Array(scope.baseline)
   )
-  scope.png = messages[1].result
+  const progress = messages.filter((message) => message.type === 'progress')
+  assert.equal(progress[0].progress.stage, 'frame-differences')
+  assert.deepEqual(
+    progress
+      .filter((message) => message.progress.stage === 'compress-frame')
+      .map((message) => message.progress.frame.index),
+    [0, 1]
+  )
+  assert.equal(progress.at(-1).progress.stage, 'assemble-png')
+  assert.equal(progress.at(-1).progress.framesCompressed, 2)
+  assert.equal(
+    vm.runInContext(
+      'UPNG.encode.framize === originalFramize && UPNG.encode._filterZero === originalFilter',
+      scope
+    ),
+    true
+  )
+  scope.png = encoded.result
   assert.equal(vm.runInContext('UPNG.decode(png).frames.length', scope), 2)
   vm.runInContext(
     `
-    UPNG.encode = function () { throw new RangeError('encoder failure probe') }
-    onmessage({ data: { id: 2 } })
+    var originalDeflate = pako.deflate
+    pako.deflate = function () { throw new RangeError('encoder failure probe') }
+    onmessage({ data: { ...input, id: 2 } })
   `,
     scope
   )
-  assert.equal(messages[2].type, 'started')
-  assert.equal(messages[3].error.name, 'RangeError')
-  assert.match(messages[3].error.stack, /encoder failure probe/)
+  const failed = messages.find((message) => message.id === 2 && message.error)
+  assert.equal(failed.error.name, 'RangeError')
+  assert.equal(failed.stage, 'compress-frame')
+  assert.match(failed.error.stack, /encoder failure probe/)
+  assert.equal(
+    vm.runInContext(
+      'UPNG.encode.framize === originalFramize && UPNG.encode._filterZero === originalFilter',
+      scope
+    ),
+    true
+  )
+  vm.runInContext(
+    `pako.deflate = originalDeflate; onmessage({ data: { ...input, id: 3 } })`,
+    scope
+  )
+  assert.deepEqual(
+    new Uint8Array(
+      messages.find((message) => message.id === 3 && message.result).result
+    ),
+    new Uint8Array(scope.baseline)
+  )
 })

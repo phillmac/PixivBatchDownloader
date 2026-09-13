@@ -1656,7 +1656,7 @@ class APNGDiagnostics {
     failure(error) {
         return new APNGConversionError({
             schemaVersion: 1,
-            diagnosticsVersion: 'apng-failure-v1',
+            diagnosticsVersion: 'apng-failure-v2',
             startedAt: this.startedAt,
             failedAt: new Date().toISOString(),
             elapsedMs: this.elapsed(),
@@ -2079,6 +2079,8 @@ class ToAPNG {
             diagnostic.details.previousWorkerTimeouts = this.workerTimeouts;
             diagnostic.details.workerStarted = false;
             diagnostic.details.timeoutMs = timeoutMs;
+            let lastProgressReceived = null;
+            let workerStage = 'encode';
             const cleanup = () => {
                 window.clearTimeout(timeoutId);
                 worker.removeEventListener('message', handler);
@@ -2087,6 +2089,9 @@ class ToAPNG {
                 this.pendingRequests.delete(id);
             };
             const fail = (error) => {
+                if (lastProgressReceived !== null) {
+                    diagnostic.details.workerLastProgressAgeMs = Math.round(performance.now() - lastProgressReceived);
+                }
                 diagnostic.details.pendingWorkerRequestsAtFailure =
                     this.pendingRequests.size;
                 cleanup();
@@ -2103,6 +2108,16 @@ class ToAPNG {
                 if (ev.data.type === 'started') {
                     diagnostic.details.workerStarted = true;
                     diagnostic.enter('worker-encode');
+                    return;
+                }
+                if (ev.data.type === 'progress') {
+                    lastProgressReceived = performance.now();
+                    diagnostic.details.workerProgress = ev.data.progress;
+                    // 同阶段的逐帧消息只更新快照，时间线保持为少量阶段切换。
+                    if (ev.data.progress.stage !== workerStage) {
+                        workerStage = ev.data.progress.stage;
+                        diagnostic.enter(`worker-${workerStage}`);
+                    }
                     return;
                 }
                 diagnostic.details.workerEncodeMs = ev.data.encodeMs;

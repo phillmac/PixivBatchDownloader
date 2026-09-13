@@ -63,6 +63,10 @@ the expandable entry.
 | `worker-post-message` | Submitting/transferring the pixel buffers failed, for example with `DataCloneError`. |
 | `wait-worker` with `workerStarted: false` | No start acknowledgement was received before the failure. This can mean queueing or an unresponsive worker; it does not prove either cause. |
 | `worker-encode` | The worker acknowledged the request and entered encoding. A worker exception preserves its original name, message and stack. A timeout here does not prove the encoder ran out of memory. |
+| `worker-frame-differences`, `worker-palette-analysis` | Preparing frame differences or checking whether a palette can be used. |
+| `worker-compress-frames`, `worker-compress-frame` | PNG filtering and compression. `workerProgress` gives completed frames, the current zero-based frame index and dimensions, the previous frame's duration, and elapsed encoding/compression time. |
+| `worker-assemble-png` | All frames were compressed; the encoder is assembling the PNG chunks. |
+| `workerLastProgressAgeMs` | Time since the main thread last received encoder progress when the failure was captured. Recent progress suggests the worker was advancing near the timeout; a long gap can also reflect a slow frame or delayed message delivery, so it does not prove a hang. |
 | `worker-post-result` | Encoding returned, but sending its result from the worker failed. |
 | `worker-error`, `worker-messageerror`, `worker-response` | A worker runtime error, a response deserialization error, or an invalid response occurred. |
 | `create-apng-blob` | The main thread received the encoded result but could not finish constructing the output. |
@@ -74,7 +78,8 @@ the expandable entry.
 Reports include the work ID, extension and diagnostic versions, browser,
 conversion/download thread settings, enabled formats, dimensions and delay
 summary. They do not retain image buffers or dump the full settings file.
-`diagnosticsVersion` is `apng-failure-v1` for this build.
+`diagnosticsVersion` is `apng-failure-v2` for this build. Worker progress updates
+replace one snapshot; they do not add a timeline entry for every frame.
 
 The timeout remains 120 seconds, measured from submission to the worker, including
 queueing time. This change does not increase the timeout, change the retry policy,
@@ -88,6 +93,20 @@ text filter, and include the extension's content-script context (disable
 `PPD ugoira conversion failed`. The console contains the report and original
 exception. Enable Preserve log if you need console output to survive navigation.
 
+## Reproduction evidence
+
+A supplied 275-frame, 426 x 240 JPEG animation passed ZIP CRC checks and decoded
+successfully. A local Node 24.19.0 replay using Pillow-decoded RGBA pixels and the
+bundled UPNG/pako libraries took 54.3 seconds. Of that, 51.6 seconds were spent in
+1,375 deflate calls: the encoder tried five PNG filters for each frame. The APNG
+preserved every input pixel and all frame delays. Repeating the replay through
+the v2 worker took 54.6 seconds and produced byte-identical output.
+
+This establishes that this input can encode correctly and makes processing time
+a candidate for the fixed 120-second timeout. It does not reproduce the original
+Windows browser timeout or establish that background-tab scheduling caused it.
+The supplied images are not included in the repository or test fixtures.
+
 ## Verification
 
 ```sh
@@ -98,5 +117,7 @@ node pack.js
 
 The focused tests inject encoder, transfer, timeout, worker, canvas and decode
 failures; check concurrent response routing and cleanup; and run the bundled
-UPNG/pako encoder on a tiny two-frame animation. They do not reproduce the
+UPNG/pako encoder on a tiny two-frame animation. They also check frame progress
+at timeout and restoration of encoder hooks after a compression error.
+They do not reproduce the
 intermittent failure of a particular Pixiv work in a logged-in browser.
