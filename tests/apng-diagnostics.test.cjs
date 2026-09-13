@@ -31,12 +31,26 @@ function harness() {
     addEventListener: events.addEventListener.bind(events),
     setTimeout(fn, ms) {
       const id = ++timerId
-      timers.set(id, { fn, ms })
+      timers.set(id, { fn, ms, at: h.now + ms })
       return id
     },
     clearTimeout(id) {
       timers.delete(id)
     },
+  }
+  h.advance = (ms) => {
+    const target = h.now + ms
+    for (;;) {
+      const next = [...timers.entries()]
+        .filter(([, timer]) => timer.at <= target)
+        .sort((a, b) => a[1].at - b[1].at)[0]
+      if (!next) break
+      const [id, timer] = next
+      h.now = timer.at
+      timers.delete(id)
+      timer.fn()
+    }
+    h.now = target
   }
   class FakeWorker extends EventTarget {
     constructor() {
@@ -272,7 +286,7 @@ test('timeout retains encoder frame progress and bounds the stage timeline', asy
   ;[...h.timers.values()][0].fn()
   await assert.rejects(result, /timeout after 120000 ms/)
   const report = d.failure(new Error('timeout')).report
-  assert.equal(report.diagnosticsVersion, 'apng-failure-v2')
+  assert.equal(report.diagnosticsVersion, 'apng-failure-v3')
   assert.equal(report.stage, 'worker-compress-frame')
   assert.equal(report.details.workerProgress.framesCompressed, 2)
   assert.equal(report.details.workerProgress.frame.index, 2)
@@ -282,6 +296,98 @@ test('timeout retains encoder frame progress and bounds the stage timeline', asy
       .length,
     1
   )
+  assert.equal(h.timers.size, 0)
+})
+
+test('encoding can finish after several timeout intervals while progress continues', async () => {
+  const h = harness()
+  const d = h.diagnostic()
+  const result = h.converter.convert(bitmaps, info, d)
+  result.catch(() => {})
+  const worker = await h.waitForPost()
+  const id = worker.messages[0].id
+  worker.emit('message', { data: { id, type: 'started' } })
+  for (let frame = 0; frame < 3; frame++) {
+    h.advance(110000)
+    assert.equal(h.converter.pendingRequests.size, 1)
+    worker.emit('message', {
+      data: {
+        id,
+        type: 'progress',
+        progress: { stage: 'compress-frame', frame },
+      },
+    })
+  }
+  assert.equal(h.now, 330000)
+  worker.emit('message', { data: { id, result: new ArrayBuffer(8) } })
+  assert.equal((await result).size, 8)
+  assert.equal(d.details.timeoutMode, 'worker-inactivity')
+  assert.equal(h.converter.workerTimeouts, 0)
+  assert.equal(h.timers.size, 0)
+})
+
+test('shared worker activity keeps queued requests alive until their turn', async () => {
+  const h = harness()
+  const firstDiagnostic = h.diagnostic()
+  const secondDiagnostic = h.diagnostic()
+  const first = h.converter.convert(bitmaps, info, firstDiagnostic)
+  const second = h.converter.convert(bitmaps, info, secondDiagnostic)
+  first.catch(() => {})
+  second.catch(() => {})
+  const worker = await h.waitForPost(2)
+  const [a, b] = worker.messages
+  worker.emit('message', { data: { id: a.id, type: 'started' } })
+  for (let frame = 0; frame < 2; frame++) {
+    h.advance(110000)
+    worker.emit('message', {
+      data: {
+        id: a.id,
+        type: 'progress',
+        progress: { stage: 'compress-frame', frame },
+      },
+    })
+    assert.equal(h.converter.pendingRequests.size, 2)
+    assert.equal(secondDiagnostic.details.workerStarted, false)
+    assert.equal(secondDiagnostic.details.workerProgress, undefined)
+  }
+  h.advance(110000)
+  worker.emit('message', { data: { id: a.id, result: new ArrayBuffer(8) } })
+  assert.equal((await first).size, 8)
+  h.advance(110000)
+  assert.equal(h.converter.pendingRequests.size, 1)
+  worker.emit('message', { data: { id: b.id, type: 'started' } })
+  worker.emit('message', { data: { id: b.id, result: new ArrayBuffer(16) } })
+  assert.equal((await second).size, 16)
+  assert.equal(h.converter.workerTimeouts, 0)
+  assert.equal(h.timers.size, 0)
+})
+
+test('two minutes of inactivity after progress still rejects and records the idle period', async () => {
+  const h = harness()
+  const d = h.diagnostic()
+  const result = h.converter.convert(bitmaps, info, d)
+  const worker = await h.waitForPost()
+  const id = worker.messages[0].id
+  worker.emit('message', { data: { id, type: 'started' } })
+  h.advance(110000)
+  worker.emit('message', {
+    data: {
+      id,
+      type: 'progress',
+      progress: { stage: 'compress-frame', frame: 151 },
+    },
+  })
+  h.advance(119999)
+  assert.equal(h.converter.pendingRequests.size, 1)
+  h.advance(1)
+  await assert.rejects(result, /inactivity timeout after 120000 ms/)
+  const report = d.failure(new Error('timeout')).report
+  assert.equal(report.details.timeoutMode, 'worker-inactivity')
+  assert.equal(report.details.workerLastProgressAgeMs, 120000)
+  assert.equal(report.details.workerLastActivityAgeMs, 120000)
+  assert.equal(report.details.workerLastActivityRequestId, id)
+  assert.equal(h.converter.workerTimeouts, 1)
+  assert.equal(h.converter.pendingRequests.size, 0)
   assert.equal(h.timers.size, 0)
 })
 

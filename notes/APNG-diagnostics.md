@@ -66,7 +66,8 @@ the expandable entry.
 | `worker-frame-differences`, `worker-palette-analysis` | Preparing frame differences or checking whether a palette can be used. |
 | `worker-compress-frames`, `worker-compress-frame` | PNG filtering and compression. `workerProgress` gives completed frames, the current zero-based frame index and dimensions, the previous frame's duration, and elapsed encoding/compression time. |
 | `worker-assemble-png` | All frames were compressed; the encoder is assembling the PNG chunks. |
-| `workerLastProgressAgeMs` | Time since the main thread last received encoder progress when the failure was captured. Recent progress suggests the worker was advancing near the timeout; a long gap can also reflect a slow frame or delayed message delivery, so it does not prove a hang. |
+| `workerLastProgressAgeMs` | Time since the main thread last received this request's encoder progress when the failure was captured. A long gap can also reflect a slow frame or delayed message delivery, so it does not prove a hang. |
+| `timeoutMode`, `workerLastActivityAgeMs`, `workerLastActivityRequestId` | In v3, `timeoutMode` is `worker-inactivity`. An inactivity failure records the time since any request's last worker message and that request ID, including activity that kept queued conversions alive. |
 | `worker-post-result` | Encoding returned, but sending its result from the worker failed. |
 | `worker-error`, `worker-messageerror`, `worker-response` | A worker runtime error, a response deserialization error, or an invalid response occurred. |
 | `create-apng-blob` | The main thread received the encoded result but could not finish constructing the output. |
@@ -78,12 +79,15 @@ the expandable entry.
 Reports include the work ID, extension and diagnostic versions, browser,
 conversion/download thread settings, enabled formats, dimensions and delay
 summary. They do not retain image buffers or dump the full settings file.
-`diagnosticsVersion` is `apng-failure-v2` for this build. Worker progress updates
+`diagnosticsVersion` is `apng-failure-v3` for this build. Worker progress updates
 replace one snapshot; they do not add a timeline entry for every frame.
 
-The timeout remains 120 seconds, measured from submission to the worker, including
-queueing time. This change does not increase the timeout, change the retry policy,
-or claim a cause for an intermittent failure that has not yet been captured.
+The worker watchdog expires after 120 seconds without an observed worker message.
+Start, progress and completion messages renew it, so an actively progressing
+conversion can run for longer than two minutes. The worker handles requests
+serially: activity from its current request also renews the watchdog for queued
+requests, without replacing their individual progress reports. Encoding options
+and the retry policy are unchanged.
 If the browser kills the whole tab/process, JavaScript cannot create a failure
 report after that termination.
 
@@ -102,9 +106,11 @@ bundled UPNG/pako libraries took 54.3 seconds. Of that, 51.6 seconds were spent 
 preserved every input pixel and all frame delays. Repeating the replay through
 the v2 worker took 54.6 seconds and produced byte-identical output.
 
-This establishes that this input can encode correctly and makes processing time
-a candidate for the fixed 120-second timeout. It does not reproduce the original
-Windows browser timeout or establish that background-tab scheduling caused it.
+The next Windows browser report confirmed that the fixed 120-second cutoff fired
+during active compression: 151 of 275 frames were complete, the previous frame
+took 769 ms, and progress arrived 762 ms before failure. The tab was visible at
+failure and no worker exception was reported. V3 replaces that total-time cutoff
+with the inactivity watchdog described above.
 The supplied images are not included in the repository or test fixtures.
 
 ## Verification
@@ -118,6 +124,8 @@ node pack.js
 The focused tests inject encoder, transfer, timeout, worker, canvas and decode
 failures; check concurrent response routing and cleanup; and run the bundled
 UPNG/pako encoder on a tiny two-frame animation. They also check frame progress
-at timeout and restoration of encoder hooks after a compression error.
+at timeout, restoration of encoder hooks after a compression error, slow encoding
+and queued requests lasting longer than two minutes, and eventual failure after
+two full minutes without worker activity. Timeout tests use a simulated clock.
 They do not reproduce the
 intermittent failure of a particular Pixiv work in a logged-in browser.

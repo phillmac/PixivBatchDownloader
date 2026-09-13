@@ -80,7 +80,7 @@ export class APNGDiagnostics {
     return new APNGConversionError(
       {
         schemaVersion: 1,
-        diagnosticsVersion: 'apng-failure-v2',
+        diagnosticsVersion: 'apng-failure-v3',
         startedAt: this.startedAt,
         failedAt: new Date().toISOString(),
         elapsedMs: this.elapsed(),

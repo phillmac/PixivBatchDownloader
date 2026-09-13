@@ -1656,7 +1656,7 @@ class APNGDiagnostics {
     failure(error) {
         return new APNGConversionError({
             schemaVersion: 1,
-            diagnosticsVersion: 'apng-failure-v2',
+            diagnosticsVersion: 'apng-failure-v3',
             startedAt: this.startedAt,
             failedAt: new Date().toISOString(),
             elapsedMs: this.elapsed(),
@@ -2079,7 +2079,10 @@ class ToAPNG {
             diagnostic.details.previousWorkerTimeouts = this.workerTimeouts;
             diagnostic.details.workerStarted = false;
             diagnostic.details.timeoutMs = timeoutMs;
+            diagnostic.details.timeoutMode = 'worker-inactivity';
             let lastProgressReceived = null;
+            let lastActivityReceived = performance.now();
+            let lastActivityRequestId = null;
             let workerStage = 'encode';
             const cleanup = () => {
                 window.clearTimeout(timeoutId);
@@ -2097,13 +2100,23 @@ class ToAPNG {
                 cleanup();
                 reject(error);
             };
-            const timeoutId = window.setTimeout(() => {
+            const onTimeout = () => {
                 this.workerTimeouts++;
                 diagnostic.details.lastWorkerError = this.workerError;
-                fail(new Error(`APNG encoding timeout after ${timeoutMs} ms`));
-            }, timeoutMs);
+                diagnostic.details.workerLastActivityAgeMs = Math.round(performance.now() - lastActivityReceived);
+                diagnostic.details.workerLastActivityRequestId = lastActivityRequestId;
+                fail(new Error(`APNG worker inactivity timeout after ${timeoutMs} ms`));
+            };
+            let timeoutId = window.setTimeout(onTimeout, timeoutMs);
             const handler = (ev) => {
-                if (!ev.data || ev.data.id !== id)
+                if (!ev.data || typeof ev.data.id !== 'number')
+                    return;
+                // 共用 worker 串行编码；其他请求的活动也能证明排队中的请求仍可继续等待。
+                lastActivityReceived = performance.now();
+                lastActivityRequestId = ev.data.id;
+                window.clearTimeout(timeoutId);
+                timeoutId = window.setTimeout(onTimeout, timeoutMs);
+                if (ev.data.id !== id)
                     return;
                 if (ev.data.type === 'started') {
                     diagnostic.details.workerStarted = true;
