@@ -6,15 +6,19 @@ page log. Each failed attempt has its own timestamps and worker request ID.
 
 ## Install the diagnostic build
 
-1. Export your settings and download records from the currently installed
-   downloader if you want to carry them across. An unpacked Chrome/Edge extension
-   has its own storage.
+1. Export your settings from the currently installed downloader if you want to
+   carry them across. Settings use `browser.storage.local`, which belongs to the
+   extension installation. Download records use the `DLRecord` IndexedDB database
+   on the Pixiv page's origin, so they normally remain available when switching
+   installations in the same Chrome/Edge profile. Record export/import is needed
+   when moving to a different browser profile or restoring a backup.
 2. Extract the diagnostic ZIP into a permanent folder. In `chrome://extensions`
    (or `edge://extensions`), enable Developer mode and choose **Load unpacked**.
    Select the extracted folder containing `manifest.json`. If building from
    source, select `dist` instead.
 3. Disable the other installation of Powerful Pixiv Downloader so only this build
-   runs on Pixiv. Import your settings and download records into this installation.
+   runs on Pixiv. Import your settings into this installation; existing download
+   records in the same browser profile do not need to be imported again.
 4. Refresh the Pixiv tab to load the diagnostic code, then use the downloader as
    usual. No diagnostic setting needs to be enabled.
 
