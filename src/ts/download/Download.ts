@@ -6,6 +6,7 @@ import { log } from '../Log'
 import { lang } from '../Language'
 import { fileName } from '../FileName'
 import { convertUgoira } from '../ConvertUgoira/ConvertUgoira'
+import { APNGConversionError } from '../ConvertUgoira/APNGDiagnostics'
 import {
   downloadArgument,
   SendToBackEndData,
@@ -446,6 +447,13 @@ class Download {
           )
           file = blob || null
         } catch (error) {
+          // 转换错误在这里已被消费，必须在通知重试之前保存原始异常和诊断。
+          console.error(
+            '[PPD ugoira conversion failed]',
+            { artworkId: result.idNum, format },
+            error instanceof APNGConversionError ? error.report : error,
+            error
+          )
           const msg =
             lang.transl(
               '_动图转换失败的提示',
@@ -457,7 +465,12 @@ class Download {
             format +
             '<br>' +
             lang.transl('_下载器会暂时跳过它并在其他文件下载完毕后重试下载它')
-          log.error(msg)
+          log.error(
+            msg +
+              (error instanceof APNGConversionError
+                ? error.toLogHTML(lang.transl('_APNG失败诊断'))
+                : '')
+          )
           this.error = true
           // 转换动图出错时，只要出错 1 次就会暂时跳过它，等下载完其他文件再重试它
           EVT.fire('downloadError', result.id)

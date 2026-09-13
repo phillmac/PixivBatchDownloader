@@ -1,3 +1,4 @@
+import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
 import { settings } from '../setting/Settings'
 import { UgoiraInfo } from '../crawl/CrawlResult'
@@ -8,6 +9,7 @@ import { toAPNG } from './ToAPNG'
 import { Tools } from '../Tools'
 import { states } from '../store/States'
 import { Utils } from '../utils/Utils'
+import { APNGDiagnostics } from './APNGDiagnostics'
 
 // 控制动图转换
 class ConvertUgoira {
@@ -57,14 +59,25 @@ class ConvertUgoira {
   /** 生成或从缓存中获取 ImageBitmap 列表 */
   private async getImageBitmapList(
     file: Blob,
-    id: number
+    id: number,
+    diagnostic?: APNGDiagnostics
   ): Promise<ImageBitmap[]> {
+    diagnostic?.enter('bitmap-cache')
+    if (diagnostic) {
+      diagnostic.details.bitmapCacheHit = this.imageBitmapCache.has(id)
+    }
     if (this.imageBitmapCache.has(id)) {
       return this.imageBitmapCache.get(id)!
     }
 
+    diagnostic?.enter('read-zip')
     const zipFileBuffer = await file.arrayBuffer()
+    diagnostic?.enter('scan-zip-frames')
     const indexList = Tools.getJPGContentIndex(zipFileBuffer)
+    if (diagnostic) {
+      diagnostic.details.extractedFrameCount = indexList.length
+    }
+    diagnostic?.enter('decode-frames')
     const imageBitmapList = await Tools.extractImage(
       zipFileBuffer,
       indexList,
@@ -74,12 +87,34 @@ class ConvertUgoira {
     return imageBitmapList
   }
 
+  /** 等待转换配额，并统一捕获解码和编码阶段的错误 */
   private async start(
     file: Blob,
     info: UgoiraInfo,
     type: 'webm' | 'webp' | 'gif' | 'png',
     id: number
   ): Promise<Blob> {
+    const diagnostic =
+      type === 'png'
+        ? new APNGDiagnostics({
+            artworkId: id,
+            extensionVersion: browser.runtime.getManifest().version,
+            zipBytes: file.size,
+            zipMimeType: file.type,
+            frameMimeType: info.mime_type,
+            metadataFrameCount: info.frames.length,
+            downloadThread: settings.downloadThread,
+            convertUgoiraThread: this.maxCount,
+            enabledFormats: {
+              webp: settings.ugoiraSaveAsWebP,
+              webm: settings.ugoiraSaveAsWebM,
+              gif: settings.ugoiraSaveAsGIF,
+              apng: settings.ugoiraSaveAsAPNG,
+              zip: settings.ugoiraSaveAsZIP,
+              ugoira: settings.ugoiraSaveAsUgoira,
+            },
+          })
+        : undefined
     while (true) {
       await Utils.sleep(200)
       // 如果已经停止下载，就不添加这个任务，避免浪费资源
@@ -95,28 +130,31 @@ class ConvertUgoira {
         this.convertingIds.add(id)
         window.clearTimeout(this.clearCacheTimers.get(id))
 
-        const imageBitmapList = await this.getImageBitmapList(file, id)
-
-        // WebM worker 会转移 ImageBitmap 的所有权。不能把已经转移的对象
-        // 留在缓存里，否则同一作品继续转换其他格式时会复用失效对象。
-        if (
-          type === 'webm' &&
-          typeof Worker !== 'undefined' &&
-          typeof OffscreenCanvas !== 'undefined'
-        ) {
-          this.imageBitmapCache.delete(id)
-        }
-
         try {
-          // await Utils.sleep(1000)
-          // console.count('测试转换错误')
-          // throw new Error('测试转换错误')
+          if (diagnostic) {
+            diagnostic.details.activeConversions = this._count
+            diagnostic.details.cachedWorks = this.imageBitmapCache.size
+          }
+          const imageBitmapList = await this.getImageBitmapList(
+            file,
+            id,
+            diagnostic
+          )
+
+          // WebM worker 会转移 ImageBitmap 的所有权，不能缓存失效对象。
+          if (
+            type === 'webm' &&
+            typeof Worker !== 'undefined' &&
+            typeof OffscreenCanvas !== 'undefined'
+          ) {
+            this.imageBitmapCache.delete(id)
+          }
 
           // 为了在这里统一捕获所有格式在转换时的错误，必须使用 await 等待转换过程
           if (type === 'gif') {
             return await toGIF.convert(imageBitmapList, info, file.size)
           } else if (type === 'png') {
-            return await toAPNG.convert(imageBitmapList, info)
+            return await toAPNG.convert(imageBitmapList, info, diagnostic!)
           } else if (type === 'webp') {
             return await toWebP.convert(imageBitmapList, info)
           } else {
@@ -125,6 +163,10 @@ class ConvertUgoira {
         } catch (error) {
           // 转换出错时把计数 -1，否则这个错误会一直占据一个转换配额，并且在下载完成后重试出错的文件时，这个计数也依然会被占用
           this.count = this._count - 1
+          if (diagnostic) {
+            diagnostic.details.activeConversionsAfterFailure = this._count
+            throw diagnostic.failure(error)
+          }
           throw error
         }
       }

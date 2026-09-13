@@ -5855,6 +5855,14 @@ This setting does not apply to collection files generated after merging a novel 
     `이 기능은 페이지를 스크롤하지 못하게 할 수 있습니다.`,
     `Это может остановить прокрутку страницы`,
   ],
+  _APNG失败诊断: [
+    `APNG 失败详情（刷新页面前请点击“导出日志”保存）`,
+    `APNG 失敗詳情（重新整理頁面前請點擊「匯出日誌」儲存）`,
+    `APNG failure details (save with Export logs before refreshing)`,
+    `APNG 変換失敗の詳細（ページを再読み込みする前に「ログをエクスポート」で保存してください）`,
+    `APNG 실패 세부 정보 (새로고침 전에 로그 내보내기로 저장하세요)`,
+    `Подробности ошибки APNG (сохраните через экспорт журнала до обновления страницы)`,
+  ],
   _动图转换失败的提示: [
     `动图转换失败，id：{}`,
     `動圖轉換失敗，id：{}`,

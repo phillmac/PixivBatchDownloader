@@ -1,125 +1,271 @@
 import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
 import { UgoiraInfo } from '../crawl/CrawlResult'
+import { APNGDiagnostics, APNGErrorInfo } from './APNGDiagnostics'
 
 class ToAPNG {
+  /** 多次转换共用的编码 worker */
   private worker!: Worker
+  /** 防止并发重复加载 worker */
   private workerReady: Promise<void> | null = null
+  /** worker 创建时间，用于判断多次失败是否复用了同一个实例 */
+  private workerCreatedAt = ''
+  /** worker 资源的加载状态 */
+  private readonly workerResources: { path: string; status: number }[] = []
+  /** 最近的 worker 运行错误，包括没有活动请求时发生的启动错误 */
+  private workerError: APNGErrorInfo | null = null
+  /** 超时不终止 worker，记录次数以便识别旧任务可能仍在运行的情况 */
+  private workerTimeouts = 0
+  /** 自增请求 ID，用来匹配并发转换的响应 */
+  private messageId = 0
+  /** 仍在等待响应的请求，不包括已经超时但可能仍在 worker 中运行的任务 */
+  private readonly pendingRequests = new Set<number>()
 
+  /** 加载扩展内的脚本，并在 pako 和 UPNG 后面拼接 worker 入口 */
   private async loadWorker(): Promise<void> {
-    // 把 pako.min.js、UPNG.js 和 worker 脚本合并成一个 blob
-    // UPNG.js 在编码时依赖 pako 的 deflate，所以必须先加载 pako
-    const [pakoRes, upngRes, workerRes] = await Promise.all([
-      fetch(browser.runtime.getURL('lib/pako.min.js')),
-      fetch(browser.runtime.getURL('lib/UPNG.js')),
-      fetch(browser.runtime.getURL('lib/apng.worker.js')),
-    ])
-    const [pakoText, upngText, workerText] = await Promise.all([
-      pakoRes.text(),
-      upngRes.text(),
-      workerRes.text(),
-    ])
-    const blob = new Blob([pakoText, '\n', upngText, '\n', workerText], {
+    const scripts = await Promise.all(
+      ['lib/pako.min.js', 'lib/UPNG.js', 'lib/apng.worker.js'].map(
+        async (path) => {
+          const response = await fetch(browser.runtime.getURL(path))
+          this.workerResources.push({ path, status: response.status })
+          if (!response.ok) {
+            throw new Error(
+              `APNG worker resource ${path}: HTTP ${response.status}`
+            )
+          }
+          return response.text()
+        }
+      )
+    )
+    const blob = new Blob([scripts.join('\n')], {
       type: 'application/javascript',
     })
     const url = URL.createObjectURL(blob)
-    this.worker = new Worker(url)
-    URL.revokeObjectURL(url)
+    try {
+      this.worker = new Worker(url)
+      this.workerCreatedAt = new Date().toISOString()
+    } finally {
+      URL.revokeObjectURL(url)
+    }
     this.worker.onerror = (ev) => {
-      console.error('APNG worker error:', ev)
+      this.workerError = {
+        name: 'WorkerError',
+        message: ev.message || 'APNG worker error (no message supplied)',
+        stack: `${ev.filename}:${ev.lineno}:${ev.colno}`,
+      }
+      console.error('[PPD APNG worker error]', this.workerError, ev)
     }
   }
 
+  /** 提取 RGBA 像素，并把每次失败前的阶段和帧信息保存在诊断里 */
   public async convert(
-    ImageBitmapList: ImageBitmap[],
-    info: UgoiraInfo
+    imageBitmapList: ImageBitmap[],
+    info: UgoiraInfo,
+    diagnostic: APNGDiagnostics
   ): Promise<Blob> {
+    diagnostic.enter('load-worker')
     if (!this.workerReady) {
       this.workerReady = this.loadWorker()
     }
-    await this.workerReady
+    try {
+      await this.workerReady
+    } finally {
+      diagnostic.details.workerResources = this.workerResources.slice()
+      diagnostic.details.workerCreatedAt = this.workerCreatedAt
+      diagnostic.details.previousWorkerError = this.workerError
+    }
 
-    const width = ImageBitmapList[0].width
-    const height = ImageBitmapList[0].height
+    diagnostic.enter('read-frame-pixels')
+    diagnostic.details.bitmapCount = imageBitmapList.length
+    if (imageBitmapList.length === 0) {
+      throw new Error('No decoded frames available for APNG conversion')
+    }
+    const width = imageBitmapList[0].width
+    const height = imageBitmapList[0].height
+    diagnostic.details.width = width
+    diagnostic.details.height = height
+    // 仅为输入像素体积，不是 UPNG 的峰值内存；编码时还需要额外缓冲区。
+    diagnostic.details.inputRGBABytes =
+      width * height * 4 * imageBitmapList.length
     const canvas = document.createElement('canvas')
-    const ctx = canvas.getContext('2d', {
-      willReadFrequently: true,
-    })! as CanvasRenderingContext2D
     canvas.width = width
     canvas.height = height
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (!ctx) {
+      throw new Error('Could not create a 2D canvas context for APNG')
+    }
 
-    // 提取每帧的像素数据
-    let arrayBuffList: ArrayBuffer[] = []
-    ImageBitmapList.forEach((imageBitmap) => {
+    const arrayBuffList: ArrayBuffer[] = []
+    imageBitmapList.forEach((imageBitmap, index) => {
+      diagnostic.details.frame = {
+        index,
+        file: info.frames[index]?.file,
+        width: imageBitmap.width,
+        height: imageBitmap.height,
+      }
+      diagnostic.details.frameOperation = 'drawImage'
       ctx.drawImage(imageBitmap, 0, 0)
-      // 从画布获取图像绘制后的 Uint8ClampedArray buffer
-      const buff = ctx.getImageData(0, 0, width, height).data.buffer
-      arrayBuffList.push(buff as any)
+      diagnostic.details.frameOperation = 'getImageData'
+      arrayBuffList.push(
+        ctx.getImageData(0, 0, width, height).data.buffer as ArrayBuffer
+      )
+      diagnostic.details.framesRead = index + 1
     })
     const delayList = info.frames.map((frame) => frame.delay)
+    diagnostic.details.delaySummary = delayList.reduce(
+      (summary, delay) => ({
+        minMs: Math.min(summary.minMs, delay),
+        maxMs: Math.max(summary.maxMs, delay),
+        totalMs: summary.totalMs + delay,
+      }),
+      { minMs: delayList[0] ?? 0, maxMs: 0, totalMs: 0 }
+    )
 
-    // 在 worker 中编码，避免阻塞主线程
-    // https://github.com/photopea/UPNG.js/#encoder
     const pngFile = await this.encodeInWorker(
       arrayBuffList,
       width,
       height,
-      delayList
+      delayList,
+      diagnostic
     )
-
-    const blob = new Blob([pngFile], {
-      type: 'image/vnd.mozilla.apng',
-    })
-
+    diagnostic.enter('create-apng-blob')
+    const blob = new Blob([pngFile], { type: 'image/vnd.mozilla.apng' })
     EVT.fire('convertSuccess')
-    arrayBuffList = null as any
     return blob
   }
 
-  // 使用自增 ID 区分并发请求，确保多线程转换时响应能正确匹配
-  private messageId = 0
-
+  /** 记录 worker 排队、编码、消息传输及超时，并在所有退出路径移除监听器 */
   private encodeInWorker(
     arrayBuffList: ArrayBuffer[],
     width: number,
     height: number,
-    delayList: number[]
+    delayList: number[],
+    diagnostic: APNGDiagnostics
   ): Promise<ArrayBuffer> {
+    const worker = this.worker
     return new Promise((resolve, reject) => {
       const id = ++this.messageId
-      const timeoutId = window.setTimeout(() => {
-        this.worker.removeEventListener('message', handler)
-        reject(new Error('APNG encoding timeout'))
-      }, 120000)
-      const handler = (ev: MessageEvent) => {
-        if (ev.data.id !== id) return
+      const timeoutMs = 120000
+      this.pendingRequests.add(id)
+      diagnostic.details.workerRequestId = id
+      diagnostic.details.pendingWorkerRequestsAtSubmit =
+        this.pendingRequests.size
+      diagnostic.details.previousWorkerTimeouts = this.workerTimeouts
+      diagnostic.details.workerStarted = false
+      diagnostic.details.timeoutMs = timeoutMs
+      diagnostic.details.timeoutMode = 'worker-inactivity'
+      let lastProgressReceived: number | null = null
+      let lastActivityReceived = performance.now()
+      let lastActivityRequestId: number | null = null
+      let workerStage = 'encode'
+
+      const cleanup = () => {
         window.clearTimeout(timeoutId)
-        this.worker.removeEventListener('message', handler)
+        worker.removeEventListener('message', handler)
+        worker.removeEventListener('error', onError)
+        worker.removeEventListener('messageerror', onMessageError)
+        this.pendingRequests.delete(id)
+      }
+      const fail = (error: unknown) => {
+        if (lastProgressReceived !== null) {
+          diagnostic.details.workerLastProgressAgeMs = Math.round(
+            performance.now() - lastProgressReceived
+          )
+        }
+        diagnostic.details.pendingWorkerRequestsAtFailure =
+          this.pendingRequests.size
+        cleanup()
+        reject(error)
+      }
+      const onTimeout = () => {
+        this.workerTimeouts++
+        diagnostic.details.lastWorkerError = this.workerError
+        diagnostic.details.workerLastActivityAgeMs = Math.round(
+          performance.now() - lastActivityReceived
+        )
+        diagnostic.details.workerLastActivityRequestId = lastActivityRequestId
+        fail(new Error(`APNG worker inactivity timeout after ${timeoutMs} ms`))
+      }
+      let timeoutId = window.setTimeout(onTimeout, timeoutMs)
+      const handler = (ev: MessageEvent) => {
+        if (!ev.data || typeof ev.data.id !== 'number') return
+        // 共用 worker 串行编码；其他请求的活动也能证明排队中的请求仍可继续等待。
+        lastActivityReceived = performance.now()
+        lastActivityRequestId = ev.data.id
+        window.clearTimeout(timeoutId)
+        timeoutId = window.setTimeout(onTimeout, timeoutMs)
+        if (ev.data.id !== id) return
+        if (ev.data.type === 'started') {
+          diagnostic.details.workerStarted = true
+          diagnostic.enter('worker-encode')
+          return
+        }
+        if (ev.data.type === 'progress') {
+          lastProgressReceived = performance.now()
+          diagnostic.details.workerProgress = ev.data.progress
+          // 同阶段的逐帧消息只更新快照，时间线保持为少量阶段切换。
+          if (ev.data.progress.stage !== workerStage) {
+            workerStage = ev.data.progress.stage
+            diagnostic.enter(`worker-${workerStage}`)
+          }
+          return
+        }
+        diagnostic.details.workerEncodeMs = ev.data.encodeMs
         if (ev.data.error) {
-          reject(new Error(ev.data.error))
+          diagnostic.details.workerStage = ev.data.stage
+          if (ev.data.stage === 'post-result') {
+            diagnostic.enter('worker-post-result')
+          }
+          // 新 worker 返回普通异常对象；也兼容旧 worker 的字符串错误。
+          fail(
+            typeof ev.data.error === 'string'
+              ? new Error(ev.data.error)
+              : ev.data.error
+          )
         } else if (
           ev.data.result === undefined ||
           ev.data.result === null ||
           typeof ev.data.result.byteLength !== 'number'
         ) {
-          console.error('[ToAPNG] invalid worker response:', ev.data)
-          reject(new Error('Invalid APNG worker response'))
+          diagnostic.enter('worker-response')
+          diagnostic.details.responseType = typeof ev.data.result
+          fail(new Error('Invalid APNG worker response'))
         } else {
-          // FUCK Firefox
-          // 在 Firefox 里，由于 worker 里编码后产生的 ArrayBuffer 数据与主线程的 ArrayBuffer 构造函数是不同的对象，导致 instanceof 检测失败始终为 false（跨 realm 问题），所以转换无法完成
-          // 现在改为检查 byteLength 属性来判断是否是有效的 ArrayBuffer
+          // Firefox 跨 realm 的 ArrayBuffer 不能通过 instanceof 检测。
+          diagnostic.details.outputBytes = ev.data.result.byteLength
+          cleanup()
           resolve(ev.data.result)
         }
       }
-      this.worker.addEventListener('message', handler)
-      // 以 Transferable 方式传递 ArrayBuffer，零拷贝转移所有权
-      this.worker.postMessage(
-        { id, arrayBuffList, width, height, delayList },
-        arrayBuffList
-      )
+      const onError = (ev: ErrorEvent) => {
+        diagnostic.enter('worker-error')
+        fail({
+          name: 'WorkerError',
+          message: ev.message || 'APNG worker error (no message supplied)',
+          stack: `${ev.filename}:${ev.lineno}:${ev.colno}`,
+        })
+      }
+      const onMessageError = () => {
+        diagnostic.enter('worker-messageerror')
+        fail(new Error('Could not deserialize the APNG worker response'))
+      }
+      worker.addEventListener('message', handler)
+      worker.addEventListener('error', onError)
+      worker.addEventListener('messageerror', onMessageError)
+      diagnostic.enter('worker-post-message')
+      try {
+        worker.postMessage(
+          { id, arrayBuffList, width, height, delayList },
+          arrayBuffList
+        )
+        diagnostic.enter('wait-worker')
+      } catch (error) {
+        fail(error)
+      }
     })
   }
 }
 
+/** 共用的 APNG 转换器 */
 const toAPNG = new ToAPNG()
 export { toAPNG }
