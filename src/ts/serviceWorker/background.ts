@@ -256,7 +256,7 @@ function isMsg(msg: any): msg is SendToBackEndData {
   return !!msg.msg
 }
 
-browser.runtime.onMessage.addListener(async function (
+async function handleRuntimeMessage(
   msg: unknown,
   sender: browser.Runtime.MessageSender
 ) {
@@ -265,10 +265,6 @@ browser.runtime.onMessage.addListener(async function (
   if (!isMsg(msg)) {
     console.warn('收到了无效的消息:', msg)
     return false
-  }
-
-  if (isGlobalDownloadLeaseMessage(msg)) {
-    return handleGlobalDownloadLeaseMessage(msg, sender)
   }
 
   const tabId = sender.tab!.id!
@@ -382,7 +378,30 @@ browser.runtime.onMessage.addListener(async function (
   }
 
   return false
-})
+}
+
+const runtimeMessageListener = (
+  msg: unknown,
+  sender: browser.Runtime.MessageSender,
+  sendResponse: (response: unknown) => void
+) => {
+  if (isGlobalDownloadLeaseMessage(msg)) {
+    handleGlobalDownloadLeaseMessage(msg, sender)
+      .then(sendResponse)
+      .catch((error) => {
+        console.error('Global download lease message failed', error)
+        sendResponse({ granted: false, retryAfterMs: 1000 })
+      })
+    return true
+  }
+
+  void handleRuntimeMessage(msg, sender)
+  return undefined
+}
+
+browser.runtime.onMessage.addListener(
+  runtimeMessageListener as browser.Runtime.OnMessageListener
+)
 
 const isFirefox = navigator.userAgent.includes('Firefox')
 

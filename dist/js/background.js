@@ -2055,15 +2055,12 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onUpdated.addL
 function isMsg(msg) {
     return !!msg.msg;
 }
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.addListener(async function (msg, sender) {
+async function handleRuntimeMessage(msg, sender) {
     // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
     // 不能直接在上面设置类型为 msg: SendToBackEndData，否则会报错。因此需要使用类型守卫，真麻烦
     if (!isMsg(msg)) {
         console.warn('收到了无效的消息:', msg);
         return false;
-    }
-    if (isGlobalDownloadLeaseMessage(msg)) {
-        return handleGlobalDownloadLeaseMessage(msg, sender);
     }
     const tabId = sender.tab.id;
     // 当存在同名文件时，默认覆写，但前台也可以指定处理方式
@@ -2165,7 +2162,21 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
         }
     }
     return false;
-});
+}
+const runtimeMessageListener = (msg, sender, sendResponse) => {
+    if (isGlobalDownloadLeaseMessage(msg)) {
+        handleGlobalDownloadLeaseMessage(msg, sender)
+            .then(sendResponse)
+            .catch((error) => {
+            console.error('Global download lease message failed', error);
+            sendResponse({ granted: false, retryAfterMs: 1000 });
+        });
+        return true;
+    }
+    void handleRuntimeMessage(msg, sender);
+    return undefined;
+};
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.addListener(runtimeMessageListener);
 const isFirefox = navigator.userAgent.includes('Firefox');
 async function getFileURL(msg) {
     // 在 Chrome 的隐私窗口里，使用 dataURL
