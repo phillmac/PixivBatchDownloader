@@ -95,8 +95,29 @@ def main():
             )
             call(tab_a, "release", "req-c", after_close["leaseId"])
 
+            tab_d = context.new_page()
+            tab_d.goto(harness)
+            tab_d.wait_for_function("window.leaseTest !== undefined")
+            owner = call(tab_d, "acquire", "req-d", "file-d")
+            require(owner.get("granted") is True, f"discard owner acquire failed: {owner}")
+            owner_tab_id = call(tab_d, "currentTabId")
+
+            tab_a.bring_to_front()
+            discarded_tab_id = call(tab_a, "discardTab", owner_tab_id)
+            require(discarded_tab_id == owner_tab_id, "Chrome did not discard the owner tab")
+
+            deadline = time.time() + 3
+            after_discard = {"granted": False}
+            while time.time() < deadline:
+                after_discard = call(tab_a, "acquire", "req-e", "file-e")
+                if after_discard.get("granted"):
+                    break
+                time.sleep(0.1)
+            require(after_discard.get("granted") is True, f"discard handoff failed: {after_discard}")
+            call(tab_a, "release", "req-e", after_discard["leaseId"])
+
             print(f"extension_id={extension_id}")
-            print("PASS mutual-exclusion renew release close-handoff")
+            print("PASS mutual-exclusion renew release close-handoff discard-handoff")
             context.close()
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
