@@ -98,25 +98,26 @@ def main():
             tab_d = context.new_page()
             tab_d.goto(harness)
             tab_d.wait_for_function("window.leaseTest !== undefined")
-            owner = call(tab_d, "acquire", "req-d", "file-d")
-            require(owner.get("granted") is True, f"discard owner acquire failed: {owner}")
-            owner_tab_id = call(tab_d, "currentTabId")
+            stuck = call(tab_d, "acquire", "req-d", "file-d")
+            require(stuck.get("granted") is True, f"stuck owner acquire failed: {stuck}")
+            stale_lease_id = stuck["leaseId"]
 
-            tab_a.bring_to_front()
-            call(tab_a, "discardTab", owner_tab_id)
+            time.sleep(46)
+            after_expiry = call(tab_a, "acquire", "req-e", "file-e")
+            require(
+                after_expiry.get("granted") is True,
+                f"expired lease did not hand off: {after_expiry}",
+            )
 
-            deadline = time.time() + 3
-            after_discard = {"granted": False}
-            while time.time() < deadline:
-                after_discard = call(tab_a, "acquire", "req-e", "file-e")
-                if after_discard.get("granted"):
-                    break
-                time.sleep(0.1)
-            require(after_discard.get("granted") is True, f"discard handoff failed: {after_discard}")
-            call(tab_a, "release", "req-e", after_discard["leaseId"])
+            stale_renew = call(tab_d, "renew", "req-d", stale_lease_id)
+            require(
+                stale_renew.get("granted") is False,
+                f"stale fencing token was accepted: {stale_renew}",
+            )
+            call(tab_a, "release", "req-e", after_expiry["leaseId"])
 
             print(f"extension_id={extension_id}")
-            print("PASS mutual-exclusion renew release close-handoff discard-handoff")
+            print("PASS mutual-exclusion renew release close-handoff expiry-fencing")
             context.close()
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)

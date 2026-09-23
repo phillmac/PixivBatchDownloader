@@ -46,18 +46,4 @@ window.leaseTest = {
       leaseId,
     })
   },
-  currentTabId() {
-    return new Promise((resolve) => {
-      chrome.tabs.getCurrent((tab) => resolve(tab.id))
-    })
-  },
-  discardTab(tabId) {
-    return new Promise((resolve, reject) => {
-      chrome.tabs.discard(tabId, (tab) => {
-        const error = chrome.runtime.lastError
-        if (error) return reject(new Error(error.message))
-        resolve(tab?.id)
-      })
-    })
-  },
 }
