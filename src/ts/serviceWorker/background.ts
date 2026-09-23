@@ -51,6 +51,7 @@ const globalDownloadLeaseMsg = {
   renew: 'global_download_lease_renew',
   release: 'global_download_lease_release',
 } as const
+const globalDownloadLeasePortName = 'global-download-lease'
 const globalDownloadLeaseStorageKey = 'globalDownloadLease'
 const globalDownloadLeaseTtlMs = 45000
 
@@ -212,10 +213,9 @@ async function handleGlobalDownloadLeaseMessageLocked(
 
 async function handleGlobalDownloadLeaseMessage(
   msg: GlobalDownloadLeaseMessage,
-  sender: browser.Runtime.MessageSender
+  tabId: number
 ): Promise<GlobalDownloadLeaseReply> {
-  const tabId = sender.tab?.id
-  if (tabId === undefined || !msg.requestId) {
+  if (!msg.requestId) {
     return { granted: false, retryAfterMs: 1000 }
   }
 
@@ -250,13 +250,34 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 })
 
+browser.runtime.onConnect.addListener((port) => {
+  if (port.name !== globalDownloadLeasePortName) return
+
+  const tabId = port.sender?.tab?.id
+  if (tabId === undefined) {
+    port.disconnect()
+    return
+  }
+
+  port.onMessage.addListener((msg: unknown) => {
+    if (!isGlobalDownloadLeaseMessage(msg)) return
+
+    handleGlobalDownloadLeaseMessage(msg, tabId)
+      .then((reply) => port.postMessage(reply))
+      .catch((error) => {
+        console.error('Global download lease port message failed', error)
+        port.postMessage({ granted: false, retryAfterMs: 1000 })
+      })
+  })
+})
+
 // 类型守卫，这是为了通过类型检查，所以只要求有 msg 属性
 // 如果检查了其他属性，那么对于只有 msg 属性的简单消息就会不通过。所以不检查其他属性
 function isMsg(msg: any): msg is SendToBackEndData {
   return !!msg.msg
 }
 
-async function handleRuntimeMessage(
+browser.runtime.onMessage.addListener(async function (
   msg: unknown,
   sender: browser.Runtime.MessageSender
 ) {
@@ -378,30 +399,7 @@ async function handleRuntimeMessage(
   }
 
   return false
-}
-
-const runtimeMessageListener = (
-  msg: unknown,
-  sender: browser.Runtime.MessageSender,
-  sendResponse: (response: unknown) => void
-) => {
-  if (isGlobalDownloadLeaseMessage(msg)) {
-    handleGlobalDownloadLeaseMessage(msg, sender)
-      .then(sendResponse)
-      .catch((error) => {
-        console.error('Global download lease message failed', error)
-        sendResponse({ granted: false, retryAfterMs: 1000 })
-      })
-    return true
-  }
-
-  void handleRuntimeMessage(msg, sender)
-  return undefined
-}
-
-browser.runtime.onMessage.addListener(
-  runtimeMessageListener as browser.Runtime.OnMessageListener
-)
+})
 
 const isFirefox = navigator.userAgent.includes('Firefox')
 

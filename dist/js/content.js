@@ -25739,8 +25739,29 @@ const globalDownloadLeaseMsg = {
     renew: 'global_download_lease_renew',
     release: 'global_download_lease_release',
 };
+const globalDownloadLeasePortName = 'global-download-lease';
 const renewIntervalMs = 10000;
 const defaultRetryAfterMs = 500;
+function sendGlobalDownloadLeaseMessage(message) {
+    const port = webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.connect({ name: globalDownloadLeasePortName });
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        port.onMessage.addListener((reply) => {
+            if (settled)
+                return;
+            settled = true;
+            resolve(reply);
+            port.disconnect();
+        });
+        port.onDisconnect.addListener(() => {
+            if (settled)
+                return;
+            settled = true;
+            reject(new Error('Global download lease port disconnected before reply'));
+        });
+        port.postMessage(message);
+    });
+}
 class GlobalDownloadLeaseLostError extends Error {
     constructor() {
         super('Global download lease lost');
@@ -25759,11 +25780,11 @@ class GlobalDownloadLease {
     static async acquire(fileId, cancelled) {
         const requestId = crypto.randomUUID();
         while (!cancelled()) {
-            const reply = (await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.sendMessage({
+            const reply = await sendGlobalDownloadLeaseMessage({
                 msg: globalDownloadLeaseMsg.acquire,
                 requestId,
                 fileId,
-            }));
+            });
             if (reply?.granted && reply.leaseId) {
                 const lease = new GlobalDownloadLease(requestId, reply.leaseId);
                 if (cancelled()) {
@@ -25784,11 +25805,11 @@ class GlobalDownloadLease {
         if (!force && Date.now() - this.lastRenewAt < renewIntervalMs) {
             return;
         }
-        const reply = (await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.sendMessage({
+        const reply = await sendGlobalDownloadLeaseMessage({
             msg: globalDownloadLeaseMsg.renew,
             requestId: this.requestId,
             leaseId: this.leaseId,
-        }));
+        });
         if (!reply?.granted) {
             throw new GlobalDownloadLeaseLostError();
         }
@@ -25800,7 +25821,7 @@ class GlobalDownloadLease {
         }
         this.released = true;
         try {
-            await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.sendMessage({
+            await sendGlobalDownloadLeaseMessage({
                 msg: globalDownloadLeaseMsg.release,
                 requestId: this.requestId,
                 leaseId: this.leaseId,

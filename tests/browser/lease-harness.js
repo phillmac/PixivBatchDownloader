@@ -1,13 +1,26 @@
 function send(message) {
+  const port = chrome.runtime.connect({ name: 'global-download-lease' })
+
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(message, (reply) => {
-      const error = chrome.runtime.lastError
-      if (error) {
-        reject(new Error(error.message))
-        return
-      }
+    let settled = false
+
+    port.onMessage.addListener((reply) => {
+      if (settled) return
+      settled = true
       resolve(reply)
+      port.disconnect()
     })
+
+    port.onDisconnect.addListener(() => {
+      if (settled) return
+      settled = true
+      const error = chrome.runtime.lastError
+      reject(
+        new Error(error?.message || 'Lease port disconnected before reply')
+      )
+    })
+
+    port.postMessage(message)
   })
 }
 

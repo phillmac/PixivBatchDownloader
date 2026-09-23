@@ -1933,6 +1933,7 @@ const globalDownloadLeaseMsg = {
     renew: 'global_download_lease_renew',
     release: 'global_download_lease_release',
 };
+const globalDownloadLeasePortName = 'global-download-lease';
 const globalDownloadLeaseStorageKey = 'globalDownloadLease';
 const globalDownloadLeaseTtlMs = 45000;
 let activeGlobalDownloadLease;
@@ -2023,9 +2024,8 @@ async function handleGlobalDownloadLeaseMessageLocked(msg, tabId) {
     }
     return { granted: false };
 }
-async function handleGlobalDownloadLeaseMessage(msg, sender) {
-    const tabId = sender.tab?.id;
-    if (tabId === undefined || !msg.requestId) {
+async function handleGlobalDownloadLeaseMessage(msg, tabId) {
+    if (!msg.requestId) {
         return { granted: false, retryAfterMs: 1000 };
     }
     return serializeGlobalDownloadLease(() => handleGlobalDownloadLeaseMessageLocked(msg, tabId));
@@ -2050,12 +2050,31 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onUpdated.addL
         });
     }
 });
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onConnect.addListener((port) => {
+    if (port.name !== globalDownloadLeasePortName)
+        return;
+    const tabId = port.sender?.tab?.id;
+    if (tabId === undefined) {
+        port.disconnect();
+        return;
+    }
+    port.onMessage.addListener((msg) => {
+        if (!isGlobalDownloadLeaseMessage(msg))
+            return;
+        handleGlobalDownloadLeaseMessage(msg, tabId)
+            .then((reply) => port.postMessage(reply))
+            .catch((error) => {
+            console.error('Global download lease port message failed', error);
+            port.postMessage({ granted: false, retryAfterMs: 1000 });
+        });
+    });
+});
 // 类型守卫，这是为了通过类型检查，所以只要求有 msg 属性
 // 如果检查了其他属性，那么对于只有 msg 属性的简单消息就会不通过。所以不检查其他属性
 function isMsg(msg) {
     return !!msg.msg;
 }
-async function handleRuntimeMessage(msg, sender) {
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.addListener(async function (msg, sender) {
     // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
     // 不能直接在上面设置类型为 msg: SendToBackEndData，否则会报错。因此需要使用类型守卫，真麻烦
     if (!isMsg(msg)) {
@@ -2162,21 +2181,7 @@ async function handleRuntimeMessage(msg, sender) {
         }
     }
     return false;
-}
-const runtimeMessageListener = (msg, sender, sendResponse) => {
-    if (isGlobalDownloadLeaseMessage(msg)) {
-        handleGlobalDownloadLeaseMessage(msg, sender)
-            .then(sendResponse)
-            .catch((error) => {
-            console.error('Global download lease message failed', error);
-            sendResponse({ granted: false, retryAfterMs: 1000 });
-        });
-        return true;
-    }
-    void handleRuntimeMessage(msg, sender);
-    return undefined;
-};
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.addListener(runtimeMessageListener);
+});
 const isFirefox = navigator.userAgent.includes('Firefox');
 async function getFileURL(msg) {
     // 在 Chrome 的隐私窗口里，使用 dataURL
