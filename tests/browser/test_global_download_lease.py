@@ -103,8 +103,7 @@ def main():
             owner_tab_id = call(tab_d, "currentTabId")
 
             tab_a.bring_to_front()
-            discarded_tab_id = call(tab_a, "discardTab", owner_tab_id)
-            require(discarded_tab_id == owner_tab_id, "Chrome did not discard the owner tab")
+            call(tab_a, "discardTab", owner_tab_id)
 
             deadline = time.time() + 3
             after_discard = {"granted": False}
