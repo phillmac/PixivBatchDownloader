@@ -46,6 +46,210 @@ async function setData(data: { [key: string]: any }) {
   return browser.storage.local.set(data)
 }
 
+const globalDownloadLeaseMsg = {
+  acquire: 'global_download_lease_acquire',
+  renew: 'global_download_lease_renew',
+  release: 'global_download_lease_release',
+} as const
+const globalDownloadLeaseStorageKey = 'globalDownloadLease'
+const globalDownloadLeaseTtlMs = 45000
+
+interface GlobalDownloadLeaseMessage {
+  msg:
+    | typeof globalDownloadLeaseMsg.acquire
+    | typeof globalDownloadLeaseMsg.renew
+    | typeof globalDownloadLeaseMsg.release
+  requestId: string
+  fileId?: string
+  leaseId?: string
+}
+
+interface GlobalDownloadLeaseReply {
+  granted: boolean
+  leaseId?: string
+  retryAfterMs?: number
+}
+
+interface StoredGlobalDownloadLease {
+  leaseId: string
+  requestId: string
+  tabId: number
+  fileId: string
+  expiresAt: number
+}
+
+let activeGlobalDownloadLease: StoredGlobalDownloadLease | null | undefined
+let globalDownloadLeaseOperationQueue: Promise<void> = Promise.resolve()
+
+function serializeGlobalDownloadLease<T>(
+  operation: () => Promise<T>
+): Promise<T> {
+  const result = globalDownloadLeaseOperationQueue.then(operation, operation)
+  globalDownloadLeaseOperationQueue = result.then(
+    () => undefined,
+    () => undefined
+  )
+  return result
+}
+
+function isGlobalDownloadLeaseMessage(
+  value: any
+): value is GlobalDownloadLeaseMessage {
+  return (
+    value?.msg === globalDownloadLeaseMsg.acquire ||
+    value?.msg === globalDownloadLeaseMsg.renew ||
+    value?.msg === globalDownloadLeaseMsg.release
+  )
+}
+
+function isStoredGlobalDownloadLease(
+  value: any
+): value is StoredGlobalDownloadLease {
+  return (
+    typeof value?.leaseId === 'string' &&
+    typeof value?.requestId === 'string' &&
+    typeof value?.tabId === 'number' &&
+    typeof value?.fileId === 'string' &&
+    typeof value?.expiresAt === 'number'
+  )
+}
+
+async function loadGlobalDownloadLease(): Promise<StoredGlobalDownloadLease | null> {
+  if (activeGlobalDownloadLease !== undefined) {
+    return activeGlobalDownloadLease
+  }
+
+  const data = await browser.storage.session.get(globalDownloadLeaseStorageKey)
+  const stored = data[globalDownloadLeaseStorageKey]
+  activeGlobalDownloadLease = isStoredGlobalDownloadLease(stored)
+    ? stored
+    : null
+  return activeGlobalDownloadLease
+}
+
+async function storeGlobalDownloadLease(
+  lease: StoredGlobalDownloadLease
+): Promise<void> {
+  await browser.storage.session.set({
+    [globalDownloadLeaseStorageKey]: lease,
+  })
+  activeGlobalDownloadLease = lease
+}
+
+async function clearGlobalDownloadLease(): Promise<void> {
+  await browser.storage.session.remove(globalDownloadLeaseStorageKey)
+  activeGlobalDownloadLease = null
+}
+
+function globalDownloadLeaseMatches(
+  lease: StoredGlobalDownloadLease,
+  tabId: number,
+  requestId: string,
+  leaseId?: string
+): boolean {
+  return (
+    lease.tabId === tabId &&
+    lease.requestId === requestId &&
+    (!leaseId || lease.leaseId === leaseId)
+  )
+}
+
+async function handleGlobalDownloadLeaseMessageLocked(
+  msg: GlobalDownloadLeaseMessage,
+  tabId: number
+): Promise<GlobalDownloadLeaseReply> {
+  const now = Date.now()
+  const current = await loadGlobalDownloadLease()
+
+  if (msg.msg === globalDownloadLeaseMsg.acquire) {
+    if (current && current.expiresAt > now) {
+      if (globalDownloadLeaseMatches(current, tabId, msg.requestId)) {
+        return { granted: true, leaseId: current.leaseId }
+      }
+
+      return {
+        granted: false,
+        retryAfterMs: Math.min(1000, Math.max(100, current.expiresAt - now)),
+      }
+    }
+
+    if (!msg.fileId) {
+      return { granted: false, retryAfterMs: 1000 }
+    }
+
+    const lease: StoredGlobalDownloadLease = {
+      leaseId: crypto.randomUUID(),
+      requestId: msg.requestId,
+      tabId,
+      fileId: msg.fileId,
+      expiresAt: now + globalDownloadLeaseTtlMs,
+    }
+    await storeGlobalDownloadLease(lease)
+    return { granted: true, leaseId: lease.leaseId }
+  }
+
+  if (
+    current &&
+    msg.leaseId &&
+    globalDownloadLeaseMatches(current, tabId, msg.requestId, msg.leaseId)
+  ) {
+    if (msg.msg === globalDownloadLeaseMsg.renew) {
+      // An expired owner may revive only if nobody has replaced its fencing token.
+      const renewed = {
+        ...current,
+        expiresAt: now + globalDownloadLeaseTtlMs,
+      }
+      await storeGlobalDownloadLease(renewed)
+      return { granted: true, leaseId: renewed.leaseId }
+    }
+
+    await clearGlobalDownloadLease()
+    return { granted: true }
+  }
+
+  return { granted: false }
+}
+
+async function handleGlobalDownloadLeaseMessage(
+  msg: GlobalDownloadLeaseMessage,
+  sender: browser.Runtime.MessageSender
+): Promise<GlobalDownloadLeaseReply> {
+  const tabId = sender.tab?.id
+  if (tabId === undefined || !msg.requestId) {
+    return { granted: false, retryAfterMs: 1000 }
+  }
+
+  return serializeGlobalDownloadLease(() =>
+    handleGlobalDownloadLeaseMessageLocked(msg, tabId)
+  )
+}
+
+async function clearGlobalDownloadLeaseForTab(tabId: number): Promise<void> {
+  await serializeGlobalDownloadLease(async () => {
+    const current = await loadGlobalDownloadLease()
+    if (current?.tabId === tabId) {
+      await clearGlobalDownloadLease()
+    }
+  })
+}
+
+browser.tabs.onRemoved.addListener((tabId) => {
+  clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
+    console.warn('Failed to clear global download lease for closed tab', error)
+  })
+})
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.discarded === true) {
+    clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
+      console.warn(
+        'Failed to clear global download lease for discarded tab',
+        error
+      )
+    })
+  }
+})
+
 // 类型守卫，这是为了通过类型检查，所以只要求有 msg 属性
 // 如果检查了其他属性，那么对于只有 msg 属性的简单消息就会不通过。所以不检查其他属性
 function isMsg(msg: any): msg is SendToBackEndData {
@@ -61,6 +265,10 @@ browser.runtime.onMessage.addListener(async function (
   if (!isMsg(msg)) {
     console.warn('收到了无效的消息:', msg)
     return false
+  }
+
+  if (isGlobalDownloadLeaseMessage(msg)) {
+    return handleGlobalDownloadLeaseMessage(msg, sender)
   }
 
   const tabId = sender.tab!.id!
