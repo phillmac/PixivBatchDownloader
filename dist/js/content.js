@@ -22931,6 +22931,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_16__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
 /* harmony import */ var _DownloadStates__WEBPACK_IMPORTED_MODULE_17__ = __webpack_require__(/*! ./DownloadStates */ "./src/ts/download/DownloadStates.ts");
 /* harmony import */ var _DownloadInterval__WEBPACK_IMPORTED_MODULE_18__ = __webpack_require__(/*! ./DownloadInterval */ "./src/ts/download/DownloadInterval.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -23044,46 +23046,60 @@ class Download {
         // 保存 catch 里的响应状态码
         let status = 0;
         try {
-            const response = await fetch(url, { signal: controller.signal });
-            const contentType = response.headers
-                .get('Content-Type')
-                ?.split(';')[0]
-                .trim();
-            status = response.status;
-            // 状态码错误，抛出异常进入重试流程
-            if (!response.ok) {
-                throw new Error(`HTTP error ${response.status}`);
-            }
-            // 获取文件总体积
-            // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
-            const contentLength = response.headers.get('Content-Length') || '0';
-            const total = parseInt(contentLength, 10);
-            // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
-            const sizeCheck = await this.checkSize(result, total);
-            if (!sizeCheck) {
-                // 当因为体积问题跳过下载时，直接把进度条拉满
-                // 如果不把进度条拉满，用户看到这个文件的进度条只有一点点，就会以为下载卡住或出错了
-                this.setProgressBar(_fileName, 1, 1);
-            }
-            if (this.cancel) {
-                controller.abort();
+            const lease = await _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.GlobalDownloadLease.acquire(arg.id, () => this.cancel);
+            if (!lease) {
                 return;
             }
-            // 使用 ReadableStream 读取响应体，跟踪下载进度
-            const reader = response.body.getReader();
+            this.lastRequestTime = Date.now();
+            let contentType;
+            let total = 0;
             const chunks = [];
-            let loaded = 0;
-            while (true) {
+            try {
+                const response = await fetch(url, { signal: controller.signal });
+                contentType = response.headers.get('Content-Type')?.split(';')[0].trim();
+                status = response.status;
+                // 状态码错误，抛出异常进入重试流程
+                if (!response.ok) {
+                    throw new Error(`HTTP error ${response.status}`);
+                }
+                // 获取文件总体积
+                // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
+                const contentLength = response.headers.get('Content-Length') || '0';
+                total = parseInt(contentLength, 10);
+                // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
+                const sizeCheck = await this.checkSize(result, total);
+                if (!sizeCheck) {
+                    // 当因为体积问题跳过下载时，直接把进度条拉满
+                    // 如果不把进度条拉满，用户看到这个文件的进度条只有一点点，就会以为下载卡住或出错了
+                    this.setProgressBar(_fileName, 1, 1);
+                }
                 if (this.cancel) {
-                    reader.cancel();
+                    controller.abort();
                     return;
                 }
-                const { done, value } = await reader.read();
-                if (done)
-                    break;
-                chunks.push(value);
-                loaded += value.length;
-                this.setProgressBar(_fileName, loaded, total);
+                // 使用 ReadableStream 读取响应体，跟踪下载进度
+                const reader = response.body.getReader();
+                let loaded = 0;
+                while (true) {
+                    if (this.cancel) {
+                        reader.cancel();
+                        return;
+                    }
+                    const { done, value } = await reader.read();
+                    // Renew only when the stream makes progress. The forced EOF check also
+                    // fences out a tab that was suspended long enough for another tab to
+                    // reclaim the expired lease.
+                    await lease.renew(done);
+                    if (done)
+                        break;
+                    chunks.push(value);
+                    loaded += value.length;
+                    this.setProgressBar(_fileName, loaded, total);
+                }
+            }
+            finally {
+                controller.abort();
+                await lease.release();
             }
             // 组装 Blob
             let file = new Blob(chunks, {
@@ -23135,6 +23151,9 @@ class Download {
         catch (error) {
             if (this.cancel) {
                 return;
+            }
+            if (error instanceof _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.GlobalDownloadLeaseLostError) {
+                return this.download(arg);
             }
             // AbortError 表示请求被主动中断，不需要重试
             if (error.name === 'AbortError') {
@@ -25694,6 +25713,128 @@ class ExportResult2CSV {
     }
 }
 new ExportResult2CSV();
+
+
+/***/ },
+
+/***/ "./src/ts/download/GlobalDownloadLease.ts"
+/*!************************************************!*\
+  !*** ./src/ts/download/GlobalDownloadLease.ts ***!
+  \************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   GlobalDownloadLease: () => (/* binding */ GlobalDownloadLease),
+/* harmony export */   GlobalDownloadLeaseLostError: () => (/* binding */ GlobalDownloadLeaseLostError)
+/* harmony export */ });
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var _utils_Utils__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../utils/Utils */ "./src/ts/utils/Utils.ts");
+
+
+const globalDownloadLeaseMsg = {
+    acquire: 'global_download_lease_acquire',
+    renew: 'global_download_lease_renew',
+    release: 'global_download_lease_release',
+};
+const globalDownloadLeasePortName = 'global-download-lease';
+const renewIntervalMs = 10000;
+const defaultRetryAfterMs = 500;
+function sendGlobalDownloadLeaseMessage(message) {
+    const port = webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.connect({ name: globalDownloadLeasePortName });
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        port.onMessage.addListener((reply) => {
+            if (settled)
+                return;
+            settled = true;
+            resolve(reply);
+            port.disconnect();
+        });
+        port.onDisconnect.addListener(() => {
+            if (settled)
+                return;
+            settled = true;
+            reject(new Error('Global download lease port disconnected before reply'));
+        });
+        port.postMessage(message);
+    });
+}
+class GlobalDownloadLeaseLostError extends Error {
+    constructor() {
+        super('Global download lease lost');
+        this.name = 'GlobalDownloadLeaseLostError';
+    }
+}
+class GlobalDownloadLease {
+    requestId;
+    leaseId;
+    released = false;
+    lastRenewAt = Date.now();
+    constructor(requestId, leaseId) {
+        this.requestId = requestId;
+        this.leaseId = leaseId;
+    }
+    static async acquire(fileId, cancelled) {
+        const requestId = crypto.randomUUID();
+        while (!cancelled()) {
+            const reply = await sendGlobalDownloadLeaseMessage({
+                msg: globalDownloadLeaseMsg.acquire,
+                requestId,
+                fileId,
+            });
+            if (reply?.granted && reply.leaseId) {
+                const lease = new GlobalDownloadLease(requestId, reply.leaseId);
+                if (cancelled()) {
+                    await lease.release();
+                    return null;
+                }
+                return lease;
+            }
+            const retryAfterMs = Math.max(100, Math.min(reply?.retryAfterMs || defaultRetryAfterMs, 1000));
+            await _utils_Utils__WEBPACK_IMPORTED_MODULE_1__.Utils.sleep(retryAfterMs);
+        }
+        return null;
+    }
+    async renew(force = false) {
+        if (this.released) {
+            throw new GlobalDownloadLeaseLostError();
+        }
+        if (!force && Date.now() - this.lastRenewAt < renewIntervalMs) {
+            return;
+        }
+        const reply = await sendGlobalDownloadLeaseMessage({
+            msg: globalDownloadLeaseMsg.renew,
+            requestId: this.requestId,
+            leaseId: this.leaseId,
+        });
+        if (!reply?.granted) {
+            throw new GlobalDownloadLeaseLostError();
+        }
+        this.lastRenewAt = Date.now();
+    }
+    async release() {
+        if (this.released) {
+            return;
+        }
+        this.released = true;
+        try {
+            await sendGlobalDownloadLeaseMessage({
+                msg: globalDownloadLeaseMsg.release,
+                requestId: this.requestId,
+                leaseId: this.leaseId,
+            });
+        }
+        catch (error) {
+            // The stored lease expires, so a failed best-effort release must not
+            // turn a successfully fetched file into a download failure.
+            console.warn('Failed to release global download lease', error);
+        }
+    }
+}
+
 
 
 /***/ },
