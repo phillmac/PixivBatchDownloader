@@ -93,3 +93,18 @@ test('persist keeps only the newest twenty incident reports', async () => {
   assert.equal(reports[0].report.sequence, 3)
   assert.equal(reports.at(-1).report.sequence, 22)
 })
+
+test('concurrent persistence keeps every incident report', async () => {
+  const h = harness()
+  await Promise.all(
+    Array.from({ length: 8 }, (_, sequence) =>
+      h.diagnostics.persist(7, { sequence })
+    )
+  )
+  const reports = h.stored.downloadHangDiagnostics
+  assert.equal(reports.length, 8)
+  assert.equal(
+    Array.from(reports, (entry) => entry.report.sequence).join(','),
+    '0,1,2,3,4,5,6,7'
+  )
+})

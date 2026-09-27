@@ -13,13 +13,21 @@ function harness() {
   const messages = []
   const elements = new Map()
   let timerId = 0
-  const h = { now: 0, timers, listeners, messages, elements }
+  const h = {
+    now: 0,
+    timers,
+    listeners,
+    messages,
+    elements,
+    workerResponse: undefined,
+  }
   const browser = {
     runtime: {
       onMessage: { addListener: (fn) => listeners.push(fn) },
       async sendMessage(msg) {
         messages.push(msg)
         if (msg.msg === 'get_download_worker_diagnostics') {
+          if (h.workerResponse) return h.workerResponse
           return { active: [], marker: 'worker-snapshot' }
         }
         return { stored: true }
@@ -172,4 +180,29 @@ test('manual diagnostic request returns page and worker state', async () => {
   const report = await listener({ msg: 'get_download_diagnostics' })
   assert.equal(report.worker.marker, 'worker-snapshot')
   assert.equal(report.activeTasks[0].workId, '999')
+})
+
+test('report keeps the page snapshot captured before worker lookup completes', async () => {
+  const h = harness()
+  const d = h.downloadDiagnostics
+  const id = d.start({
+    workId: 'delayed-worker',
+    index: 2,
+    progressBarIndex: 0,
+    taskBatch: 900,
+    workType: 3,
+  })
+  let resolveWorker
+  h.workerResponse = new Promise((resolve) => {
+    resolveWorker = resolve
+  })
+
+  const reportPromise = d.getReport()
+  d.finish(id, 'completed-during-worker-snapshot')
+  resolveWorker({ marker: 'late-worker-snapshot' })
+  const report = await reportPromise
+
+  assert.equal(report.worker.marker, 'late-worker-snapshot')
+  assert.equal(report.activeTasks[0].workId, 'delayed-worker')
+  assert.equal(d.pageSnapshot().activeTasks.length, 0)
 })

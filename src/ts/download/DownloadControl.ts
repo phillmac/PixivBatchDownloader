@@ -226,9 +226,9 @@ class DownloadControl {
       if (msg.msg === 'downloaded') {
         try {
           if (msg.data.diagnosticId) {
-            downloadDiagnostics.finish(
+            downloadDiagnostics.enter(
               msg.data.diagnosticId,
-              'page-download-complete',
+              'page-download-result-received',
               { browserDownloadId: msg.data.browserDownloadId }
             )
           }
@@ -237,7 +237,14 @@ class DownloadControl {
           // 发送下载成功的事件
           EVT.fire('downloadSuccess', msg.data)
 
-          this.downloadOrSkipAFile(msg.data)
+          const advanced = this.downloadOrSkipAFile(msg.data)
+          if (advanced && msg.data.diagnosticId) {
+            downloadDiagnostics.finish(
+              msg.data.diagnosticId,
+              'page-download-complete',
+              { browserDownloadId: msg.data.browserDownloadId }
+            )
+          }
         } catch (error) {
           // 捕获此分支内的异常，避免事件监听器或推进逻辑的错误导致任务卡住却没有提示
           console.error('downloaded 分支执行出错', error)
@@ -691,9 +698,11 @@ class DownloadControl {
       if (this.checkContinueDownload()) {
         this.createDownload(no)
       }
+      return true
     } catch (error) {
       // 捕获推进任务时的异常，避免任务卡住却没有提示
       console.error('downloadOrSkipAFile 执行出错', error)
+      return false
     }
   }
 

@@ -1,9 +1,13 @@
 import browser from 'webextension-polyfill'
 
+/** 每个标签页保留的最近 worker 诊断事件数量。 */
 const EVENT_LIMIT = 240
+/** 持久化保留的疑似卡住报告数量。 */
 const REPORT_LIMIT = 20
+/** 疑似卡住报告的 storage.local 键名。 */
 const REPORT_STORAGE_KEY = 'downloadHangDiagnostics'
 
+/** Service worker 侧仍在处理的下载诊断任务。 */
 interface WorkerTask {
   diagnosticId: string
   tabId: number
@@ -14,6 +18,7 @@ interface WorkerTask {
   browserDownloadId?: number
 }
 
+/** Service worker 侧诊断事件。 */
 interface WorkerEvent {
   at: string
   diagnosticId: string
@@ -22,10 +27,16 @@ interface WorkerEvent {
   details?: Record<string, unknown>
 }
 
+/** 跟踪 service worker 下载阶段并持久化异常诊断报告。 */
 class DownloadWorkerDiagnostics {
+  /** 当前仍在 worker 中活动的诊断任务。 */
   private readonly active = new Map<string, WorkerTask>()
+  /** 按标签页保存的有界 worker 诊断事件。 */
   private readonly events = new Map<number, WorkerEvent[]>()
+  /** 串行化持久化报告的队列，防止并发读改写丢失数据。 */
+  private persistQueue: Promise<void> = Promise.resolve()
 
+  /** 记录 worker 侧任务进入新的诊断阶段。 */
   public enter(
     tabId: number,
     diagnosticId: string | undefined,
@@ -67,6 +78,7 @@ class DownloadWorkerDiagnostics {
     this.events.set(tabId, events)
   }
 
+  /** 记录最终 worker 阶段并移除活动任务。 */
   public finish(
     tabId: number,
     diagnosticId: string | undefined,
@@ -78,6 +90,7 @@ class DownloadWorkerDiagnostics {
     this.active.delete(diagnosticId)
   }
 
+  /** 捕获指定标签页的 worker 状态及已知 Chrome 下载状态。 */
   public async snapshot(
     tabId: number,
     bookkeeping: Record<string, unknown> = {}
@@ -131,18 +144,28 @@ class DownloadWorkerDiagnostics {
     }
   }
 
-  public async persist(tabId: number, report: unknown) {
-    const stored = await browser.storage.local.get(REPORT_STORAGE_KEY)
-    const reports = Array.isArray(stored[REPORT_STORAGE_KEY])
-      ? stored[REPORT_STORAGE_KEY]
-      : []
-    reports.push({ tabId, storedAt: new Date().toISOString(), report })
-    if (reports.length > REPORT_LIMIT) {
-      reports.splice(0, reports.length - REPORT_LIMIT)
+  /** 串行化 storage.local 的读改写，避免并发异常报告相互覆盖。 */
+  public persist(tabId: number, report: unknown) {
+    const write = async () => {
+      const stored = await browser.storage.local.get(REPORT_STORAGE_KEY)
+      const reports = Array.isArray(stored[REPORT_STORAGE_KEY])
+        ? stored[REPORT_STORAGE_KEY]
+        : []
+      reports.push({ tabId, storedAt: new Date().toISOString(), report })
+      if (reports.length > REPORT_LIMIT) {
+        reports.splice(0, reports.length - REPORT_LIMIT)
+      }
+      await browser.storage.local.set({ [REPORT_STORAGE_KEY]: reports })
     }
-    await browser.storage.local.set({ [REPORT_STORAGE_KEY]: reports })
+    const result = this.persistQueue.then(write, write)
+    this.persistQueue = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
   }
 }
 
+/** Service worker 侧下载诊断单例。 */
 const downloadWorkerDiagnostics = new DownloadWorkerDiagnostics()
 export { downloadWorkerDiagnostics }
