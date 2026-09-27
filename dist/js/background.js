@@ -1928,33 +1928,55 @@ let idList = {};
 async function setData(data) {
     return webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.set(data);
 }
+/** 全局下载租约协议使用的消息名称。 */
 const globalDownloadLeaseMsg = {
     acquire: 'global_download_lease_acquire',
     renew: 'global_download_lease_renew',
     release: 'global_download_lease_release',
 };
+/** 全局下载租约专用的 runtime port 名称。 */
 const globalDownloadLeasePortName = 'global-download-lease';
+/** 在 session storage 中保存全局下载租约的键名。 */
 const globalDownloadLeaseStorageKey = 'globalDownloadLease';
+/** 没有进度续租时，一个下载租约最多保留 45 秒。 */
 const globalDownloadLeaseTtlMs = 45000;
+/** 当前 Service Worker 实例缓存的租约；undefined 表示尚未从存储加载。 */
 let activeGlobalDownloadLease;
+/** 串行化租约读写，避免两个标签页同时修改 session storage。 */
 let globalDownloadLeaseOperationQueue = Promise.resolve();
+/** 把一个租约操作排到前一个租约操作之后执行。 */
 function serializeGlobalDownloadLease(operation) {
     const result = globalDownloadLeaseOperationQueue.then(operation, operation);
     globalDownloadLeaseOperationQueue = result.then(() => undefined, () => undefined);
     return result;
 }
+/** 判断 unknown 值是否是可安全读取属性的对象。 */
+function isRecord(value) {
+    return typeof value === 'object' && value !== null;
+}
+/** 校验来自 runtime port 的租约消息结构。 */
 function isGlobalDownloadLeaseMessage(value) {
-    return (value?.msg === globalDownloadLeaseMsg.acquire ||
-        value?.msg === globalDownloadLeaseMsg.renew ||
-        value?.msg === globalDownloadLeaseMsg.release);
+    if (!isRecord(value) || typeof value.requestId !== 'string')
+        return false;
+    if (value.fileId !== undefined && typeof value.fileId !== 'string')
+        return false;
+    if (value.leaseId !== undefined && typeof value.leaseId !== 'string')
+        return false;
+    return (value.msg === globalDownloadLeaseMsg.acquire ||
+        value.msg === globalDownloadLeaseMsg.renew ||
+        value.msg === globalDownloadLeaseMsg.release);
 }
+/** 校验从 session storage 读取出的租约结构。 */
 function isStoredGlobalDownloadLease(value) {
-    return (typeof value?.leaseId === 'string' &&
-        typeof value?.requestId === 'string' &&
-        typeof value?.tabId === 'number' &&
-        typeof value?.fileId === 'string' &&
-        typeof value?.expiresAt === 'number');
+    if (!isRecord(value))
+        return false;
+    return (typeof value.leaseId === 'string' &&
+        typeof value.requestId === 'string' &&
+        typeof value.tabId === 'number' &&
+        typeof value.fileId === 'string' &&
+        typeof value.expiresAt === 'number');
 }
+/** 从内存缓存或 session storage 读取当前租约。 */
 async function loadGlobalDownloadLease() {
     if (activeGlobalDownloadLease !== undefined) {
         return activeGlobalDownloadLease;
@@ -1966,21 +1988,25 @@ async function loadGlobalDownloadLease() {
         : null;
     return activeGlobalDownloadLease;
 }
+/** 同时更新 session storage 和当前 Service Worker 的租约缓存。 */
 async function storeGlobalDownloadLease(lease) {
     await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.session.set({
         [globalDownloadLeaseStorageKey]: lease,
     });
     activeGlobalDownloadLease = lease;
 }
+/** 清除当前全局下载租约。 */
 async function clearGlobalDownloadLease() {
     await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.session.remove(globalDownloadLeaseStorageKey);
     activeGlobalDownloadLease = null;
 }
+/** 检查租约是否仍然属于指定标签页、请求和 fencing token。 */
 function globalDownloadLeaseMatches(lease, tabId, requestId, leaseId) {
     return (lease.tabId === tabId &&
         lease.requestId === requestId &&
         (!leaseId || lease.leaseId === leaseId));
 }
+/** 在已经取得串行化锁的情况下执行 acquire、renew 或 release。 */
 async function handleGlobalDownloadLeaseMessageLocked(msg, tabId) {
     const now = Date.now();
     const current = await loadGlobalDownloadLease();
@@ -2024,12 +2050,14 @@ async function handleGlobalDownloadLeaseMessageLocked(msg, tabId) {
     }
     return { granted: false };
 }
+/** 串行执行一个来自指定标签页的租约操作。 */
 async function handleGlobalDownloadLeaseMessage(msg, tabId) {
     if (!msg.requestId) {
         return { granted: false, retryAfterMs: 1000 };
     }
     return serializeGlobalDownloadLease(() => handleGlobalDownloadLeaseMessageLocked(msg, tabId));
 }
+/** 如果当前租约属于指定标签页，则立即清除它。 */
 async function clearGlobalDownloadLeaseForTab(tabId) {
     await serializeGlobalDownloadLease(async () => {
         const current = await loadGlobalDownloadLease();
@@ -2044,9 +2072,10 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onRemoved.addL
     });
 });
 webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo.discarded === true) {
+    // 完整导航/刷新和 discarded 都会卸载旧文档，旧 content script 无法保证 finally 能执行。
+    if (changeInfo.discarded === true || changeInfo.status === 'loading') {
         clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
-            console.warn('Failed to clear global download lease for discarded tab', error);
+            console.warn('Failed to clear global download lease for unloaded tab', error);
         });
     }
 });

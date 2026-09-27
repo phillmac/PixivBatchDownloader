@@ -3,6 +3,7 @@ import { lang } from '../Language'
 import { SendDownload } from './SendDownload'
 import { Tools } from '../Tools'
 import { settings } from '../setting/Settings'
+import { fetchGlobalDownloadBody } from './GlobalDownloadLease'
 
 type Urls = {
   '240mw': string
@@ -91,18 +92,24 @@ class DownloadNovelGlossaryImage {
 
     console.log('get glossaryImage url', url)
     try {
-      const res = await fetch(url, {
-        method: 'get',
-        credentials: 'same-origin',
-      })
-      if (!res.ok) {
+      const download = await fetchGlobalDownloadBody(
+        url,
+        `novel-glossary:${url}`,
+        type,
+        {
+          method: 'get',
+          credentials: 'same-origin',
+        }
+      )
+      if (download === null) return null
+      const res = download.response
+      if (!res.ok || download.data === null) {
         const error = new Error(`${res.status} ${res.statusText}`)
         ;(error as any).status = res.status
         ;(error as any).statusText = res.statusText
         throw error
       }
-      const data = await res[type]()
-      return data
+      return download.data
     } catch (error: Error | any) {
       retry++
       // console.log(retry, url)

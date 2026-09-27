@@ -23492,13 +23492,16 @@ class Download {
         else {
             // 其他情况，使用 fetch 加载缩略图文件
             try {
-                const response = await fetch(thumbURL);
-                if (!response.ok) {
+                const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.fetchGlobalDownloadBody)(thumbURL, `${result.id}:ugoira-thumbnail`, 'blob', undefined, () => this.cancel);
+                if (download === null) {
+                    return;
+                }
+                if (!download.response.ok || download.data === null) {
                     // 如果请求成功但是状态码错误，就从 zip 文件里提取第一张图片来作为缩略图
                     thumbBlob = await _Tools__WEBPACK_IMPORTED_MODULE_16__.Tools.extractFirstImage(await zipFile.arrayBuffer());
                 }
                 else {
-                    thumbBlob = await response.blob();
+                    thumbBlob = download.data;
                 }
             }
             catch (error) {
@@ -24337,6 +24340,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _SendDownload__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./SendDownload */ "./src/ts/download/SendDownload.ts");
 /* harmony import */ var _setting_Settings__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ../setting/Settings */ "./src/ts/setting/Settings.ts");
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -24358,18 +24363,20 @@ class DownloadNovelCover {
     retryMax = 5;
     async getCover(url, type, retry = 0) {
         try {
-            const res = await fetch(url, {
+            const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_6__.fetchGlobalDownloadBody)(url, `novel-cover:${url}`, type, {
                 method: 'get',
                 credentials: 'same-origin',
             });
-            if (!res.ok) {
+            if (download === null)
+                return null;
+            const res = download.response;
+            if (!res.ok || download.data === null) {
                 const error = new Error(`${res.status} ${res.statusText}`);
                 error.status = res.status;
                 error.statusText = res.statusText;
                 throw error;
             }
-            const data = await res[type]();
-            return data;
+            return download.data;
         }
         catch (error) {
             retry++;
@@ -24414,6 +24421,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_7__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
 /* harmony import */ var _SendDownload__WEBPACK_IMPORTED_MODULE_8__ = __webpack_require__(/*! ./SendDownload */ "./src/ts/download/SendDownload.ts");
 /* harmony import */ var _EVT__WEBPACK_IMPORTED_MODULE_9__ = __webpack_require__(/*! ../EVT */ "./src/ts/EVT.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_10__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -24665,15 +24674,17 @@ class DownloadNovelEmbeddedImage {
     retryMax = 10;
     async getImage(url, type, id, title, retry = 0) {
         try {
-            const res = await fetch(url);
-            if (!res.ok) {
+            const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_10__.fetchGlobalDownloadBody)(url, `novel-image:${id}:${url}`, type, undefined, () => this.stop);
+            if (download === null)
+                return null;
+            const res = download.response;
+            if (!res.ok || download.data === null) {
                 const error = new Error(`${res.status} ${res.statusText}`);
                 error.status = res.status;
                 error.statusText = res.statusText;
                 throw error;
             }
-            const data = await res[type]();
-            return data;
+            return download.data;
         }
         catch (error) {
             // 发生网络错误时，有时候请求会立即结束并被捕获。但有时需要等比较长的时间，例如服务器错误的返回了 206 状态码，请求并不会立刻结束，而是要等到浏览器认为请求超时才会报错。可能需要等待 5 分钟
@@ -24716,6 +24727,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _SendDownload__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./SendDownload */ "./src/ts/download/SendDownload.ts");
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
 /* harmony import */ var _setting_Settings__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ../setting/Settings */ "./src/ts/setting/Settings.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -24766,18 +24779,20 @@ class DownloadNovelGlossaryImage {
         }
         console.log('get glossaryImage url', url);
         try {
-            const res = await fetch(url, {
+            const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_5__.fetchGlobalDownloadBody)(url, `novel-glossary:${url}`, type, {
                 method: 'get',
                 credentials: 'same-origin',
             });
-            if (!res.ok) {
+            if (download === null)
+                return null;
+            const res = download.response;
+            if (!res.ok || download.data === null) {
                 const error = new Error(`${res.status} ${res.statusText}`);
                 error.status = res.status;
                 error.statusText = res.statusText;
                 throw error;
             }
-            const data = await res[type]();
-            return data;
+            return download.data;
         }
         catch (error) {
             retry++;
@@ -25727,21 +25742,27 @@ new ExportResult2CSV();
 __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   GlobalDownloadLease: () => (/* binding */ GlobalDownloadLease),
-/* harmony export */   GlobalDownloadLeaseLostError: () => (/* binding */ GlobalDownloadLeaseLostError)
+/* harmony export */   GlobalDownloadLeaseLostError: () => (/* binding */ GlobalDownloadLeaseLostError),
+/* harmony export */   fetchGlobalDownloadBody: () => (/* binding */ fetchGlobalDownloadBody)
 /* harmony export */ });
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
 /* harmony import */ var _utils_Utils__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../utils/Utils */ "./src/ts/utils/Utils.ts");
 
 
+/** 全局下载租约协议使用的消息名称。 */
 const globalDownloadLeaseMsg = {
     acquire: 'global_download_lease_acquire',
     renew: 'global_download_lease_renew',
     release: 'global_download_lease_release',
 };
+/** 全局下载租约专用的 runtime port 名称。 */
 const globalDownloadLeasePortName = 'global-download-lease';
+/** 全局下载租约的续租间隔。只有读取到响应体进度时才会调用续租。 */
 const renewIntervalMs = 10000;
+/** 租约被其他标签页占用时的默认重试间隔。 */
 const defaultRetryAfterMs = 500;
+/** 通过专用 port 发送一次租约请求，避免和现有 onMessage 监听器竞争响应。 */
 function sendGlobalDownloadLeaseMessage(message) {
     const port = webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.connect({ name: globalDownloadLeasePortName });
     return new Promise((resolve, reject) => {
@@ -25762,21 +25783,28 @@ function sendGlobalDownloadLeaseMessage(message) {
         port.postMessage(message);
     });
 }
+/** 当前下载已经失去全局租约时抛出的错误。 */
 class GlobalDownloadLeaseLostError extends Error {
+    /** 创建租约失效错误。 */
     constructor() {
         super('Global download lease lost');
         this.name = 'GlobalDownloadLeaseLostError';
     }
 }
+/** 表示一个跨标签页互斥的媒体下载租约。 */
 class GlobalDownloadLease {
     requestId;
     leaseId;
+    /** 标记这个租约是否已经释放。 */
     released = false;
+    /** 最近一次成功续租的时间。 */
     lastRenewAt = Date.now();
+    /** 只能通过 acquire() 创建租约实例。 */
     constructor(requestId, leaseId) {
         this.requestId = requestId;
         this.leaseId = leaseId;
     }
+    /** 等待并获取一个全局下载租约；取消等待时返回 null。 */
     static async acquire(fileId, cancelled) {
         const requestId = crypto.randomUUID();
         while (!cancelled()) {
@@ -25798,6 +25826,7 @@ class GlobalDownloadLease {
         }
         return null;
     }
+    /** 在响应体确实取得进度后续租；force 用于 EOF 的 fencing 检查。 */
     async renew(force = false) {
         if (this.released) {
             throw new GlobalDownloadLeaseLostError();
@@ -25815,6 +25844,7 @@ class GlobalDownloadLease {
         }
         this.lastRenewAt = Date.now();
     }
+    /** 尽力释放租约；释放失败时让后台 TTL 最终回收它。 */
     async release() {
         if (this.released) {
             return;
@@ -25828,10 +25858,47 @@ class GlobalDownloadLease {
             });
         }
         catch (error) {
-            // The stored lease expires, so a failed best-effort release must not
-            // turn a successfully fetched file into a download failure.
+            // 释放失败时仍然有后台 TTL 兜底，不应把已经成功获取的文件变成下载失败
             console.warn('Failed to release global download lease', error);
         }
+    }
+}
+async function fetchGlobalDownloadBody(url, fileId, type, init, cancelled = () => false) {
+    const lease = await GlobalDownloadLease.acquire(fileId, cancelled);
+    if (!lease)
+        return null;
+    try {
+        const response = await fetch(url, init);
+        if (!response.ok) {
+            await response.body?.cancel();
+            return { response, data: null };
+        }
+        const reader = response.body?.getReader();
+        const chunks = [];
+        if (reader) {
+            while (true) {
+                if (cancelled()) {
+                    await reader.cancel();
+                    return null;
+                }
+                const { done, value } = await reader.read();
+                await lease.renew(done);
+                if (done)
+                    break;
+                chunks.push(value);
+            }
+        }
+        else {
+            await lease.renew(true);
+        }
+        const contentType = response.headers.get('Content-Type')?.split(';')[0].trim() ||
+            'application/octet-stream';
+        const blob = new Blob(chunks, { type: contentType });
+        const data = type === 'blob' ? blob : await blob.arrayBuffer();
+        return { response, data };
+    }
+    finally {
+        await lease.release();
     }
 }
 

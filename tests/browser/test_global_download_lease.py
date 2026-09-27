@@ -95,6 +95,30 @@ def main():
             )
             call(tab_a, "release", "req-c", after_close["leaseId"])
 
+            before_navigation = call(tab_a, "acquire", "req-nav", "file-nav")
+            require(
+                before_navigation.get("granted") is True,
+                f"navigation owner acquire failed: {before_navigation}",
+            )
+            tab_a.reload()
+            tab_a.wait_for_function("window.leaseTest !== undefined")
+            tab_nav = context.new_page()
+            tab_nav.goto(harness)
+            tab_nav.wait_for_function("window.leaseTest !== undefined")
+            deadline = time.time() + 3
+            after_navigation = {"granted": False}
+            while time.time() < deadline:
+                after_navigation = call(tab_nav, "acquire", "req-after-nav", "file-after-nav")
+                if after_navigation.get("granted"):
+                    break
+                time.sleep(0.1)
+            require(
+                after_navigation.get("granted") is True,
+                f"navigation handoff failed: {after_navigation}",
+            )
+            call(tab_nav, "release", "req-after-nav", after_navigation["leaseId"])
+            tab_nav.close()
+
             tab_d = context.new_page()
             tab_d.goto(harness)
             tab_d.wait_for_function("window.leaseTest !== undefined")
@@ -117,7 +141,7 @@ def main():
             call(tab_a, "release", "req-e", after_expiry["leaseId"])
 
             print(f"extension_id={extension_id}")
-            print("PASS mutual-exclusion renew release close-handoff expiry-fencing")
+            print("PASS mutual-exclusion renew release close-handoff navigation-handoff expiry-fencing")
             context.close()
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)

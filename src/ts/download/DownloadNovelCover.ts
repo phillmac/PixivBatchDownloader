@@ -4,6 +4,7 @@ import { lang } from '../Language'
 import { SendDownload } from './SendDownload'
 import { settings } from '../setting/Settings'
 import { Tools } from '../Tools'
+import { fetchGlobalDownloadBody } from './GlobalDownloadLease'
 
 class DownloadNovelCover {
   /**下载小说的封面图片 */
@@ -41,18 +42,24 @@ class DownloadNovelCover {
     retry = 0
   ): Promise<Blob | ArrayBuffer | null> {
     try {
-      const res = await fetch(url, {
-        method: 'get',
-        credentials: 'same-origin',
-      })
-      if (!res.ok) {
+      const download = await fetchGlobalDownloadBody(
+        url,
+        `novel-cover:${url}`,
+        type,
+        {
+          method: 'get',
+          credentials: 'same-origin',
+        }
+      )
+      if (download === null) return null
+      const res = download.response
+      if (!res.ok || download.data === null) {
         const error = new Error(`${res.status} ${res.statusText}`)
         ;(error as any).status = res.status
         ;(error as any).statusText = res.statusText
         throw error
       }
-      const data = await res[type]()
-      return data
+      return download.data
     } catch (error: Error | any) {
       retry++
       // console.log(retry, url)

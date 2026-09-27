@@ -26,6 +26,7 @@ import { downloadStates } from './DownloadStates'
 import { downloadInterval } from './DownloadInterval'
 import { NovelMeta, Result } from '../store/StoreType'
 import {
+  fetchGlobalDownloadBody,
   GlobalDownloadLease,
   GlobalDownloadLeaseLostError,
 } from './GlobalDownloadLease'
@@ -694,12 +695,21 @@ class Download {
     } else {
       // 其他情况，使用 fetch 加载缩略图文件
       try {
-        const response = await fetch(thumbURL)
-        if (!response.ok) {
+        const download = await fetchGlobalDownloadBody(
+          thumbURL,
+          `${result.id}:ugoira-thumbnail`,
+          'blob',
+          undefined,
+          () => this.cancel
+        )
+        if (download === null) {
+          return
+        }
+        if (!download.response.ok || download.data === null) {
           // 如果请求成功但是状态码错误，就从 zip 文件里提取第一张图片来作为缩略图
           thumbBlob = await Tools.extractFirstImage(await zipFile.arrayBuffer())
         } else {
-          thumbBlob = await response.blob()
+          thumbBlob = download.data
         }
       } catch (error) {
         // 如果网络请求失败，重试最多 3 次

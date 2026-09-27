@@ -8,6 +8,7 @@ import { downloadInterval } from './DownloadInterval'
 import { Tools } from '../Tools'
 import { SendDownload } from './SendDownload'
 import { EVT } from '../EVT'
+import { fetchGlobalDownloadBody } from './GlobalDownloadLease'
 
 type EmbeddedImages = null | {
   [key: string]: string
@@ -388,15 +389,22 @@ class DownloadNovelEmbeddedImage {
     retry = 0
   ): Promise<Blob | ArrayBuffer | null> {
     try {
-      const res = await fetch(url)
-      if (!res.ok) {
+      const download = await fetchGlobalDownloadBody(
+        url,
+        `novel-image:${id}:${url}`,
+        type,
+        undefined,
+        () => this.stop
+      )
+      if (download === null) return null
+      const res = download.response
+      if (!res.ok || download.data === null) {
         const error = new Error(`${res.status} ${res.statusText}`)
         ;(error as any).status = res.status
         ;(error as any).statusText = res.statusText
         throw error
       }
-      const data = await res[type]()
-      return data
+      return download.data
     } catch (error: Error | any) {
       // 发生网络错误时，有时候请求会立即结束并被捕获。但有时需要等比较长的时间，例如服务器错误的返回了 206 状态码，请求并不会立刻结束，而是要等到浏览器认为请求超时才会报错。可能需要等待 5 分钟
       retry++
