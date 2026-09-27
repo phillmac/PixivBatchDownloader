@@ -198,6 +198,9 @@ async function fetchGlobalDownloadBody(
   const lease = await GlobalDownloadLease.acquire(fileId, cancelled)
   if (!lease) return null
 
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  let bodyComplete = false
+
   try {
     const response = await fetch(url, init)
     if (!response.ok) {
@@ -205,7 +208,7 @@ async function fetchGlobalDownloadBody(
       return { response, data: null }
     }
 
-    const reader = response.body?.getReader()
+    reader = response.body?.getReader()
     const chunks: Uint8Array[] = []
 
     if (reader) {
@@ -217,11 +220,15 @@ async function fetchGlobalDownloadBody(
 
         const { done, value } = await reader.read()
         await lease.renew(done)
-        if (done) break
+        if (done) {
+          bodyComplete = true
+          break
+        }
         chunks.push(value)
       }
     } else {
       await lease.renew(true)
+      bodyComplete = true
     }
 
     const contentType =
@@ -231,6 +238,14 @@ async function fetchGlobalDownloadBody(
     const data = type === 'blob' ? blob : await blob.arrayBuffer()
     return { response, data }
   } finally {
+    if (reader && !bodyComplete) {
+      try {
+        await reader.cancel()
+      } catch (error) {
+        // 取消失败不能覆盖原始下载/租约错误，租约仍然必须立即释放
+        console.warn('Failed to cancel abandoned global download body', error)
+      }
+    }
     await lease.release()
   }
 }

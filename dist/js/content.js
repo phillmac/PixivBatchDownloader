@@ -22962,6 +22962,8 @@ class Download {
     progressBarIndex;
     downloadStatesIndex;
     retry = 0; // 重试次数
+    /** 全局下载租约丢失后的重启次数，防止多个慢请求无限互相抢占。 */
+    leaseLossRetry = 0;
     lastRequestTime = 0; // 最后一次发起请求的时间戳
     retryInterval = []; // 保存每次到达重试环节时，距离上一次请求的时间差
     sizeChecked = false; // 是否对文件体积进行了检查
@@ -23153,6 +23155,14 @@ class Download {
                 return;
             }
             if (error instanceof _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.GlobalDownloadLeaseLostError) {
+                this.leaseLossRetry++;
+                if (this.leaseLossRetry >= _Config__WEBPACK_IMPORTED_MODULE_13__.Config.retryMax) {
+                    console.error('Global download lease repeatedly lost:', error);
+                    _ProgressBar__WEBPACK_IMPORTED_MODULE_7__.progressBar.errorColor(this.progressBarIndex, true);
+                    this.error = true;
+                    _EVT__WEBPACK_IMPORTED_MODULE_1__.EVT.fire('downloadError', arg.id);
+                    return;
+                }
                 return this.download(arg);
             }
             // AbortError 表示请求被主动中断，不需要重试
@@ -25867,13 +25877,15 @@ async function fetchGlobalDownloadBody(url, fileId, type, init, cancelled = () =
     const lease = await GlobalDownloadLease.acquire(fileId, cancelled);
     if (!lease)
         return null;
+    let reader;
+    let bodyComplete = false;
     try {
         const response = await fetch(url, init);
         if (!response.ok) {
             await response.body?.cancel();
             return { response, data: null };
         }
-        const reader = response.body?.getReader();
+        reader = response.body?.getReader();
         const chunks = [];
         if (reader) {
             while (true) {
@@ -25883,13 +25895,16 @@ async function fetchGlobalDownloadBody(url, fileId, type, init, cancelled = () =
                 }
                 const { done, value } = await reader.read();
                 await lease.renew(done);
-                if (done)
+                if (done) {
+                    bodyComplete = true;
                     break;
+                }
                 chunks.push(value);
             }
         }
         else {
             await lease.renew(true);
+            bodyComplete = true;
         }
         const contentType = response.headers.get('Content-Type')?.split(';')[0].trim() ||
             'application/octet-stream';
@@ -25898,6 +25913,15 @@ async function fetchGlobalDownloadBody(url, fileId, type, init, cancelled = () =
         return { response, data };
     }
     finally {
+        if (reader && !bodyComplete) {
+            try {
+                await reader.cancel();
+            }
+            catch (error) {
+                // 取消失败不能覆盖原始下载/租约错误，租约仍然必须立即释放
+                console.warn('Failed to cancel abandoned global download body', error);
+            }
+        }
         await lease.release();
     }
 }

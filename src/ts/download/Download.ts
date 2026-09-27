@@ -47,6 +47,8 @@ class Download {
   private downloadStatesIndex: number
 
   private retry = 0 // 重试次数
+  /** 全局下载租约丢失后的重启次数，防止多个慢请求无限互相抢占。 */
+  private leaseLossRetry = 0
   private lastRequestTime = 0 // 最后一次发起请求的时间戳
   private retryInterval: number[] = [] // 保存每次到达重试环节时，距离上一次请求的时间差
 
@@ -276,6 +278,14 @@ class Download {
       }
 
       if (error instanceof GlobalDownloadLeaseLostError) {
+        this.leaseLossRetry++
+        if (this.leaseLossRetry >= Config.retryMax) {
+          console.error('Global download lease repeatedly lost:', error)
+          progressBar.errorColor(this.progressBarIndex, true)
+          this.error = true
+          EVT.fire('downloadError', arg.id)
+          return
+        }
         return this.download(arg)
       }
 

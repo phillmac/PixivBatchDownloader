@@ -91,6 +91,34 @@ let activeGlobalDownloadLease: StoredGlobalDownloadLease | null | undefined
 /** 串行化租约读写，避免两个标签页同时修改 session storage。 */
 let globalDownloadLeaseOperationQueue: Promise<void> = Promise.resolve()
 
+/** 当前用于持久化租约的存储区域；旧浏览器没有 session 时退回 local。 */
+let globalDownloadLeaseStorageArea: browser.Storage.StorageArea =
+  browser.storage.session || browser.storage.local
+
+/** 标记租约是否已经退回 local storage，避免失败后重复尝试 session。 */
+let globalDownloadLeaseUsesLocalStorage = !browser.storage.session
+
+/**
+ * 执行一次租约存储操作。session 不可用或运行时拒绝时改用 local；
+ * local 中残留的租约仍受 45 秒 TTL 限制，不会永久阻塞下一次浏览器会话。
+ */
+async function useGlobalDownloadLeaseStorage<T>(
+  operation: (storage: browser.Storage.StorageArea) => Promise<T>
+): Promise<T> {
+  try {
+    return await operation(globalDownloadLeaseStorageArea)
+  } catch (error) {
+    if (globalDownloadLeaseUsesLocalStorage) throw error
+    globalDownloadLeaseUsesLocalStorage = true
+    globalDownloadLeaseStorageArea = browser.storage.local
+    console.warn(
+      'storage.session unavailable; using storage.local for lease',
+      error
+    )
+    return operation(globalDownloadLeaseStorageArea)
+  }
+}
+
 /** 把一个租约操作排到前一个租约操作之后执行。 */
 function serializeGlobalDownloadLease<T>(
   operation: () => Promise<T>
@@ -144,7 +172,9 @@ async function loadGlobalDownloadLease(): Promise<StoredGlobalDownloadLease | nu
     return activeGlobalDownloadLease
   }
 
-  const data = await browser.storage.session.get(globalDownloadLeaseStorageKey)
+  const data = await useGlobalDownloadLeaseStorage((storage) =>
+    storage.get(globalDownloadLeaseStorageKey)
+  )
   const stored = data[globalDownloadLeaseStorageKey]
   activeGlobalDownloadLease = isStoredGlobalDownloadLease(stored)
     ? stored
@@ -156,15 +186,17 @@ async function loadGlobalDownloadLease(): Promise<StoredGlobalDownloadLease | nu
 async function storeGlobalDownloadLease(
   lease: StoredGlobalDownloadLease
 ): Promise<void> {
-  await browser.storage.session.set({
-    [globalDownloadLeaseStorageKey]: lease,
-  })
+  await useGlobalDownloadLeaseStorage((storage) =>
+    storage.set({ [globalDownloadLeaseStorageKey]: lease })
+  )
   activeGlobalDownloadLease = lease
 }
 
 /** 清除当前全局下载租约。 */
 async function clearGlobalDownloadLease(): Promise<void> {
-  await browser.storage.session.remove(globalDownloadLeaseStorageKey)
+  await useGlobalDownloadLeaseStorage((storage) =>
+    storage.remove(globalDownloadLeaseStorageKey)
+  )
   activeGlobalDownloadLease = null
 }
 

@@ -1944,6 +1944,27 @@ const globalDownloadLeaseTtlMs = 45000;
 let activeGlobalDownloadLease;
 /** 串行化租约读写，避免两个标签页同时修改 session storage。 */
 let globalDownloadLeaseOperationQueue = Promise.resolve();
+/** 当前用于持久化租约的存储区域；旧浏览器没有 session 时退回 local。 */
+let globalDownloadLeaseStorageArea = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).session || (webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).local;
+/** 标记租约是否已经退回 local storage，避免失败后重复尝试 session。 */
+let globalDownloadLeaseUsesLocalStorage = !(webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).session;
+/**
+ * 执行一次租约存储操作。session 不可用或运行时拒绝时改用 local；
+ * local 中残留的租约仍受 45 秒 TTL 限制，不会永久阻塞下一次浏览器会话。
+ */
+async function useGlobalDownloadLeaseStorage(operation) {
+    try {
+        return await operation(globalDownloadLeaseStorageArea);
+    }
+    catch (error) {
+        if (globalDownloadLeaseUsesLocalStorage)
+            throw error;
+        globalDownloadLeaseUsesLocalStorage = true;
+        globalDownloadLeaseStorageArea = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).local;
+        console.warn('storage.session unavailable; using storage.local for lease', error);
+        return operation(globalDownloadLeaseStorageArea);
+    }
+}
 /** 把一个租约操作排到前一个租约操作之后执行。 */
 function serializeGlobalDownloadLease(operation) {
     const result = globalDownloadLeaseOperationQueue.then(operation, operation);
@@ -1981,7 +2002,7 @@ async function loadGlobalDownloadLease() {
     if (activeGlobalDownloadLease !== undefined) {
         return activeGlobalDownloadLease;
     }
-    const data = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.session.get(globalDownloadLeaseStorageKey);
+    const data = await useGlobalDownloadLeaseStorage((storage) => storage.get(globalDownloadLeaseStorageKey));
     const stored = data[globalDownloadLeaseStorageKey];
     activeGlobalDownloadLease = isStoredGlobalDownloadLease(stored)
         ? stored
@@ -1990,14 +2011,12 @@ async function loadGlobalDownloadLease() {
 }
 /** 同时更新 session storage 和当前 Service Worker 的租约缓存。 */
 async function storeGlobalDownloadLease(lease) {
-    await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.session.set({
-        [globalDownloadLeaseStorageKey]: lease,
-    });
+    await useGlobalDownloadLeaseStorage((storage) => storage.set({ [globalDownloadLeaseStorageKey]: lease }));
     activeGlobalDownloadLease = lease;
 }
 /** 清除当前全局下载租约。 */
 async function clearGlobalDownloadLease() {
-    await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.session.remove(globalDownloadLeaseStorageKey);
+    await useGlobalDownloadLeaseStorage((storage) => storage.remove(globalDownloadLeaseStorageKey));
     activeGlobalDownloadLease = null;
 }
 /** 检查租约是否仍然属于指定标签页、请求和 fencing token。 */
