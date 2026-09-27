@@ -9,8 +9,12 @@ import { fetchGlobalDownloadBody } from './GlobalDownloadLease'
 class DownloadNovelCover {
   /**下载小说的封面图片 */
   // 这个模块内部没有添加间隔时间
-  public async download(coverURL: string, novelName: string) {
-    const blob = await this.getCover(coverURL, 'blob')
+  public async download(
+    coverURL: string,
+    novelName: string,
+    cancelled: () => boolean = () => false
+  ) {
+    const blob = await this.getCover(coverURL, 'blob', cancelled)
     if (blob === null) {
       return
     }
@@ -29,16 +33,19 @@ class DownloadNovelCover {
   public async getCover(
     url: string,
     type: 'blob',
+    cancelled?: () => boolean,
     retry?: number
   ): Promise<Blob | null>
   public async getCover(
     url: string,
     type: 'arrayBuffer',
+    cancelled?: () => boolean,
     retry?: number
   ): Promise<ArrayBuffer | null>
   public async getCover(
     url: string,
     type: 'blob' | 'arrayBuffer',
+    cancelled: () => boolean = () => false,
     retry = 0
   ): Promise<Blob | ArrayBuffer | null> {
     try {
@@ -49,7 +56,8 @@ class DownloadNovelCover {
         {
           method: 'get',
           credentials: 'same-origin',
-        }
+        },
+        cancelled
       )
       if (download === null) return null
       const res = download.response
@@ -72,7 +80,7 @@ class DownloadNovelCover {
         log.error(msg)
         return null
       }
-      return this.getCover(url, type as any, retry)
+      return this.getCover(url, type as any, cancelled, retry)
     }
   }
 }

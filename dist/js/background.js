@@ -2113,7 +2113,10 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onConnect.a
             .then((reply) => port.postMessage(reply))
             .catch((error) => {
             console.error('Global download lease port message failed', error);
-            port.postMessage({ granted: false, retryAfterMs: 1000 });
+            port.postMessage({
+                granted: false,
+                error: 'Global download lease storage unavailable',
+            });
         });
     });
 });

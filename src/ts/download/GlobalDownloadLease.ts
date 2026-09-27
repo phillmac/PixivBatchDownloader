@@ -24,6 +24,7 @@ interface GlobalDownloadLeaseReply {
   granted: boolean
   leaseId?: string
   retryAfterMs?: number
+  error?: string
 }
 
 /** 读取受全局租约保护的响应体之后返回的数据。 */
@@ -50,7 +51,12 @@ function sendGlobalDownloadLeaseMessage(
     port.onMessage.addListener((reply: unknown) => {
       if (settled) return
       settled = true
-      resolve(reply as GlobalDownloadLeaseReply)
+      const result = reply as GlobalDownloadLeaseReply
+      if (result?.error) {
+        reject(new Error(result.error))
+      } else {
+        resolve(result)
+      }
       port.disconnect()
     })
 

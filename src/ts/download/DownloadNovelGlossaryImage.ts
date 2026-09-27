@@ -36,13 +36,14 @@ class DownloadNovelGlossaryImage {
     urls: Urls,
     novelName: string,
     imageId: string,
-    seriesId: string
+    seriesId: string,
+    cancelled: () => boolean = () => false
   ) {
     if (!settings.downloadNovelEmbeddedImage) {
       return
     }
 
-    const blob = await this.getImage(urls, 'blob')
+    const blob = await this.getImage(urls, 'blob', cancelled)
     if (blob === null) {
       return
     }
@@ -69,16 +70,19 @@ class DownloadNovelGlossaryImage {
   public async getImage(
     urls: Urls,
     type: 'blob',
+    cancelled?: () => boolean,
     retry?: number
   ): Promise<Blob | null>
   public async getImage(
     urls: Urls,
     type: 'arrayBuffer',
+    cancelled?: () => boolean,
     retry?: number
   ): Promise<ArrayBuffer | null>
   public async getImage(
     urls: Urls,
     type: 'blob' | 'arrayBuffer',
+    cancelled: () => boolean = () => false,
     retry = 0
   ): Promise<Blob | ArrayBuffer | null> {
     if (!settings.downloadNovelEmbeddedImage) {
@@ -99,7 +103,8 @@ class DownloadNovelGlossaryImage {
         {
           method: 'get',
           credentials: 'same-origin',
-        }
+        },
+        cancelled
       )
       if (download === null) return null
       const res = download.response
@@ -122,7 +127,7 @@ class DownloadNovelGlossaryImage {
         log.error(msg)
         return null
       }
-      return this.getImage(urls, type as any, retry)
+      return this.getImage(urls, type as any, cancelled, retry)
     }
   }
 }

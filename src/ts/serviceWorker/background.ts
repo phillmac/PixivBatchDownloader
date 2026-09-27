@@ -75,6 +75,7 @@ interface GlobalDownloadLeaseReply {
   granted: boolean
   leaseId?: string
   retryAfterMs?: number
+  error?: string
 }
 
 /** 持久化在 session storage 中的当前租约。 */
@@ -329,7 +330,10 @@ browser.runtime.onConnect.addListener((port) => {
       .then((reply) => port.postMessage(reply))
       .catch((error) => {
         console.error('Global download lease port message failed', error)
-        port.postMessage({ granted: false, retryAfterMs: 1000 })
+        port.postMessage({
+          granted: false,
+          error: 'Global download lease storage unavailable',
+        })
       })
   })
 })

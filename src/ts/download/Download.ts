@@ -378,7 +378,7 @@ class Download {
 
     const blob = await makeSingleNovelFile[
       settings.novelSaveAs === 'epub' ? 'makeEPUB' : 'makeTXT'
-    ](novelMeta, filename)
+    ](novelMeta, filename, () => this.cancel)
     return blob
   }
 

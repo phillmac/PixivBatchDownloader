@@ -23236,7 +23236,7 @@ class Download {
         if (!novelMeta) {
             throw new Error('Not found novelMeta');
         }
-        const blob = await _MakeSingleNovelFile__WEBPACK_IMPORTED_MODULE_11__.makeSingleNovelFile[_setting_Settings__WEBPACK_IMPORTED_MODULE_10__.settings.novelSaveAs === 'epub' ? 'makeEPUB' : 'makeTXT'](novelMeta, filename);
+        const blob = await _MakeSingleNovelFile__WEBPACK_IMPORTED_MODULE_11__.makeSingleNovelFile[_setting_Settings__WEBPACK_IMPORTED_MODULE_10__.settings.novelSaveAs === 'epub' ? 'makeEPUB' : 'makeTXT'](novelMeta, filename, () => this.cancel);
         return blob;
     }
     lastUgoiraFileName = '';
@@ -24361,8 +24361,8 @@ __webpack_require__.r(__webpack_exports__);
 class DownloadNovelCover {
     /**下载小说的封面图片 */
     // 这个模块内部没有添加间隔时间
-    async download(coverURL, novelName) {
-        const blob = await this.getCover(coverURL, 'blob');
+    async download(coverURL, novelName, cancelled = () => false) {
+        const blob = await this.getCover(coverURL, 'blob', cancelled);
         if (blob === null) {
             return;
         }
@@ -24371,12 +24371,12 @@ class DownloadNovelCover {
     }
     /**最多重试一定次数，避免无限重试 */
     retryMax = 5;
-    async getCover(url, type, retry = 0) {
+    async getCover(url, type, cancelled = () => false, retry = 0) {
         try {
             const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_6__.fetchGlobalDownloadBody)(url, `novel-cover:${url}`, type, {
                 method: 'get',
                 credentials: 'same-origin',
-            });
+            }, cancelled);
             if (download === null)
                 return null;
             const res = download.response;
@@ -24400,7 +24400,7 @@ class DownloadNovelCover {
                 _Log__WEBPACK_IMPORTED_MODULE_0__.log.error(msg);
                 return null;
             }
-            return this.getCover(url, type, retry);
+            return this.getCover(url, type, cancelled, retry);
         }
     }
 }
@@ -24763,11 +24763,11 @@ class DownloadNovelGlossaryImage {
                 return urls['original'] || null;
         }
     }
-    async download(urls, novelName, imageId, seriesId) {
+    async download(urls, novelName, imageId, seriesId, cancelled = () => false) {
         if (!_setting_Settings__WEBPACK_IMPORTED_MODULE_4__.settings.downloadNovelEmbeddedImage) {
             return;
         }
-        const blob = await this.getImage(urls, 'blob');
+        const blob = await this.getImage(urls, 'blob', cancelled);
         if (blob === null) {
             return;
         }
@@ -24778,7 +24778,7 @@ class DownloadNovelGlossaryImage {
     }
     /**最多重试一定次数，避免无限重试 */
     retryMax = 5;
-    async getImage(urls, type, retry = 0) {
+    async getImage(urls, type, cancelled = () => false, retry = 0) {
         if (!_setting_Settings__WEBPACK_IMPORTED_MODULE_4__.settings.downloadNovelEmbeddedImage) {
             return null;
         }
@@ -24792,7 +24792,7 @@ class DownloadNovelGlossaryImage {
             const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_5__.fetchGlobalDownloadBody)(url, `novel-glossary:${url}`, type, {
                 method: 'get',
                 credentials: 'same-origin',
-            });
+            }, cancelled);
             if (download === null)
                 return null;
             const res = download.response;
@@ -24816,7 +24816,7 @@ class DownloadNovelGlossaryImage {
                 _Log__WEBPACK_IMPORTED_MODULE_0__.log.error(msg);
                 return null;
             }
-            return this.getImage(urls, type, retry);
+            return this.getImage(urls, type, cancelled, retry);
         }
     }
 }
@@ -25781,7 +25781,13 @@ function sendGlobalDownloadLeaseMessage(message) {
             if (settled)
                 return;
             settled = true;
-            resolve(reply);
+            const result = reply;
+            if (result?.error) {
+                reject(new Error(result.error));
+            }
+            else {
+                resolve(result);
+            }
             port.disconnect();
         });
         port.onDisconnect.addListener(() => {
@@ -26069,11 +26075,11 @@ __webpack_require__.r(__webpack_exports__);
 /** 为单篇小说生成文件 */
 class MakeSingleNovelFile {
     /** 下载小说的封面图片 */
-    async downloadCover(id, title, url, filename) {
+    async downloadCover(id, title, url, filename, cancelled) {
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_0__.settings.downloadNovelCoverImage && url) {
             _Log__WEBPACK_IMPORTED_MODULE_4__.log.log(_Language__WEBPACK_IMPORTED_MODULE_3__.lang.transl('_下载小说的封面图片的提示', _Tools__WEBPACK_IMPORTED_MODULE_1__.Tools.createWorkLink(id, title, 'novel')), 'downloadNovelCover' + id);
             await _DownloadInterval__WEBPACK_IMPORTED_MODULE_5__.downloadInterval.wait();
-            await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.download(url, filename);
+            await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.download(url, filename, cancelled);
         }
     }
     // 建立串行机制（主要是在下载图片时启用限制），禁止并发执行。
@@ -26089,10 +26095,10 @@ class MakeSingleNovelFile {
         }
         return;
     }
-    async makeTXT(data, filename) {
+    async makeTXT(data, filename, cancelled = () => false) {
         await this.waitForIdle();
         this.busy = true;
-        await this.downloadCover(data.id, data.title, data.coverUrl, filename);
+        await this.downloadCover(data.id, data.title, data.coverUrl, filename, cancelled);
         let content = await _ReplaceNovelWords__WEBPACK_IMPORTED_MODULE_10__.replaceNovelWords.replace(data.seriesId, data.content);
         // 下载小说里的内嵌图片
         await _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_9__.downloadNovelEmbeddedImage.TXT(data.id, data.title, content, data.embeddedImages, filename, 'single novel');
@@ -26110,10 +26116,10 @@ class MakeSingleNovelFile {
             type: 'text/plain',
         });
     }
-    async makeEPUB(data, filename) {
+    async makeEPUB(data, filename, cancelled = () => false) {
         await this.waitForIdle();
         this.busy = true;
-        await this.downloadCover(data.id, data.title, data.coverUrl, filename);
+        await this.downloadCover(data.id, data.title, data.coverUrl, filename, cancelled);
         let content = await _ReplaceNovelWords__WEBPACK_IMPORTED_MODULE_10__.replaceNovelWords.replace(data.seriesId, data.content);
         // 添加元数据
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_0__.settings.saveNovelMeta) {
@@ -26153,7 +26159,7 @@ class MakeSingleNovelFile {
         jepub.uuid(novelURL);
         jepub.date(new Date(data.createDate));
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_0__.settings.downloadNovelCoverImage && data.coverUrl) {
-            const cover = await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.getCover(data.coverUrl, 'arrayBuffer');
+            const cover = await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.getCover(data.coverUrl, 'arrayBuffer', cancelled);
             if (cover) {
                 jepub.cover(_Config__WEBPACK_IMPORTED_MODULE_7__.Config.isFirefox ? _utils_Utils__WEBPACK_IMPORTED_MODULE_2__.Utils.copyArrayBuffer(cover) : cover);
             }
@@ -26454,7 +26460,7 @@ class MergeNovel {
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_2__.settings.novelSaveAs === 'txt') {
             await this.sleep(this.downloadInterval);
         }
-        await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.download(coverUrl, this.novelName);
+        await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.download(coverUrl, this.novelName, () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
     }
     /** 输出合并完成后的成功日志和提示。 */
     logMergeFinished(link) {
@@ -26515,7 +26521,7 @@ class MergeNovel {
         for (const item of this.glossaryImages) {
             if (item) {
                 this.logDownloadGlossaryImage(item);
-                await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.download(item.urls, this.novelName, item.novelImageId, this.seriesId);
+                await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.download(item.urls, this.novelName, item.novelImageId, this.seriesId, () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
             }
         }
     }
@@ -26768,7 +26774,7 @@ class MergeNovel {
         for (const item of this.glossaryImages) {
             if (item) {
                 this.logDownloadGlossaryImage(item);
-                const image = await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.getImage(item.urls, 'arrayBuffer');
+                const image = await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.getImage(item.urls, 'arrayBuffer', () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
                 if (image) {
                     this.addSize(image.byteLength);
                     const imageId = `glossaryImage-${item.novelImageId}`;
@@ -26785,7 +26791,7 @@ class MergeNovel {
         }
         await this.sleep(this.downloadInterval);
         this.logDownloadSeriesCover();
-        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(seriesCoverUrl, 'arrayBuffer');
+        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(seriesCoverUrl, 'arrayBuffer', () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
         if (cover) {
             this.addSize(cover.byteLength);
             jepub.cover(_Config__WEBPACK_IMPORTED_MODULE_11__.Config.isFirefox ? _utils_Utils__WEBPACK_IMPORTED_MODULE_1__.Utils.copyArrayBuffer(cover) : cover);
@@ -26811,7 +26817,7 @@ class MergeNovel {
         }
         // 没有保存过，下载并添加这个章节的封面图
         await this.sleep(this.downloadInterval);
-        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(coverUrl, 'arrayBuffer');
+        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(coverUrl, 'arrayBuffer', () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
         if (!cover) {
             return coverHtml;
         }
