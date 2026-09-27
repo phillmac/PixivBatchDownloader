@@ -24,6 +24,7 @@ import { states } from '../store/States'
 import { Tools } from '../Tools'
 import { downloadStates } from './DownloadStates'
 import { downloadInterval } from './DownloadInterval'
+import { downloadDiagnostics } from './DownloadDiagnostics'
 import { NovelMeta, Result } from '../store/StoreType'
 import {
   fetchGlobalDownloadBody,
@@ -40,11 +41,19 @@ class Download {
   ) {
     this.progressBarIndex = progressBarIndex
     this.downloadStatesIndex = downloadStatesIndex
+    this.diagnosticId = downloadDiagnostics.start({
+      workId: data.id,
+      index: data.index,
+      progressBarIndex,
+      taskBatch: data.taskBatch,
+      workType: data.result.type,
+    })
     this.beforeDownload(data)
   }
 
   private progressBarIndex: number
   private downloadStatesIndex: number
+  private readonly diagnosticId: string
 
   private retry = 0 // 重试次数
   /** 全局下载租约丢失后的重启次数，防止多个慢请求无限互相抢占。 */
@@ -63,6 +72,9 @@ class Download {
   /** 跳过下载这个文件。可以传入用于提示的文本 */
   private skipDownload(data: DonwloadSkipData, msg?: string) {
     this.skip = true
+    downloadDiagnostics.finish(this.diagnosticId, 'skipped', {
+      reason: data.reason,
+    })
     if (msg) {
       log.warning('🚫' + msg)
     }
@@ -73,6 +85,7 @@ class Download {
 
   /** 在下载前检查一些过滤条件，以确认是否应该下载这个文件 */
   private async beforeDownload(arg: downloadArgument) {
+    downloadDiagnostics.enter(this.diagnosticId, 'preflight')
     // 检查是否是重复文件
     const duplicate = await downloadRecord.checkDeduplication(arg.result)
     if (duplicate) {
@@ -116,17 +129,29 @@ class Download {
 
     // 重置当前下载记录条
     this.setProgressBar(_fileName, 0, 0)
+    downloadDiagnostics.enter(this.diagnosticId, 'prepare-download', {
+      fileName: _fileName,
+    })
 
     await downloadInterval.wait()
     this.lastRequestTime = Date.now()
 
     if (result.type === 3) {
       // 小说文件单独处理，因为它是动态生成的，生成后就可以直接下载，不需要走下面的 Fetch 请求流程
+      downloadDiagnostics.enter(this.diagnosticId, 'novel-build-start', {
+        fileName: _fileName,
+      })
       const blob = await this.getNovelFileURL(result.novelMeta, _fileName)
       const blobURL = URL.createObjectURL(blob)
+      downloadDiagnostics.enter(this.diagnosticId, 'novel-blob-ready', {
+        fileName: _fileName,
+        blobBytes: blob.size,
+      })
 
       // 等待上一个文件下载完成
+      downloadDiagnostics.enter(this.diagnosticId, 'save-order-wait')
       await this.waitPreviousFileDownload()
+      downloadDiagnostics.enter(this.diagnosticId, 'save-order-ready')
 
       // 发送下载任务
       const size = blob.size
@@ -153,6 +178,9 @@ class Download {
     let status = 0
 
     try {
+      downloadDiagnostics.enter(this.diagnosticId, 'fetch-start', {
+        fileName: _fileName,
+      })
       const lease = await GlobalDownloadLease.acquire(arg.id, () => this.cancel)
       if (!lease) {
         return
@@ -178,6 +206,10 @@ class Download {
         // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
         const contentLength = response.headers.get('Content-Length') || '0'
         total = parseInt(contentLength, 10)
+        downloadDiagnostics.enter(this.diagnosticId, 'fetch-response', {
+          status,
+          totalBytes: total,
+        })
 
         // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
         const sizeCheck = await this.checkSize(result, total)
@@ -212,7 +244,18 @@ class Download {
           chunks.push(value)
           loaded += value.length
           this.setProgressBar(_fileName, loaded, total)
+          downloadDiagnostics.progress(
+            this.diagnosticId,
+            loaded,
+            total,
+            _fileName
+          )
         }
+
+        downloadDiagnostics.enter(this.diagnosticId, 'body-complete', {
+          loadedBytes: loaded,
+          totalBytes: total,
+        })
       } finally {
         controller.abort()
         await lease.release()
@@ -232,9 +275,13 @@ class Download {
 
       // 转换动图
       if (result.type === 2) {
+        downloadDiagnostics.enter(this.diagnosticId, 'conversion-start')
         // 如果不需要转换会返回 null，此时继续使用 file
         const convertResult = await this.convertUgoira(result, file, _fileName)
         file = convertResult || file
+        downloadDiagnostics.enter(this.diagnosticId, 'conversion-complete', {
+          blobBytes: file.size,
+        })
         const lastName = this.lastUgoiraFileName
         if (lastName && lastName !== _fileName) {
           _fileName = lastName
@@ -267,7 +314,9 @@ class Download {
       }
 
       // 等待上一个文件下载完成
+      downloadDiagnostics.enter(this.diagnosticId, 'save-order-wait')
       await this.waitPreviousFileDownload()
+      downloadDiagnostics.enter(this.diagnosticId, 'save-order-ready')
 
       // 发送下载任务
       this.sendDownload(file, blobURL, _fileName, arg.id, arg.taskBatch)
@@ -295,6 +344,11 @@ class Download {
       }
 
       console.error('Download error:', error)
+      downloadDiagnostics.enter(this.diagnosticId, 'download-error', {
+        status,
+        retry: this.retry,
+        error: downloadDiagnostics.errorDetails(error),
+      })
 
       // 网络错误时 fetch 会抛出 TypeError，此时 status 为 0
       // 储存重试的时间戳等信息
@@ -308,6 +362,10 @@ class Download {
 
       if (this.retry >= Config.retryMax) {
         // 重试达到最大次数
+        downloadDiagnostics.finish(this.diagnosticId, 'retry-max', {
+          status,
+          retry: this.retry,
+        })
         this.afterReTryMax(status, arg.id)
       } else {
         // 开始重试
@@ -780,11 +838,17 @@ class Download {
       dataURL = await Utils.blobToDataURL(blob)
     }
 
+    downloadDiagnostics.enter(this.diagnosticId, 'browser-save-prepare', {
+      fileName,
+      blobBytes: blob.size,
+    })
+
     const sendData: SendToBackEndData = {
       msg: reply ? 'save_work_file' : 'no_reply',
       fileName: fileName,
       id,
       taskBatch,
+      diagnosticId: this.diagnosticId,
       blobURL,
       blob: Config.sendBlob ? blob : undefined,
       dataURL,
@@ -805,16 +869,42 @@ class Download {
       sendData.blob = undefined
       sendData.dataURL = undefined
       sendData.blobURL = ''
-      browser.runtime.sendMessage(sendData).catch((error) => {
-        // 消息发送失败时打印错误，避免下载任务卡住却没有提示
-        console.error('发送 save_work_file_a_download 消息失败', error)
-      })
+      downloadDiagnostics.enter(this.diagnosticId, 'a-download-message-sent')
+      browser.runtime.sendMessage(sendData).then(
+        () =>
+          downloadDiagnostics.enter(
+            this.diagnosticId,
+            'a-download-message-resolved'
+          ),
+        (error) => {
+          downloadDiagnostics.enter(
+            this.diagnosticId,
+            'a-download-message-rejected',
+            { error: downloadDiagnostics.errorDetails(error) }
+          )
+          // 消息发送失败时打印错误，避免下载任务卡住却没有提示
+          console.error('发送 save_work_file_a_download 消息失败', error)
+        }
+      )
       return
     }
 
     // 发送给浏览器下载
     try {
-      browser.runtime.sendMessage(sendData)
+      downloadDiagnostics.enter(this.diagnosticId, 'browser-save-message-sent')
+      browser.runtime.sendMessage(sendData).then(
+        () =>
+          downloadDiagnostics.enter(
+            this.diagnosticId,
+            'browser-save-message-resolved'
+          ),
+        (error) =>
+          downloadDiagnostics.enter(
+            this.diagnosticId,
+            'browser-save-message-rejected',
+            { error: downloadDiagnostics.errorDetails(error) }
+          )
+      )
       EVT.fire('sendBrowserDownload')
     } catch (error) {
       let msg = `${lang.transl('_发生错误原因')}<br>{}${lang.transl(
