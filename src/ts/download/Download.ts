@@ -25,6 +25,11 @@ import { Tools } from '../Tools'
 import { downloadStates } from './DownloadStates'
 import { downloadInterval } from './DownloadInterval'
 import { NovelMeta, Result } from '../store/StoreType'
+import {
+  fetchGlobalDownloadBody,
+  GlobalDownloadLease,
+  GlobalDownloadLeaseLostError,
+} from './GlobalDownloadLease'
 
 // 下载抓取结果里的一个文件
 class Download {
@@ -42,6 +47,8 @@ class Download {
   private downloadStatesIndex: number
 
   private retry = 0 // 重试次数
+  /** 全局下载租约丢失后的重启次数，防止多个慢请求无限互相抢占。 */
+  private leaseLossRetry = 0
   private lastRequestTime = 0 // 最后一次发起请求的时间戳
   private retryInterval: number[] = [] // 保存每次到达重试环节时，距离上一次请求的时间差
 
@@ -146,53 +153,69 @@ class Download {
     let status = 0
 
     try {
-      const response = await fetch(url, { signal: controller.signal })
-      const contentType = response.headers
-        .get('Content-Type')
-        ?.split(';')[0]
-        .trim()
-      status = response.status
-
-      // 状态码错误，抛出异常进入重试流程
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`)
-      }
-
-      // 获取文件总体积
-      // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
-      const contentLength = response.headers.get('Content-Length') || '0'
-      const total = parseInt(contentLength, 10)
-
-      // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
-      const sizeCheck = await this.checkSize(result, total)
-      if (!sizeCheck) {
-        // 当因为体积问题跳过下载时，直接把进度条拉满
-        // 如果不把进度条拉满，用户看到这个文件的进度条只有一点点，就会以为下载卡住或出错了
-        this.setProgressBar(_fileName, 1, 1)
-      }
-
-      if (this.cancel) {
-        controller.abort()
+      const lease = await GlobalDownloadLease.acquire(arg.id, () => this.cancel)
+      if (!lease) {
         return
       }
 
-      // 使用 ReadableStream 读取响应体，跟踪下载进度
-      const reader = response.body!.getReader()
-      const chunks: Uint8Array[] = []
-      let loaded = 0
+      this.lastRequestTime = Date.now()
 
-      while (true) {
+      let contentType: string | undefined
+      let total = 0
+      const chunks: Uint8Array[] = []
+
+      try {
+        const response = await fetch(url, { signal: controller.signal })
+        contentType = response.headers.get('Content-Type')?.split(';')[0].trim()
+        status = response.status
+
+        // 状态码错误，抛出异常进入重试流程
+        if (!response.ok) {
+          throw new Error(`HTTP error ${response.status}`)
+        }
+
+        // 获取文件总体积
+        // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
+        const contentLength = response.headers.get('Content-Length') || '0'
+        total = parseInt(contentLength, 10)
+
+        // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
+        const sizeCheck = await this.checkSize(result, total)
+        if (!sizeCheck) {
+          // 当因为体积问题跳过下载时，直接把进度条拉满
+          // 如果不把进度条拉满，用户看到这个文件的进度条只有一点点，就会以为下载卡住或出错了
+          this.setProgressBar(_fileName, 1, 1)
+        }
+
         if (this.cancel) {
-          reader.cancel()
+          controller.abort()
           return
         }
 
-        const { done, value } = await reader.read()
-        if (done) break
+        // 使用 ReadableStream 读取响应体，跟踪下载进度
+        const reader = response.body!.getReader()
+        let loaded = 0
 
-        chunks.push(value)
-        loaded += value.length
-        this.setProgressBar(_fileName, loaded, total)
+        while (true) {
+          if (this.cancel) {
+            reader.cancel()
+            return
+          }
+
+          const { done, value } = await reader.read()
+          // Renew only when the stream makes progress. The forced EOF check also
+          // fences out a tab that was suspended long enough for another tab to
+          // reclaim the expired lease.
+          await lease.renew(done)
+          if (done) break
+
+          chunks.push(value)
+          loaded += value.length
+          this.setProgressBar(_fileName, loaded, total)
+        }
+      } finally {
+        controller.abort()
+        await lease.release()
       }
 
       // 组装 Blob
@@ -252,6 +275,18 @@ class Download {
     } catch (error) {
       if (this.cancel) {
         return
+      }
+
+      if (error instanceof GlobalDownloadLeaseLostError) {
+        this.leaseLossRetry++
+        if (this.leaseLossRetry >= Config.retryMax) {
+          console.error('Global download lease repeatedly lost:', error)
+          progressBar.errorColor(this.progressBarIndex, true)
+          this.error = true
+          EVT.fire('downloadError', arg.id)
+          return
+        }
+        return this.download(arg)
       }
 
       // AbortError 表示请求被主动中断，不需要重试
@@ -343,7 +378,7 @@ class Download {
 
     const blob = await makeSingleNovelFile[
       settings.novelSaveAs === 'epub' ? 'makeEPUB' : 'makeTXT'
-    ](novelMeta, filename)
+    ](novelMeta, filename, () => this.cancel)
     return blob
   }
 
@@ -670,12 +705,21 @@ class Download {
     } else {
       // 其他情况，使用 fetch 加载缩略图文件
       try {
-        const response = await fetch(thumbURL)
-        if (!response.ok) {
+        const download = await fetchGlobalDownloadBody(
+          thumbURL,
+          `${result.id}:ugoira-thumbnail`,
+          'blob',
+          undefined,
+          () => this.cancel
+        )
+        if (download === null) {
+          return
+        }
+        if (!download.response.ok || download.data === null) {
           // 如果请求成功但是状态码错误，就从 zip 文件里提取第一张图片来作为缩略图
           thumbBlob = await Tools.extractFirstImage(await zipFile.arrayBuffer())
         } else {
-          thumbBlob = await response.blob()
+          thumbBlob = download.data
         }
       } catch (error) {
         // 如果网络请求失败，重试最多 3 次

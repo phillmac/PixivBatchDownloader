@@ -20,7 +20,8 @@ class MakeSingleNovelFile {
     id: string,
     title: string,
     url: string,
-    filename: string
+    filename: string,
+    cancelled: () => boolean
   ) {
     if (settings.downloadNovelCoverImage && url) {
       log.log(
@@ -31,7 +32,7 @@ class MakeSingleNovelFile {
         'downloadNovelCover' + id
       )
       await downloadInterval.wait()
-      await downloadNovelCover.download(url, filename)
+      await downloadNovelCover.download(url, filename, cancelled)
     }
   }
 
@@ -49,11 +50,21 @@ class MakeSingleNovelFile {
     return
   }
 
-  public async makeTXT(data: NovelMeta, filename: string) {
+  public async makeTXT(
+    data: NovelMeta,
+    filename: string,
+    cancelled: () => boolean = () => false
+  ) {
     await this.waitForIdle()
     this.busy = true
 
-    await this.downloadCover(data.id, data.title, data.coverUrl, filename)
+    await this.downloadCover(
+      data.id,
+      data.title,
+      data.coverUrl,
+      filename,
+      cancelled
+    )
 
     let content = await replaceNovelWords.replace(data.seriesId, data.content)
 
@@ -85,11 +96,21 @@ class MakeSingleNovelFile {
     })
   }
 
-  public async makeEPUB(data: NovelMeta, filename: string): Promise<Blob> {
+  public async makeEPUB(
+    data: NovelMeta,
+    filename: string,
+    cancelled: () => boolean = () => false
+  ): Promise<Blob> {
     await this.waitForIdle()
     this.busy = true
 
-    await this.downloadCover(data.id, data.title, data.coverUrl, filename)
+    await this.downloadCover(
+      data.id,
+      data.title,
+      data.coverUrl,
+      filename,
+      cancelled
+    )
 
     let content = await replaceNovelWords.replace(data.seriesId, data.content)
 
@@ -141,7 +162,8 @@ class MakeSingleNovelFile {
     if (settings.downloadNovelCoverImage && data.coverUrl) {
       const cover = await downloadNovelCover.getCover(
         data.coverUrl,
-        'arrayBuffer'
+        'arrayBuffer',
+        cancelled
       )
       if (cover) {
         jepub.cover(Config.isFirefox ? Utils.copyArrayBuffer(cover) : cover)

@@ -46,6 +46,298 @@ async function setData(data: { [key: string]: any }) {
   return browser.storage.local.set(data)
 }
 
+/** 全局下载租约协议使用的消息名称。 */
+const globalDownloadLeaseMsg = {
+  acquire: 'global_download_lease_acquire',
+  renew: 'global_download_lease_renew',
+  release: 'global_download_lease_release',
+} as const
+/** 全局下载租约专用的 runtime port 名称。 */
+const globalDownloadLeasePortName = 'global-download-lease'
+/** 在 session storage 中保存全局下载租约的键名。 */
+const globalDownloadLeaseStorageKey = 'globalDownloadLease'
+/** 没有进度续租时，一个下载租约最多保留 45 秒。 */
+const globalDownloadLeaseTtlMs = 45000
+
+/** 前台通过专用 port 发送的租约操作。 */
+interface GlobalDownloadLeaseMessage {
+  msg:
+    | typeof globalDownloadLeaseMsg.acquire
+    | typeof globalDownloadLeaseMsg.renew
+    | typeof globalDownloadLeaseMsg.release
+  requestId: string
+  fileId?: string
+  leaseId?: string
+}
+
+/** 后台对租约操作返回的结果。 */
+interface GlobalDownloadLeaseReply {
+  granted: boolean
+  leaseId?: string
+  retryAfterMs?: number
+  error?: string
+}
+
+/** 持久化在 session storage 中的当前租约。 */
+interface StoredGlobalDownloadLease {
+  leaseId: string
+  requestId: string
+  tabId: number
+  fileId: string
+  expiresAt: number
+}
+
+/** 当前 Service Worker 实例缓存的租约；undefined 表示尚未从存储加载。 */
+let activeGlobalDownloadLease: StoredGlobalDownloadLease | null | undefined
+/** 串行化租约读写，避免两个标签页同时修改 session storage。 */
+let globalDownloadLeaseOperationQueue: Promise<void> = Promise.resolve()
+
+/** 当前用于持久化租约的存储区域；旧浏览器没有 session 时退回 local。 */
+let globalDownloadLeaseStorageArea: browser.Storage.StorageArea =
+  browser.storage.session || browser.storage.local
+
+/** 标记租约是否已经退回 local storage，避免失败后重复尝试 session。 */
+let globalDownloadLeaseUsesLocalStorage = !browser.storage.session
+
+/**
+ * 执行一次租约存储操作。session 不可用或运行时拒绝时改用 local；
+ * local 中残留的租约仍受 45 秒 TTL 限制，不会永久阻塞下一次浏览器会话。
+ */
+async function useGlobalDownloadLeaseStorage<T>(
+  operation: (storage: browser.Storage.StorageArea) => Promise<T>
+): Promise<T> {
+  try {
+    return await operation(globalDownloadLeaseStorageArea)
+  } catch (error) {
+    if (globalDownloadLeaseUsesLocalStorage) throw error
+    globalDownloadLeaseUsesLocalStorage = true
+    globalDownloadLeaseStorageArea = browser.storage.local
+    console.warn(
+      'storage.session unavailable; using storage.local for lease',
+      error
+    )
+    return operation(globalDownloadLeaseStorageArea)
+  }
+}
+
+/** 把一个租约操作排到前一个租约操作之后执行。 */
+function serializeGlobalDownloadLease<T>(
+  operation: () => Promise<T>
+): Promise<T> {
+  const result = globalDownloadLeaseOperationQueue.then(operation, operation)
+  globalDownloadLeaseOperationQueue = result.then(
+    () => undefined,
+    () => undefined
+  )
+  return result
+}
+
+/** 判断 unknown 值是否是可安全读取属性的对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/** 校验来自 runtime port 的租约消息结构。 */
+function isGlobalDownloadLeaseMessage(
+  value: unknown
+): value is GlobalDownloadLeaseMessage {
+  if (!isRecord(value) || typeof value.requestId !== 'string') return false
+  if (value.fileId !== undefined && typeof value.fileId !== 'string')
+    return false
+  if (value.leaseId !== undefined && typeof value.leaseId !== 'string')
+    return false
+  return (
+    value.msg === globalDownloadLeaseMsg.acquire ||
+    value.msg === globalDownloadLeaseMsg.renew ||
+    value.msg === globalDownloadLeaseMsg.release
+  )
+}
+
+/** 校验从 session storage 读取出的租约结构。 */
+function isStoredGlobalDownloadLease(
+  value: unknown
+): value is StoredGlobalDownloadLease {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.leaseId === 'string' &&
+    typeof value.requestId === 'string' &&
+    typeof value.tabId === 'number' &&
+    typeof value.fileId === 'string' &&
+    typeof value.expiresAt === 'number'
+  )
+}
+
+/** 从内存缓存或 session storage 读取当前租约。 */
+async function loadGlobalDownloadLease(): Promise<StoredGlobalDownloadLease | null> {
+  if (activeGlobalDownloadLease !== undefined) {
+    return activeGlobalDownloadLease
+  }
+
+  const data = await useGlobalDownloadLeaseStorage((storage) =>
+    storage.get(globalDownloadLeaseStorageKey)
+  )
+  const stored = data[globalDownloadLeaseStorageKey]
+  activeGlobalDownloadLease = isStoredGlobalDownloadLease(stored)
+    ? stored
+    : null
+  return activeGlobalDownloadLease
+}
+
+/** 同时更新 session storage 和当前 Service Worker 的租约缓存。 */
+async function storeGlobalDownloadLease(
+  lease: StoredGlobalDownloadLease
+): Promise<void> {
+  await useGlobalDownloadLeaseStorage((storage) =>
+    storage.set({ [globalDownloadLeaseStorageKey]: lease })
+  )
+  activeGlobalDownloadLease = lease
+}
+
+/** 清除当前全局下载租约。 */
+async function clearGlobalDownloadLease(): Promise<void> {
+  await useGlobalDownloadLeaseStorage((storage) =>
+    storage.remove(globalDownloadLeaseStorageKey)
+  )
+  activeGlobalDownloadLease = null
+}
+
+/** 检查租约是否仍然属于指定标签页、请求和 fencing token。 */
+function globalDownloadLeaseMatches(
+  lease: StoredGlobalDownloadLease,
+  tabId: number,
+  requestId: string,
+  leaseId?: string
+): boolean {
+  return (
+    lease.tabId === tabId &&
+    lease.requestId === requestId &&
+    (!leaseId || lease.leaseId === leaseId)
+  )
+}
+
+/** 在已经取得串行化锁的情况下执行 acquire、renew 或 release。 */
+async function handleGlobalDownloadLeaseMessageLocked(
+  msg: GlobalDownloadLeaseMessage,
+  tabId: number
+): Promise<GlobalDownloadLeaseReply> {
+  const now = Date.now()
+  const current = await loadGlobalDownloadLease()
+
+  if (msg.msg === globalDownloadLeaseMsg.acquire) {
+    if (current && current.expiresAt > now) {
+      if (globalDownloadLeaseMatches(current, tabId, msg.requestId)) {
+        return { granted: true, leaseId: current.leaseId }
+      }
+
+      return {
+        granted: false,
+        retryAfterMs: Math.min(1000, Math.max(100, current.expiresAt - now)),
+      }
+    }
+
+    if (!msg.fileId) {
+      return { granted: false, retryAfterMs: 1000 }
+    }
+
+    const lease: StoredGlobalDownloadLease = {
+      leaseId: crypto.randomUUID(),
+      requestId: msg.requestId,
+      tabId,
+      fileId: msg.fileId,
+      expiresAt: now + globalDownloadLeaseTtlMs,
+    }
+    await storeGlobalDownloadLease(lease)
+    return { granted: true, leaseId: lease.leaseId }
+  }
+
+  if (
+    current &&
+    msg.leaseId &&
+    globalDownloadLeaseMatches(current, tabId, msg.requestId, msg.leaseId)
+  ) {
+    if (msg.msg === globalDownloadLeaseMsg.renew) {
+      // An expired owner may revive only if nobody has replaced its fencing token.
+      const renewed = {
+        ...current,
+        expiresAt: now + globalDownloadLeaseTtlMs,
+      }
+      await storeGlobalDownloadLease(renewed)
+      return { granted: true, leaseId: renewed.leaseId }
+    }
+
+    await clearGlobalDownloadLease()
+    return { granted: true }
+  }
+
+  return { granted: false }
+}
+
+/** 串行执行一个来自指定标签页的租约操作。 */
+async function handleGlobalDownloadLeaseMessage(
+  msg: GlobalDownloadLeaseMessage,
+  tabId: number
+): Promise<GlobalDownloadLeaseReply> {
+  if (!msg.requestId) {
+    return { granted: false, retryAfterMs: 1000 }
+  }
+
+  return serializeGlobalDownloadLease(() =>
+    handleGlobalDownloadLeaseMessageLocked(msg, tabId)
+  )
+}
+
+/** 如果当前租约属于指定标签页，则立即清除它。 */
+async function clearGlobalDownloadLeaseForTab(tabId: number): Promise<void> {
+  await serializeGlobalDownloadLease(async () => {
+    const current = await loadGlobalDownloadLease()
+    if (current?.tabId === tabId) {
+      await clearGlobalDownloadLease()
+    }
+  })
+}
+
+browser.tabs.onRemoved.addListener((tabId) => {
+  clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
+    console.warn('Failed to clear global download lease for closed tab', error)
+  })
+})
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // 完整导航/刷新和 discarded 都会卸载旧文档，旧 content script 无法保证 finally 能执行。
+  if (changeInfo.discarded === true || changeInfo.status === 'loading') {
+    clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
+      console.warn(
+        'Failed to clear global download lease for unloaded tab',
+        error
+      )
+    })
+  }
+})
+
+browser.runtime.onConnect.addListener((port) => {
+  if (port.name !== globalDownloadLeasePortName) return
+
+  const tabId = port.sender?.tab?.id
+  if (tabId === undefined) {
+    port.disconnect()
+    return
+  }
+
+  port.onMessage.addListener((msg: unknown) => {
+    if (!isGlobalDownloadLeaseMessage(msg)) return
+
+    handleGlobalDownloadLeaseMessage(msg, tabId)
+      .then((reply) => port.postMessage(reply))
+      .catch((error) => {
+        console.error('Global download lease port message failed', error)
+        port.postMessage({
+          granted: false,
+          error: 'Global download lease storage unavailable',
+        })
+      })
+  })
+})
+
 // 类型守卫，这是为了通过类型检查，所以只要求有 msg 属性
 // 如果检查了其他属性，那么对于只有 msg 属性的简单消息就会不通过。所以不检查其他属性
 function isMsg(msg: any): msg is SendToBackEndData {

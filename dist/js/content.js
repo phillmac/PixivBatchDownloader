@@ -22931,6 +22931,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_16__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
 /* harmony import */ var _DownloadStates__WEBPACK_IMPORTED_MODULE_17__ = __webpack_require__(/*! ./DownloadStates */ "./src/ts/download/DownloadStates.ts");
 /* harmony import */ var _DownloadInterval__WEBPACK_IMPORTED_MODULE_18__ = __webpack_require__(/*! ./DownloadInterval */ "./src/ts/download/DownloadInterval.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -22960,6 +22962,8 @@ class Download {
     progressBarIndex;
     downloadStatesIndex;
     retry = 0; // 重试次数
+    /** 全局下载租约丢失后的重启次数，防止多个慢请求无限互相抢占。 */
+    leaseLossRetry = 0;
     lastRequestTime = 0; // 最后一次发起请求的时间戳
     retryInterval = []; // 保存每次到达重试环节时，距离上一次请求的时间差
     sizeChecked = false; // 是否对文件体积进行了检查
@@ -23044,46 +23048,60 @@ class Download {
         // 保存 catch 里的响应状态码
         let status = 0;
         try {
-            const response = await fetch(url, { signal: controller.signal });
-            const contentType = response.headers
-                .get('Content-Type')
-                ?.split(';')[0]
-                .trim();
-            status = response.status;
-            // 状态码错误，抛出异常进入重试流程
-            if (!response.ok) {
-                throw new Error(`HTTP error ${response.status}`);
-            }
-            // 获取文件总体积
-            // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
-            const contentLength = response.headers.get('Content-Length') || '0';
-            const total = parseInt(contentLength, 10);
-            // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
-            const sizeCheck = await this.checkSize(result, total);
-            if (!sizeCheck) {
-                // 当因为体积问题跳过下载时，直接把进度条拉满
-                // 如果不把进度条拉满，用户看到这个文件的进度条只有一点点，就会以为下载卡住或出错了
-                this.setProgressBar(_fileName, 1, 1);
-            }
-            if (this.cancel) {
-                controller.abort();
+            const lease = await _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.GlobalDownloadLease.acquire(arg.id, () => this.cancel);
+            if (!lease) {
                 return;
             }
-            // 使用 ReadableStream 读取响应体，跟踪下载进度
-            const reader = response.body.getReader();
+            this.lastRequestTime = Date.now();
+            let contentType;
+            let total = 0;
             const chunks = [];
-            let loaded = 0;
-            while (true) {
+            try {
+                const response = await fetch(url, { signal: controller.signal });
+                contentType = response.headers.get('Content-Type')?.split(';')[0].trim();
+                status = response.status;
+                // 状态码错误，抛出异常进入重试流程
+                if (!response.ok) {
+                    throw new Error(`HTTP error ${response.status}`);
+                }
+                // 获取文件总体积
+                // 但是 Pixiv 的服务器有问题，偶尔一些文件没有 Content-Length 响应头（之后重试可能又有了），直接设置为 0
+                const contentLength = response.headers.get('Content-Length') || '0';
+                total = parseInt(contentLength, 10);
+                // 检查体积设置，如果检查不通过，会把 this.skip 设置成 true，从而中断下载
+                const sizeCheck = await this.checkSize(result, total);
+                if (!sizeCheck) {
+                    // 当因为体积问题跳过下载时，直接把进度条拉满
+                    // 如果不把进度条拉满，用户看到这个文件的进度条只有一点点，就会以为下载卡住或出错了
+                    this.setProgressBar(_fileName, 1, 1);
+                }
                 if (this.cancel) {
-                    reader.cancel();
+                    controller.abort();
                     return;
                 }
-                const { done, value } = await reader.read();
-                if (done)
-                    break;
-                chunks.push(value);
-                loaded += value.length;
-                this.setProgressBar(_fileName, loaded, total);
+                // 使用 ReadableStream 读取响应体，跟踪下载进度
+                const reader = response.body.getReader();
+                let loaded = 0;
+                while (true) {
+                    if (this.cancel) {
+                        reader.cancel();
+                        return;
+                    }
+                    const { done, value } = await reader.read();
+                    // Renew only when the stream makes progress. The forced EOF check also
+                    // fences out a tab that was suspended long enough for another tab to
+                    // reclaim the expired lease.
+                    await lease.renew(done);
+                    if (done)
+                        break;
+                    chunks.push(value);
+                    loaded += value.length;
+                    this.setProgressBar(_fileName, loaded, total);
+                }
+            }
+            finally {
+                controller.abort();
+                await lease.release();
             }
             // 组装 Blob
             let file = new Blob(chunks, {
@@ -23135,6 +23153,17 @@ class Download {
         catch (error) {
             if (this.cancel) {
                 return;
+            }
+            if (error instanceof _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.GlobalDownloadLeaseLostError) {
+                this.leaseLossRetry++;
+                if (this.leaseLossRetry >= _Config__WEBPACK_IMPORTED_MODULE_13__.Config.retryMax) {
+                    console.error('Global download lease repeatedly lost:', error);
+                    _ProgressBar__WEBPACK_IMPORTED_MODULE_7__.progressBar.errorColor(this.progressBarIndex, true);
+                    this.error = true;
+                    _EVT__WEBPACK_IMPORTED_MODULE_1__.EVT.fire('downloadError', arg.id);
+                    return;
+                }
+                return this.download(arg);
             }
             // AbortError 表示请求被主动中断，不需要重试
             if (error.name === 'AbortError') {
@@ -23207,7 +23236,7 @@ class Download {
         if (!novelMeta) {
             throw new Error('Not found novelMeta');
         }
-        const blob = await _MakeSingleNovelFile__WEBPACK_IMPORTED_MODULE_11__.makeSingleNovelFile[_setting_Settings__WEBPACK_IMPORTED_MODULE_10__.settings.novelSaveAs === 'epub' ? 'makeEPUB' : 'makeTXT'](novelMeta, filename);
+        const blob = await _MakeSingleNovelFile__WEBPACK_IMPORTED_MODULE_11__.makeSingleNovelFile[_setting_Settings__WEBPACK_IMPORTED_MODULE_10__.settings.novelSaveAs === 'epub' ? 'makeEPUB' : 'makeTXT'](novelMeta, filename, () => this.cancel);
         return blob;
     }
     lastUgoiraFileName = '';
@@ -23473,13 +23502,16 @@ class Download {
         else {
             // 其他情况，使用 fetch 加载缩略图文件
             try {
-                const response = await fetch(thumbURL);
-                if (!response.ok) {
+                const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_19__.fetchGlobalDownloadBody)(thumbURL, `${result.id}:ugoira-thumbnail`, 'blob', undefined, () => this.cancel);
+                if (download === null) {
+                    return;
+                }
+                if (!download.response.ok || download.data === null) {
                     // 如果请求成功但是状态码错误，就从 zip 文件里提取第一张图片来作为缩略图
                     thumbBlob = await _Tools__WEBPACK_IMPORTED_MODULE_16__.Tools.extractFirstImage(await zipFile.arrayBuffer());
                 }
                 else {
-                    thumbBlob = await response.blob();
+                    thumbBlob = download.data;
                 }
             }
             catch (error) {
@@ -24318,6 +24350,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _SendDownload__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./SendDownload */ "./src/ts/download/SendDownload.ts");
 /* harmony import */ var _setting_Settings__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ../setting/Settings */ "./src/ts/setting/Settings.ts");
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -24327,8 +24361,8 @@ __webpack_require__.r(__webpack_exports__);
 class DownloadNovelCover {
     /**下载小说的封面图片 */
     // 这个模块内部没有添加间隔时间
-    async download(coverURL, novelName) {
-        const blob = await this.getCover(coverURL, 'blob');
+    async download(coverURL, novelName, cancelled = () => false) {
+        const blob = await this.getCover(coverURL, 'blob', cancelled);
         if (blob === null) {
             return;
         }
@@ -24337,20 +24371,22 @@ class DownloadNovelCover {
     }
     /**最多重试一定次数，避免无限重试 */
     retryMax = 5;
-    async getCover(url, type, retry = 0) {
+    async getCover(url, type, cancelled = () => false, retry = 0) {
         try {
-            const res = await fetch(url, {
+            const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_6__.fetchGlobalDownloadBody)(url, `novel-cover:${url}`, type, {
                 method: 'get',
                 credentials: 'same-origin',
-            });
-            if (!res.ok) {
+            }, cancelled);
+            if (download === null)
+                return null;
+            const res = download.response;
+            if (!res.ok || download.data === null) {
                 const error = new Error(`${res.status} ${res.statusText}`);
                 error.status = res.status;
                 error.statusText = res.statusText;
                 throw error;
             }
-            const data = await res[type]();
-            return data;
+            return download.data;
         }
         catch (error) {
             retry++;
@@ -24364,7 +24400,7 @@ class DownloadNovelCover {
                 _Log__WEBPACK_IMPORTED_MODULE_0__.log.error(msg);
                 return null;
             }
-            return this.getCover(url, type, retry);
+            return this.getCover(url, type, cancelled, retry);
         }
     }
 }
@@ -24395,6 +24431,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_7__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
 /* harmony import */ var _SendDownload__WEBPACK_IMPORTED_MODULE_8__ = __webpack_require__(/*! ./SendDownload */ "./src/ts/download/SendDownload.ts");
 /* harmony import */ var _EVT__WEBPACK_IMPORTED_MODULE_9__ = __webpack_require__(/*! ../EVT */ "./src/ts/EVT.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_10__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -24646,15 +24684,17 @@ class DownloadNovelEmbeddedImage {
     retryMax = 10;
     async getImage(url, type, id, title, retry = 0) {
         try {
-            const res = await fetch(url);
-            if (!res.ok) {
+            const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_10__.fetchGlobalDownloadBody)(url, `novel-image:${id}:${url}`, type, undefined, () => this.stop);
+            if (download === null)
+                return null;
+            const res = download.response;
+            if (!res.ok || download.data === null) {
                 const error = new Error(`${res.status} ${res.statusText}`);
                 error.status = res.status;
                 error.statusText = res.statusText;
                 throw error;
             }
-            const data = await res[type]();
-            return data;
+            return download.data;
         }
         catch (error) {
             // 发生网络错误时，有时候请求会立即结束并被捕获。但有时需要等比较长的时间，例如服务器错误的返回了 206 状态码，请求并不会立刻结束，而是要等到浏览器认为请求超时才会报错。可能需要等待 5 分钟
@@ -24697,6 +24737,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _SendDownload__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./SendDownload */ "./src/ts/download/SendDownload.ts");
 /* harmony import */ var _Tools__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ../Tools */ "./src/ts/Tools.ts");
 /* harmony import */ var _setting_Settings__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ../setting/Settings */ "./src/ts/setting/Settings.ts");
+/* harmony import */ var _GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ./GlobalDownloadLease */ "./src/ts/download/GlobalDownloadLease.ts");
+
 
 
 
@@ -24721,11 +24763,11 @@ class DownloadNovelGlossaryImage {
                 return urls['original'] || null;
         }
     }
-    async download(urls, novelName, imageId, seriesId) {
+    async download(urls, novelName, imageId, seriesId, cancelled = () => false) {
         if (!_setting_Settings__WEBPACK_IMPORTED_MODULE_4__.settings.downloadNovelEmbeddedImage) {
             return;
         }
-        const blob = await this.getImage(urls, 'blob');
+        const blob = await this.getImage(urls, 'blob', cancelled);
         if (blob === null) {
             return;
         }
@@ -24736,7 +24778,7 @@ class DownloadNovelGlossaryImage {
     }
     /**最多重试一定次数，避免无限重试 */
     retryMax = 5;
-    async getImage(urls, type, retry = 0) {
+    async getImage(urls, type, cancelled = () => false, retry = 0) {
         if (!_setting_Settings__WEBPACK_IMPORTED_MODULE_4__.settings.downloadNovelEmbeddedImage) {
             return null;
         }
@@ -24747,18 +24789,20 @@ class DownloadNovelGlossaryImage {
         }
         console.log('get glossaryImage url', url);
         try {
-            const res = await fetch(url, {
+            const download = await (0,_GlobalDownloadLease__WEBPACK_IMPORTED_MODULE_5__.fetchGlobalDownloadBody)(url, `novel-glossary:${url}`, type, {
                 method: 'get',
                 credentials: 'same-origin',
-            });
-            if (!res.ok) {
+            }, cancelled);
+            if (download === null)
+                return null;
+            const res = download.response;
+            if (!res.ok || download.data === null) {
                 const error = new Error(`${res.status} ${res.statusText}`);
                 error.status = res.status;
                 error.statusText = res.statusText;
                 throw error;
             }
-            const data = await res[type]();
-            return data;
+            return download.data;
         }
         catch (error) {
             retry++;
@@ -24772,7 +24816,7 @@ class DownloadNovelGlossaryImage {
                 _Log__WEBPACK_IMPORTED_MODULE_0__.log.error(msg);
                 return null;
             }
-            return this.getImage(urls, type, retry);
+            return this.getImage(urls, type, cancelled, retry);
         }
     }
 }
@@ -25698,6 +25742,200 @@ new ExportResult2CSV();
 
 /***/ },
 
+/***/ "./src/ts/download/GlobalDownloadLease.ts"
+/*!************************************************!*\
+  !*** ./src/ts/download/GlobalDownloadLease.ts ***!
+  \************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   GlobalDownloadLease: () => (/* binding */ GlobalDownloadLease),
+/* harmony export */   GlobalDownloadLeaseLostError: () => (/* binding */ GlobalDownloadLeaseLostError),
+/* harmony export */   fetchGlobalDownloadBody: () => (/* binding */ fetchGlobalDownloadBody)
+/* harmony export */ });
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var _utils_Utils__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../utils/Utils */ "./src/ts/utils/Utils.ts");
+
+
+/** 全局下载租约协议使用的消息名称。 */
+const globalDownloadLeaseMsg = {
+    acquire: 'global_download_lease_acquire',
+    renew: 'global_download_lease_renew',
+    release: 'global_download_lease_release',
+};
+/** 全局下载租约专用的 runtime port 名称。 */
+const globalDownloadLeasePortName = 'global-download-lease';
+/** 全局下载租约的续租间隔。只有读取到响应体进度时才会调用续租。 */
+const renewIntervalMs = 10000;
+/** 租约被其他标签页占用时的默认重试间隔。 */
+const defaultRetryAfterMs = 500;
+/** 通过专用 port 发送一次租约请求，避免和现有 onMessage 监听器竞争响应。 */
+function sendGlobalDownloadLeaseMessage(message) {
+    const port = webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.connect({ name: globalDownloadLeasePortName });
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        port.onMessage.addListener((reply) => {
+            if (settled)
+                return;
+            settled = true;
+            const result = reply;
+            if (result?.error) {
+                reject(new Error(result.error));
+            }
+            else {
+                resolve(result);
+            }
+            port.disconnect();
+        });
+        port.onDisconnect.addListener(() => {
+            if (settled)
+                return;
+            settled = true;
+            reject(new Error('Global download lease port disconnected before reply'));
+        });
+        port.postMessage(message);
+    });
+}
+/** 当前下载已经失去全局租约时抛出的错误。 */
+class GlobalDownloadLeaseLostError extends Error {
+    /** 创建租约失效错误。 */
+    constructor() {
+        super('Global download lease lost');
+        this.name = 'GlobalDownloadLeaseLostError';
+    }
+}
+/** 表示一个跨标签页互斥的媒体下载租约。 */
+class GlobalDownloadLease {
+    requestId;
+    leaseId;
+    /** 标记这个租约是否已经释放。 */
+    released = false;
+    /** 最近一次成功续租的时间。 */
+    lastRenewAt = Date.now();
+    /** 只能通过 acquire() 创建租约实例。 */
+    constructor(requestId, leaseId) {
+        this.requestId = requestId;
+        this.leaseId = leaseId;
+    }
+    /** 等待并获取一个全局下载租约；取消等待时返回 null。 */
+    static async acquire(fileId, cancelled) {
+        const requestId = crypto.randomUUID();
+        while (!cancelled()) {
+            const reply = await sendGlobalDownloadLeaseMessage({
+                msg: globalDownloadLeaseMsg.acquire,
+                requestId,
+                fileId,
+            });
+            if (reply?.granted && reply.leaseId) {
+                const lease = new GlobalDownloadLease(requestId, reply.leaseId);
+                if (cancelled()) {
+                    await lease.release();
+                    return null;
+                }
+                return lease;
+            }
+            const retryAfterMs = Math.max(100, Math.min(reply?.retryAfterMs || defaultRetryAfterMs, 1000));
+            await _utils_Utils__WEBPACK_IMPORTED_MODULE_1__.Utils.sleep(retryAfterMs);
+        }
+        return null;
+    }
+    /** 在响应体确实取得进度后续租；force 用于 EOF 的 fencing 检查。 */
+    async renew(force = false) {
+        if (this.released) {
+            throw new GlobalDownloadLeaseLostError();
+        }
+        if (!force && Date.now() - this.lastRenewAt < renewIntervalMs) {
+            return;
+        }
+        const reply = await sendGlobalDownloadLeaseMessage({
+            msg: globalDownloadLeaseMsg.renew,
+            requestId: this.requestId,
+            leaseId: this.leaseId,
+        });
+        if (!reply?.granted) {
+            throw new GlobalDownloadLeaseLostError();
+        }
+        this.lastRenewAt = Date.now();
+    }
+    /** 尽力释放租约；释放失败时让后台 TTL 最终回收它。 */
+    async release() {
+        if (this.released) {
+            return;
+        }
+        this.released = true;
+        try {
+            await sendGlobalDownloadLeaseMessage({
+                msg: globalDownloadLeaseMsg.release,
+                requestId: this.requestId,
+                leaseId: this.leaseId,
+            });
+        }
+        catch (error) {
+            // 释放失败时仍然有后台 TTL 兜底，不应把已经成功获取的文件变成下载失败
+            console.warn('Failed to release global download lease', error);
+        }
+    }
+}
+async function fetchGlobalDownloadBody(url, fileId, type, init, cancelled = () => false) {
+    const lease = await GlobalDownloadLease.acquire(fileId, cancelled);
+    if (!lease)
+        return null;
+    let reader;
+    let bodyComplete = false;
+    try {
+        const response = await fetch(url, init);
+        if (!response.ok) {
+            await response.body?.cancel();
+            return { response, data: null };
+        }
+        reader = response.body?.getReader();
+        const chunks = [];
+        if (reader) {
+            while (true) {
+                if (cancelled()) {
+                    await reader.cancel();
+                    return null;
+                }
+                const { done, value } = await reader.read();
+                await lease.renew(done);
+                if (done) {
+                    bodyComplete = true;
+                    break;
+                }
+                chunks.push(value);
+            }
+        }
+        else {
+            await lease.renew(true);
+            bodyComplete = true;
+        }
+        const contentType = response.headers.get('Content-Type')?.split(';')[0].trim() ||
+            'application/octet-stream';
+        const blob = new Blob(chunks, { type: contentType });
+        const data = type === 'blob' ? blob : await blob.arrayBuffer();
+        return { response, data };
+    }
+    finally {
+        if (reader && !bodyComplete) {
+            try {
+                await reader.cancel();
+            }
+            catch (error) {
+                // 取消失败不能覆盖原始下载/租约错误，租约仍然必须立即释放
+                console.warn('Failed to cancel abandoned global download body', error);
+            }
+        }
+        await lease.release();
+    }
+}
+
+
+
+/***/ },
+
 /***/ "./src/ts/download/ImportResult.ts"
 /*!*****************************************!*\
   !*** ./src/ts/download/ImportResult.ts ***!
@@ -25837,11 +26075,11 @@ __webpack_require__.r(__webpack_exports__);
 /** 为单篇小说生成文件 */
 class MakeSingleNovelFile {
     /** 下载小说的封面图片 */
-    async downloadCover(id, title, url, filename) {
+    async downloadCover(id, title, url, filename, cancelled) {
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_0__.settings.downloadNovelCoverImage && url) {
             _Log__WEBPACK_IMPORTED_MODULE_4__.log.log(_Language__WEBPACK_IMPORTED_MODULE_3__.lang.transl('_下载小说的封面图片的提示', _Tools__WEBPACK_IMPORTED_MODULE_1__.Tools.createWorkLink(id, title, 'novel')), 'downloadNovelCover' + id);
             await _DownloadInterval__WEBPACK_IMPORTED_MODULE_5__.downloadInterval.wait();
-            await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.download(url, filename);
+            await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.download(url, filename, cancelled);
         }
     }
     // 建立串行机制（主要是在下载图片时启用限制），禁止并发执行。
@@ -25857,10 +26095,10 @@ class MakeSingleNovelFile {
         }
         return;
     }
-    async makeTXT(data, filename) {
+    async makeTXT(data, filename, cancelled = () => false) {
         await this.waitForIdle();
         this.busy = true;
-        await this.downloadCover(data.id, data.title, data.coverUrl, filename);
+        await this.downloadCover(data.id, data.title, data.coverUrl, filename, cancelled);
         let content = await _ReplaceNovelWords__WEBPACK_IMPORTED_MODULE_10__.replaceNovelWords.replace(data.seriesId, data.content);
         // 下载小说里的内嵌图片
         await _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_9__.downloadNovelEmbeddedImage.TXT(data.id, data.title, content, data.embeddedImages, filename, 'single novel');
@@ -25878,10 +26116,10 @@ class MakeSingleNovelFile {
             type: 'text/plain',
         });
     }
-    async makeEPUB(data, filename) {
+    async makeEPUB(data, filename, cancelled = () => false) {
         await this.waitForIdle();
         this.busy = true;
-        await this.downloadCover(data.id, data.title, data.coverUrl, filename);
+        await this.downloadCover(data.id, data.title, data.coverUrl, filename, cancelled);
         let content = await _ReplaceNovelWords__WEBPACK_IMPORTED_MODULE_10__.replaceNovelWords.replace(data.seriesId, data.content);
         // 添加元数据
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_0__.settings.saveNovelMeta) {
@@ -25921,7 +26159,7 @@ class MakeSingleNovelFile {
         jepub.uuid(novelURL);
         jepub.date(new Date(data.createDate));
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_0__.settings.downloadNovelCoverImage && data.coverUrl) {
-            const cover = await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.getCover(data.coverUrl, 'arrayBuffer');
+            const cover = await _DownloadNovelCover__WEBPACK_IMPORTED_MODULE_8__.downloadNovelCover.getCover(data.coverUrl, 'arrayBuffer', cancelled);
             if (cover) {
                 jepub.cover(_Config__WEBPACK_IMPORTED_MODULE_7__.Config.isFirefox ? _utils_Utils__WEBPACK_IMPORTED_MODULE_2__.Utils.copyArrayBuffer(cover) : cover);
             }
@@ -26222,7 +26460,7 @@ class MergeNovel {
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_2__.settings.novelSaveAs === 'txt') {
             await this.sleep(this.downloadInterval);
         }
-        await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.download(coverUrl, this.novelName);
+        await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.download(coverUrl, this.novelName, () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
     }
     /** 输出合并完成后的成功日志和提示。 */
     logMergeFinished(link) {
@@ -26283,7 +26521,7 @@ class MergeNovel {
         for (const item of this.glossaryImages) {
             if (item) {
                 this.logDownloadGlossaryImage(item);
-                await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.download(item.urls, this.novelName, item.novelImageId, this.seriesId);
+                await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.download(item.urls, this.novelName, item.novelImageId, this.seriesId, () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
             }
         }
     }
@@ -26536,7 +26774,7 @@ class MergeNovel {
         for (const item of this.glossaryImages) {
             if (item) {
                 this.logDownloadGlossaryImage(item);
-                const image = await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.getImage(item.urls, 'arrayBuffer');
+                const image = await _DownloadNovelGlossaryImage__WEBPACK_IMPORTED_MODULE_7__.downloadNovelGlossaryImage.getImage(item.urls, 'arrayBuffer', () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
                 if (image) {
                     this.addSize(image.byteLength);
                     const imageId = `glossaryImage-${item.novelImageId}`;
@@ -26553,7 +26791,7 @@ class MergeNovel {
         }
         await this.sleep(this.downloadInterval);
         this.logDownloadSeriesCover();
-        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(seriesCoverUrl, 'arrayBuffer');
+        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(seriesCoverUrl, 'arrayBuffer', () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
         if (cover) {
             this.addSize(cover.byteLength);
             jepub.cover(_Config__WEBPACK_IMPORTED_MODULE_11__.Config.isFirefox ? _utils_Utils__WEBPACK_IMPORTED_MODULE_1__.Utils.copyArrayBuffer(cover) : cover);
@@ -26579,7 +26817,7 @@ class MergeNovel {
         }
         // 没有保存过，下载并添加这个章节的封面图
         await this.sleep(this.downloadInterval);
-        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(coverUrl, 'arrayBuffer');
+        const cover = await _download_DownloadNovelCover__WEBPACK_IMPORTED_MODULE_5__.downloadNovelCover.getCover(coverUrl, 'arrayBuffer', () => _DownloadNovelEmbeddedImage__WEBPACK_IMPORTED_MODULE_6__.downloadNovelEmbeddedImage.stop);
         if (!cover) {
             return coverHtml;
         }

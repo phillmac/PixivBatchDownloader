@@ -325,7 +325,11 @@ class MergeNovel {
     if (settings.novelSaveAs === 'txt') {
       await this.sleep(this.downloadInterval)
     }
-    await downloadNovelCover.download(coverUrl, this.novelName)
+    await downloadNovelCover.download(
+      coverUrl,
+      this.novelName,
+      () => downloadNovelEmbeddedImage.stop
+    )
   }
 
   /** 输出合并完成后的成功日志和提示。 */
@@ -412,7 +416,8 @@ class MergeNovel {
           item.urls,
           this.novelName,
           item.novelImageId,
-          this.seriesId
+          this.seriesId,
+          () => downloadNovelEmbeddedImage.stop
         )
       }
     }
@@ -725,7 +730,8 @@ class MergeNovel {
         this.logDownloadGlossaryImage(item)
         const image = await downloadNovelGlossaryImage.getImage(
           item.urls,
-          'arrayBuffer'
+          'arrayBuffer',
+          () => downloadNovelEmbeddedImage.stop
         )
         if (image) {
           this.addSize(image.byteLength)
@@ -750,7 +756,8 @@ class MergeNovel {
     this.logDownloadSeriesCover()
     const cover = await downloadNovelCover.getCover(
       seriesCoverUrl,
-      'arrayBuffer'
+      'arrayBuffer',
+      () => downloadNovelEmbeddedImage.stop
     )
     if (cover) {
       this.addSize(cover.byteLength)
@@ -785,7 +792,11 @@ class MergeNovel {
 
     // 没有保存过，下载并添加这个章节的封面图
     await this.sleep(this.downloadInterval)
-    const cover = await downloadNovelCover.getCover(coverUrl, 'arrayBuffer')
+    const cover = await downloadNovelCover.getCover(
+      coverUrl,
+      'arrayBuffer',
+      () => downloadNovelEmbeddedImage.stop
+    )
     if (!cover) {
       return coverHtml
     }
