@@ -13,6 +13,7 @@ import { log } from '../Log'
 import { lang } from '../Language'
 import { setSetting, settings } from '../setting/Settings'
 import { Download } from '../download/Download'
+import { downloadDiagnostics } from './DownloadDiagnostics'
 import { progressBar } from './ProgressBar'
 import { downloadStates } from './DownloadStates'
 import { ShowDownloadStates } from './ShowDownloadStates'
@@ -36,6 +37,20 @@ class DownloadControl {
     this.createDownloadArea()
 
     this.bindEvents()
+
+    downloadDiagnostics.setPageStateProvider(() => ({
+      taskBatch: this.taskBatch,
+      thread: this.thread,
+      downloaded: this.downloaded,
+      remainingDownload: store.remainingDownload,
+      resultLength: store.result.length,
+      pause: this.pause,
+      stop: this.stop,
+      busy: states.busy,
+      downloading: states.downloading,
+      downloadStates: [...downloadStates.states],
+      taskList: { ...this.taskList },
+    }))
 
     const statusTipWrap = this.wrapper.querySelector(
       '.down_status'
@@ -106,6 +121,7 @@ class DownloadControl {
 
   private bindEvents() {
     window.addEventListener(EVT.list.crawlStart, () => {
+      downloadDiagnostics.finishAll('crawl-start')
       this.hideResultBtns()
       this.hideDownloadArea()
       this.reset()
@@ -209,18 +225,39 @@ class DownloadControl {
       // 文件下载成功
       if (msg.msg === 'downloaded') {
         try {
+          if (msg.data.diagnosticId) {
+            downloadDiagnostics.enter(
+              msg.data.diagnosticId,
+              'page-download-result-received',
+              { browserDownloadId: msg.data.browserDownloadId }
+            )
+          }
           URL.revokeObjectURL(msg.data.blobURLFront)
 
           // 发送下载成功的事件
           EVT.fire('downloadSuccess', msg.data)
 
-          this.downloadOrSkipAFile(msg.data)
+          const advanced = this.downloadOrSkipAFile(msg.data)
+          if (advanced && msg.data.diagnosticId) {
+            downloadDiagnostics.finish(
+              msg.data.diagnosticId,
+              'page-download-complete',
+              { browserDownloadId: msg.data.browserDownloadId }
+            )
+          }
         } catch (error) {
           // 捕获此分支内的异常，避免事件监听器或推进逻辑的错误导致任务卡住却没有提示
           console.error('downloaded 分支执行出错', error)
         }
         // console.log('downloaded', msg.data.id )
       } else if (msg.msg === 'download_err') {
+        if (msg.data.diagnosticId) {
+          downloadDiagnostics.finish(
+            msg.data.diagnosticId,
+            'page-download-error',
+            { browserDownloadId: msg.data.browserDownloadId, error: msg.err }
+          )
+        }
         // 浏览器把文件保存到本地失败
 
         // 用户操作导致下载取消的情况，跳过这个文件，不再重试保存它。触发条件如：
@@ -538,6 +575,7 @@ class DownloadControl {
       // 如果正在下载中
       if (states.busy) {
         this.pause = true
+        downloadDiagnostics.finishAll('download-paused')
         log.warning('⏸️' + lang.transl('_下载已暂停'))
         // 输出空字符串，起到占据一个空行的效果，使得日志看起来更清晰
         log.log('')
@@ -557,6 +595,7 @@ class DownloadControl {
     }
 
     this.stop = true
+    downloadDiagnostics.finishAll('download-stopped')
     log.error('🛑' + lang.transl('_下载已停止'))
     // 输出空字符串，起到占据一个空行的效果，使得日志看起来更清晰
     log.log('')
@@ -659,9 +698,11 @@ class DownloadControl {
       if (this.checkContinueDownload()) {
         this.createDownload(no)
       }
+      return true
     } catch (error) {
       // 捕获推进任务时的异常，避免任务卡住却没有提示
       console.error('downloadOrSkipAFile 执行出错', error)
+      return false
     }
   }
 

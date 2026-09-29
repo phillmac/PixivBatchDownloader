@@ -194,6 +194,147 @@ async function sendWarningToAllTabs() {
 
 /***/ },
 
+/***/ "./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts"
+/*!***********************************************************!*\
+  !*** ./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts ***!
+  \***********************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   downloadWorkerDiagnostics: () => (/* binding */ downloadWorkerDiagnostics)
+/* harmony export */ });
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+
+/** 每个标签页保留的最近 worker 诊断事件数量。 */
+const EVENT_LIMIT = 240;
+/** 持久化保留的疑似卡住报告数量。 */
+const REPORT_LIMIT = 20;
+/** 疑似卡住报告的 storage.local 键名。 */
+const REPORT_STORAGE_KEY = 'downloadHangDiagnostics';
+/** 跟踪 service worker 下载阶段并持久化异常诊断报告。 */
+class DownloadWorkerDiagnostics {
+    /** 当前仍在 worker 中活动的诊断任务。 */
+    active = new Map();
+    /** 按标签页保存的有界 worker 诊断事件。 */
+    events = new Map();
+    /** 串行化持久化报告的队列，防止并发读改写丢失数据。 */
+    persistQueue = Promise.resolve();
+    /** 记录 worker 侧任务进入新的诊断阶段。 */
+    enter(tabId, diagnosticId, stage, details = {}) {
+        if (!diagnosticId)
+            return;
+        const previous = this.active.get(diagnosticId);
+        const task = {
+            diagnosticId,
+            tabId,
+            workId: typeof details.workId === 'string'
+                ? details.workId
+                : previous?.workId || '',
+            fileName: typeof details.fileName === 'string'
+                ? details.fileName
+                : previous?.fileName || '',
+            stage,
+            stageAt: new Date().toISOString(),
+            browserDownloadId: typeof details.browserDownloadId === 'number'
+                ? details.browserDownloadId
+                : previous?.browserDownloadId,
+        };
+        this.active.set(diagnosticId, task);
+        const events = this.events.get(tabId) || [];
+        events.push({
+            at: task.stageAt,
+            diagnosticId,
+            tabId,
+            stage,
+            details,
+        });
+        if (events.length > EVENT_LIMIT) {
+            events.splice(0, events.length - EVENT_LIMIT);
+        }
+        this.events.set(tabId, events);
+    }
+    /** 记录最终 worker 阶段并移除活动任务。 */
+    finish(tabId, diagnosticId, stage, details = {}) {
+        if (!diagnosticId)
+            return;
+        this.enter(tabId, diagnosticId, stage, details);
+        this.active.delete(diagnosticId);
+    }
+    /** 捕获指定标签页的 worker 状态及已知 Chrome 下载状态。 */
+    async snapshot(tabId, bookkeeping = {}) {
+        const active = [...this.active.values()].filter((task) => task.tabId === tabId);
+        const downloads = [];
+        for (const task of active) {
+            if (task.browserDownloadId === undefined)
+                continue;
+            try {
+                const [item] = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().downloads.search({
+                    id: task.browserDownloadId,
+                });
+                downloads.push(item
+                    ? {
+                        diagnosticId: task.diagnosticId,
+                        id: item.id,
+                        filename: item.filename,
+                        state: item.state,
+                        paused: item.paused,
+                        error: item.error,
+                        bytesReceived: item.bytesReceived,
+                        totalBytes: item.totalBytes,
+                        startTime: item.startTime,
+                        endTime: item.endTime,
+                        exists: item.exists,
+                    }
+                    : {
+                        diagnosticId: task.diagnosticId,
+                        id: task.browserDownloadId,
+                        missing: true,
+                    });
+            }
+            catch (error) {
+                downloads.push({
+                    diagnosticId: task.diagnosticId,
+                    id: task.browserDownloadId,
+                    lookupError: String(error),
+                });
+            }
+        }
+        return {
+            capturedAt: new Date().toISOString(),
+            active,
+            recentEvents: (this.events.get(tabId) || []).slice(),
+            downloads,
+            bookkeeping,
+        };
+    }
+    /** 串行化 storage.local 的读改写，避免并发异常报告相互覆盖。 */
+    persist(tabId, report) {
+        const write = async () => {
+            const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.get(REPORT_STORAGE_KEY);
+            const reports = Array.isArray(stored[REPORT_STORAGE_KEY])
+                ? stored[REPORT_STORAGE_KEY]
+                : [];
+            reports.push({ tabId, storedAt: new Date().toISOString(), report });
+            if (reports.length > REPORT_LIMIT) {
+                reports.splice(0, reports.length - REPORT_LIMIT);
+            }
+            await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.set({ [REPORT_STORAGE_KEY]: reports });
+        };
+        const result = this.persistQueue.then(write, write);
+        this.persistQueue = result.then(() => undefined, () => undefined);
+        return result;
+    }
+}
+/** Service worker 侧下载诊断单例。 */
+const downloadWorkerDiagnostics = new DownloadWorkerDiagnostics();
+
+
+
+/***/ },
+
 /***/ "./src/ts/serviceWorker/ManageFollowing.ts"
 /*!*************************************************!*\
   !*** ./src/ts/serviceWorker/ManageFollowing.ts ***!
@@ -1898,6 +2039,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_2__);
 /* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
+/* harmony import */ var _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ./DownloadWorkerDiagnostics */ "./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts");
+
 
 
 
@@ -1927,6 +2070,22 @@ let idList = {};
 // 实际上，下载时后台 SW 会持续存在很长时间，不会轻易被回收的。持久化存储只是为了以防万一
 async function setData(data) {
     return webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.set(data);
+}
+/** 立即持久化 worker 侧异常，避免 MV3 worker 休眠后丢失证据。 */
+async function persistDownloadWorkerIncident(tabId, reason, details = {}) {
+    const worker = await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.snapshot(tabId, {
+        memoryBatchNo: batchNo[tabId],
+        memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
+    });
+    await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.persist(tabId, {
+        schemaVersion: 1,
+        diagnosticsVersion: 'download-hang-v1',
+        source: 'service-worker',
+        capturedAt: new Date().toISOString(),
+        reason,
+        details,
+        worker,
+    });
 }
 /** 全局下载租约协议使用的消息名称。 */
 const globalDownloadLeaseMsg = {
@@ -2120,23 +2279,57 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onConnect.a
         });
     });
 });
+/** 判断未知 runtime 消息是否属于只读/持久化下载诊断协议。 */
+function isDownloadDiagnosticMessage(msg) {
+    if (!msg || typeof msg !== 'object')
+        return false;
+    const value = msg;
+    if (value.msg === 'get_download_worker_diagnostics')
+        return true;
+    return value.msg === 'record_download_hang_diagnostic' && 'report' in value;
+}
 // 类型守卫，这是为了通过类型检查，所以只要求有 msg 属性
 // 如果检查了其他属性，那么对于只有 msg 属性的简单消息就会不通过。所以不检查其他属性
 function isMsg(msg) {
     return !!msg.msg;
 }
 webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.addListener(async function (msg, sender) {
+    const tabId = sender.tab?.id;
+    if (isDownloadDiagnosticMessage(msg)) {
+        if (msg.msg === 'get_download_worker_diagnostics') {
+            if (tabId === undefined)
+                return { unavailable: true, reason: 'no-tab-id' };
+            const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.get(['batchNo', 'idList']);
+            const storedBatchNo = stored.batchNo;
+            const storedIdList = stored.idList;
+            return _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.snapshot(tabId, {
+                memoryBatchNo: batchNo[tabId],
+                memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
+                storedBatchNo: storedBatchNo?.[tabId],
+                storedIdList: storedIdList?.[tabId] ? [...storedIdList[tabId]] : [],
+            });
+        }
+        if (tabId === undefined)
+            return { stored: false, reason: 'no-tab-id' };
+        await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.persist(tabId, msg.report);
+        return { stored: true };
+    }
     // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
     // 不能直接在上面设置类型为 msg: SendToBackEndData，否则会报错。因此需要使用类型守卫，真麻烦
     if (!isMsg(msg)) {
         console.warn('收到了无效的消息:', msg);
         return false;
     }
-    const tabId = sender.tab.id;
+    if (tabId === undefined)
+        return false;
     // 当存在同名文件时，默认覆写，但前台也可以指定处理方式
     const conflictAction = msg.conflictAction || 'overwrite';
     // 下载作品的文件
     if (msg.msg === 'save_work_file') {
+        _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'save-request-received', {
+            workId: msg.id,
+            fileName: msg.fileName,
+        });
         // 当处于初始状态时，或者变量被回收了，就从存储中读取数据储存在变量中
         // 之后每当要使用这两个数据时，从变量读取，而不是从存储中获得。这样就解决了数据不同步的问题，而且性能更高
         if (Object.keys(batchNo).length === 0) {
@@ -2158,6 +2351,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
             setData({ idList });
             // 开始下载
             const _url = await getFileURL(msg);
+            _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-create-pending', { workId: msg.id, fileName: msg.fileName });
             webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().downloads
                 .download({
                 url: _url,
@@ -2166,6 +2360,11 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
                 saveAs: false,
             })
                 .then((id) => {
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-created', {
+                    workId: msg.id,
+                    fileName: msg.fileName,
+                    browserDownloadId: id,
+                });
                 // id 是新建立的下载项的 id，使用它作为 key 保存数据
                 dlData[id] = {
                     blobURLFront: msg.blobURL,
@@ -2173,10 +2372,30 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
                     id: msg.id,
                     tabId: tabId,
                     uuid: false,
+                    diagnosticId: msg.diagnosticId,
+                    browserDownloadId: id,
                 };
             })
                 .catch((error) => {
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-create-rejected', {
+                    workId: msg.id,
+                    fileName: msg.fileName,
+                    error: String(error),
+                });
                 console.error('downloads.download 失败', error);
+                void persistDownloadWorkerIncident(tabId, 'browser-download-create-rejected', { workId: msg.id, fileName: msg.fileName, error: String(error) });
+            });
+        }
+        else {
+            _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'save-request-deduplicated', {
+                workId: msg.id,
+                fileName: msg.fileName,
+                idListLength: idList[tabId].length,
+            });
+            await persistDownloadWorkerIncident(tabId, 'save-request-deduplicated', {
+                workId: msg.id,
+                fileName: msg.fileName,
+                idListLength: idList[tabId].length,
             });
         }
     }
@@ -2216,11 +2435,18 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
                 id: msg.id,
                 tabId,
                 uuid: false,
+                diagnosticId: msg.diagnosticId,
             },
             err: '',
         };
+        _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.finish(tabId, msg.diagnosticId, 'a-download-simulated-complete', { workId: msg.id, fileName: msg.fileName });
         webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.sendMessage(tabId, data).catch((error) => {
             console.error('回发 downloaded 消息失败', error);
+            void persistDownloadWorkerIncident(tabId, 'result-message-rejected', {
+                workId: msg.id,
+                diagnosticId: msg.diagnosticId,
+                error: String(error),
+            });
         });
     }
     if (msg.msg === 'clearDownloadsTempData') {
@@ -2281,10 +2507,15 @@ if (!_Config__WEBPACK_IMPORTED_MODULE_3__.Config.downloadsAPIDisabled) {
             }
             if (detail.state && detail.state.current === 'complete') {
                 msg = 'downloaded';
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.finish(_dlData.tabId, _dlData.diagnosticId, 'browser-download-complete', {
+                    browserDownloadId: detail.id,
+                    browserSetFilename: _dlData.browserSetFilename,
+                });
             }
             if (detail.error && detail.error.current) {
                 msg = 'download_err';
                 err = detail.error.current;
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.finish(_dlData.tabId, _dlData.diagnosticId, 'browser-download-error', { browserDownloadId: detail.id, error: err });
                 // 当保存一个文件出错时，从任务记录列表里删除它，以便前台重试下载
                 const idIndex = idList[_dlData.tabId].findIndex((val) => val === _dlData.id);
                 idList[_dlData.tabId][idIndex] = '';
@@ -2293,7 +2524,18 @@ if (!_Config__WEBPACK_IMPORTED_MODULE_3__.Config.downloadsAPIDisabled) {
             if (msg) {
                 // 返回信息
                 if (!_dlData.noReply) {
-                    webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.sendMessage(_dlData.tabId, { msg, data: _dlData, err });
+                    webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs
+                        .sendMessage(_dlData.tabId, { msg, data: _dlData, err })
+                        .catch((error) => {
+                        console.error('回发 downloaded 消息失败', error);
+                        void persistDownloadWorkerIncident(_dlData.tabId, 'result-message-rejected', {
+                            workId: _dlData.id,
+                            diagnosticId: _dlData.diagnosticId,
+                            browserDownloadId: detail.id,
+                            resultMessage: msg,
+                            error: String(error),
+                        });
+                    });
                 }
                 // 吊销前后台生成的 blob URL
                 revokeBlobURL(_dlData?.blobURLFront);

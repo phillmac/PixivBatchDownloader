@@ -3,6 +3,7 @@ import './CheckDownloadCount'
 import { DonwloadListData, SendToBackEndData } from '../download/DownloadType'
 import browser from 'webextension-polyfill'
 import { Config } from '../Config'
+import { downloadWorkerDiagnostics } from './DownloadWorkerDiagnostics'
 
 // 当点击扩展图标时，显示/隐藏下载面板
 browser.action.onClicked.addListener(function (tab) {
@@ -32,6 +33,21 @@ const dlData: DonwloadListData = {}
 type batchNoType = { [key: string]: number }
 type idListType = { [key: string]: string[] }
 
+/** 页面请求 worker 返回当前下载诊断状态的消息。 */
+interface GetDownloadWorkerDiagnosticsMessage {
+  msg: 'get_download_worker_diagnostics'
+}
+
+/** 页面请求 worker 持久化疑似卡住诊断报告的消息。 */
+interface RecordDownloadHangDiagnosticMessage {
+  msg: 'record_download_hang_diagnostic'
+  report: unknown
+}
+
+/** 下载诊断专用的 runtime 消息。 */
+type DownloadDiagnosticMessage =
+  GetDownloadWorkerDiagnosticsMessage | RecordDownloadHangDiagnosticMessage
+
 /** 使用每个标签页的 tabId 作为索引，储存此标签页里当前下载任务的编号。用来判断不同批次的下载 */
 let batchNo: batchNoType = {}
 
@@ -44,6 +60,27 @@ let idList: idListType = {}
 
 async function setData(data: { [key: string]: any }) {
   return browser.storage.local.set(data)
+}
+
+/** 立即持久化 worker 侧异常，避免 MV3 worker 休眠后丢失证据。 */
+async function persistDownloadWorkerIncident(
+  tabId: number,
+  reason: string,
+  details: Record<string, unknown> = {}
+) {
+  const worker = await downloadWorkerDiagnostics.snapshot(tabId, {
+    memoryBatchNo: batchNo[tabId],
+    memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
+  })
+  await downloadWorkerDiagnostics.persist(tabId, {
+    schemaVersion: 1,
+    diagnosticsVersion: 'download-hang-v1',
+    source: 'service-worker',
+    capturedAt: new Date().toISOString(),
+    reason,
+    details,
+    worker,
+  })
 }
 
 /** 全局下载租约协议使用的消息名称。 */
@@ -338,6 +375,16 @@ browser.runtime.onConnect.addListener((port) => {
   })
 })
 
+/** 判断未知 runtime 消息是否属于只读/持久化下载诊断协议。 */
+function isDownloadDiagnosticMessage(
+  msg: unknown
+): msg is DownloadDiagnosticMessage {
+  if (!msg || typeof msg !== 'object') return false
+  const value = msg as Record<string, unknown>
+  if (value.msg === 'get_download_worker_diagnostics') return true
+  return value.msg === 'record_download_hang_diagnostic' && 'report' in value
+}
+
 // 类型守卫，这是为了通过类型检查，所以只要求有 msg 属性
 // 如果检查了其他属性，那么对于只有 msg 属性的简单消息就会不通过。所以不检查其他属性
 function isMsg(msg: any): msg is SendToBackEndData {
@@ -348,6 +395,27 @@ browser.runtime.onMessage.addListener(async function (
   msg: unknown,
   sender: browser.Runtime.MessageSender
 ) {
+  const tabId = sender.tab?.id
+
+  if (isDownloadDiagnosticMessage(msg)) {
+    if (msg.msg === 'get_download_worker_diagnostics') {
+      if (tabId === undefined) return { unavailable: true, reason: 'no-tab-id' }
+      const stored = await browser.storage.local.get(['batchNo', 'idList'])
+      const storedBatchNo = stored.batchNo as batchNoType | undefined
+      const storedIdList = stored.idList as idListType | undefined
+      return downloadWorkerDiagnostics.snapshot(tabId, {
+        memoryBatchNo: batchNo[tabId],
+        memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
+        storedBatchNo: storedBatchNo?.[tabId],
+        storedIdList: storedIdList?.[tabId] ? [...storedIdList[tabId]] : [],
+      })
+    }
+
+    if (tabId === undefined) return { stored: false, reason: 'no-tab-id' }
+    await downloadWorkerDiagnostics.persist(tabId, msg.report)
+    return { stored: true }
+  }
+
   // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
   // 不能直接在上面设置类型为 msg: SendToBackEndData，否则会报错。因此需要使用类型守卫，真麻烦
   if (!isMsg(msg)) {
@@ -355,12 +423,22 @@ browser.runtime.onMessage.addListener(async function (
     return false
   }
 
-  const tabId = sender.tab!.id!
+  if (tabId === undefined) return false
+
   // 当存在同名文件时，默认覆写，但前台也可以指定处理方式
   const conflictAction = msg.conflictAction || 'overwrite'
 
   // 下载作品的文件
   if (msg.msg === 'save_work_file') {
+    downloadWorkerDiagnostics.enter(
+      tabId,
+      msg.diagnosticId,
+      'save-request-received',
+      {
+        workId: msg.id,
+        fileName: msg.fileName,
+      }
+    )
     // 当处于初始状态时，或者变量被回收了，就从存储中读取数据储存在变量中
     // 之后每当要使用这两个数据时，从变量读取，而不是从存储中获得。这样就解决了数据不同步的问题，而且性能更高
     if (Object.keys(batchNo).length === 0) {
@@ -385,6 +463,12 @@ browser.runtime.onMessage.addListener(async function (
 
       // 开始下载
       const _url = await getFileURL(msg)
+      downloadWorkerDiagnostics.enter(
+        tabId,
+        msg.diagnosticId,
+        'browser-download-create-pending',
+        { workId: msg.id, fileName: msg.fileName }
+      )
       browser.downloads
         .download({
           url: _url,
@@ -393,6 +477,16 @@ browser.runtime.onMessage.addListener(async function (
           saveAs: false,
         })
         .then((id) => {
+          downloadWorkerDiagnostics.enter(
+            tabId,
+            msg.diagnosticId,
+            'browser-download-created',
+            {
+              workId: msg.id,
+              fileName: msg.fileName,
+              browserDownloadId: id,
+            }
+          )
           // id 是新建立的下载项的 id，使用它作为 key 保存数据
           dlData[id] = {
             blobURLFront: msg.blobURL,
@@ -400,11 +494,44 @@ browser.runtime.onMessage.addListener(async function (
             id: msg.id,
             tabId: tabId,
             uuid: false,
+            diagnosticId: msg.diagnosticId,
+            browserDownloadId: id,
           }
         })
         .catch((error) => {
+          downloadWorkerDiagnostics.enter(
+            tabId,
+            msg.diagnosticId,
+            'browser-download-create-rejected',
+            {
+              workId: msg.id,
+              fileName: msg.fileName,
+              error: String(error),
+            }
+          )
           console.error('downloads.download 失败', error)
+          void persistDownloadWorkerIncident(
+            tabId,
+            'browser-download-create-rejected',
+            { workId: msg.id, fileName: msg.fileName, error: String(error) }
+          )
         })
+    } else {
+      downloadWorkerDiagnostics.enter(
+        tabId,
+        msg.diagnosticId,
+        'save-request-deduplicated',
+        {
+          workId: msg.id,
+          fileName: msg.fileName,
+          idListLength: idList[tabId].length,
+        }
+      )
+      await persistDownloadWorkerIncident(tabId, 'save-request-deduplicated', {
+        workId: msg.id,
+        fileName: msg.fileName,
+        idListLength: idList[tabId].length,
+      })
     }
   }
 
@@ -447,11 +574,23 @@ browser.runtime.onMessage.addListener(async function (
         id: msg.id,
         tabId,
         uuid: false,
+        diagnosticId: msg.diagnosticId,
       },
       err: '',
     }
+    downloadWorkerDiagnostics.finish(
+      tabId,
+      msg.diagnosticId,
+      'a-download-simulated-complete',
+      { workId: msg.id, fileName: msg.fileName }
+    )
     browser.tabs.sendMessage(tabId, data).catch((error) => {
       console.error('回发 downloaded 消息失败', error)
+      void persistDownloadWorkerIncident(tabId, 'result-message-rejected', {
+        workId: msg.id,
+        diagnosticId: msg.diagnosticId,
+        error: String(error),
+      })
     })
   }
 
@@ -529,11 +668,26 @@ if (!Config.downloadsAPIDisabled) {
 
       if (detail.state && detail.state.current === 'complete') {
         msg = 'downloaded'
+        downloadWorkerDiagnostics.finish(
+          _dlData.tabId,
+          _dlData.diagnosticId,
+          'browser-download-complete',
+          {
+            browserDownloadId: detail.id,
+            browserSetFilename: _dlData.browserSetFilename,
+          }
+        )
       }
 
       if (detail.error && detail.error.current) {
         msg = 'download_err'
         err = detail.error.current
+        downloadWorkerDiagnostics.finish(
+          _dlData.tabId,
+          _dlData.diagnosticId,
+          'browser-download-error',
+          { browserDownloadId: detail.id, error: err }
+        )
         // 当保存一个文件出错时，从任务记录列表里删除它，以便前台重试下载
         const idIndex = idList[_dlData.tabId].findIndex(
           (val) => val === _dlData.id
@@ -545,7 +699,22 @@ if (!Config.downloadsAPIDisabled) {
       if (msg) {
         // 返回信息
         if (!_dlData.noReply) {
-          browser.tabs.sendMessage(_dlData.tabId, { msg, data: _dlData, err })
+          browser.tabs
+            .sendMessage(_dlData.tabId, { msg, data: _dlData, err })
+            .catch((error) => {
+              console.error('回发 downloaded 消息失败', error)
+              void persistDownloadWorkerIncident(
+                _dlData.tabId,
+                'result-message-rejected',
+                {
+                  workId: _dlData.id,
+                  diagnosticId: _dlData.diagnosticId,
+                  browserDownloadId: detail.id,
+                  resultMessage: msg,
+                  error: String(error),
+                }
+              )
+            })
         }
 
         // 吊销前后台生成的 blob URL

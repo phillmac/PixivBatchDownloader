@@ -26,6 +26,7 @@ export interface SendToBackEndData {
   /**作品 id*/
   id: string
   taskBatch: number
+  diagnosticId?: string
   blob?: Blob
   /**blobURL 必定有值 */
   blobURL: string
@@ -44,6 +45,8 @@ export interface DonwloadSuccessData {
   id: string
   tabId: number
   uuid: boolean
+  diagnosticId?: string
+  browserDownloadId?: number
   /** 当该标记为 true 时，后台不会向前台返回这个文件的下载结果（即不会向前台发送消息）  */
   noReply?: boolean
   /** 浏览器实际保存这个文件时使用的文件名，这可能和前台传递的文件名不同 */
