@@ -161,43 +161,100 @@ function assembleAnimatedWebP(frames, loopCount) {
 
 // ─── Worker entry point ───────────────────────────────────────────────────────
 
-/**
- * Expected message:
- * {
- *   rgbaList:  ArrayBuffer[],  // raw RGBA pixel data, one buffer per frame
- *   delays:    number[],       // frame delay in milliseconds (one per frame)
- *   width:     number,
- *   height:    number,
- *   quality:   number,         // 0.0–1.0 WebP lossy quality
- *   loopCount: number,         // 0 = infinite loop
- * }
- */
+var state = null
+
+function postError(stage, index, error) {
+  self.postMessage({
+    type: 'error',
+    stage: stage,
+    index: index,
+    error: {
+      name: error && error.name ? error.name : 'Error',
+      message: error && error.message ? error.message : String(error),
+      stack: error && error.stack ? error.stack : undefined,
+    },
+  })
+}
+
 onmessage = async function (ev) {
-  var d         = ev.data
-  var rgbaList  = d.rgbaList
-  var delays    = d.delays
-  var width     = d.width
-  var height    = d.height
-  var quality   = d.quality
-  var loopCount = d.loopCount
+  var d = ev.data || {}
+  try {
+    if (d.type === 'start') {
+      if (state) throw new Error('PPDWebP worker already has an active job')
+      var canvas = new OffscreenCanvas(d.width, d.height)
+      var ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('PPDWebP worker could not create 2D context')
+      state = {
+        width: d.width,
+        height: d.height,
+        quality: d.quality,
+        loopCount: d.loopCount,
+        frameCount: d.frameCount,
+        canvas: canvas,
+        ctx: ctx,
+        frames: [],
+      }
+      self.postMessage({ type: 'progress', stage: 'started', index: -1 })
+      return
+    }
 
-  var canvas = new OffscreenCanvas(width, height)
-  var ctx    = canvas.getContext('2d')
-  var frames = []
+    if (!state) throw new Error('PPDWebP worker received data before start')
 
-  for (var i = 0; i < rgbaList.length; i++) {
-    // Reconstruct the frame from raw RGBA data and encode as single-frame WebP
-    var imageData = new ImageData(new Uint8ClampedArray(rgbaList[i]), width, height)
-    ctx.putImageData(imageData, 0, 0)
+    if (d.type === 'frame') {
+      self.postMessage({ type: 'progress', stage: 'encode-frame', index: d.index })
+      var imageData = new ImageData(
+        new Uint8ClampedArray(d.rgba),
+        state.width,
+        state.height
+      )
+      state.ctx.putImageData(imageData, 0, 0)
+      imageData = null
+      d.rgba = null
 
-    var blob   = await canvas.convertToBlob({ type: 'image/webp', quality: quality })
-    var buffer = await blob.arrayBuffer()
-    var chunks = extractFrameChunks(buffer)
+      var blob = await state.canvas.convertToBlob({
+        type: 'image/webp',
+        quality: state.quality,
+      })
+      var buffer = await blob.arrayBuffer()
+      var chunks = extractFrameChunks(buffer)
+      state.frames.push({
+        width: state.width,
+        height: state.height,
+        delay: d.delay,
+        chunks: chunks,
+      })
+      self.postMessage({
+        type: 'frame-complete',
+        index: d.index,
+        encodedBytes: buffer.byteLength,
+      })
+      return
+    }
 
-    frames.push({ width: width, height: height, delay: delays[i], chunks: chunks })
+    if (d.type === 'finish') {
+      if (state.frames.length !== state.frameCount) {
+        throw new Error(
+          'PPDWebP worker frame count mismatch: expected ' +
+            state.frameCount +
+            ', got ' +
+            state.frames.length
+        )
+      }
+      self.postMessage({
+        type: 'progress',
+        stage: 'assemble-webp',
+        index: state.frames.length - 1,
+      })
+      var resultBytes = assembleAnimatedWebP(state.frames, state.loopCount)
+      var resultBlob = new Blob([resultBytes.buffer], { type: 'image/webp' })
+      state = null
+      self.postMessage({ type: 'result', blob: resultBlob })
+      return
+    }
+
+    throw new Error('PPDWebP worker received unknown message type: ' + d.type)
+  } catch (error) {
+    postError(d.type || 'unknown', d.index, error)
+    state = null
   }
-
-  var resultBytes = assembleAnimatedWebP(frames, loopCount)
-  var resultBlob  = new Blob([resultBytes.buffer], { type: 'image/webp' })
-  self.postMessage({ blob: resultBlob })
 }
