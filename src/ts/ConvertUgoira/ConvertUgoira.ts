@@ -24,6 +24,10 @@ class ConvertUgoira {
   /** 同时运行的转换任务的上限 */
   private maxCount = 1
 
+  /** WebP 会触碰完整 RGBA 帧数据；单独限制并发以避免多个大任务叠加峰值。 */
+  private webpActive = 0
+  private readonly maxWebPCount = 1
+
   /** 缓存每个作品的 ImageBitmap 列表，key 为作品 id */
   private readonly imageBitmapCache = new Map<number, ImageBitmap[]>()
 
@@ -123,8 +127,15 @@ class ConvertUgoira {
         return '' as any
       }
 
-      if (this._count < this.maxCount) {
+      const webpSlotAvailable =
+        type !== 'webp' || this.webpActive < this.maxWebPCount
+
+      if (this._count < this.maxCount && webpSlotAvailable) {
         this.count = this._count + 1
+        const webpSlotHeld = type === 'webp'
+        if (webpSlotHeld) {
+          this.webpActive++
+        }
 
         // 把这个 id 添加到转换中的 id 列表里，并取消清理它的缓存的定时器
         this.convertingIds.add(id)
@@ -168,6 +179,10 @@ class ConvertUgoira {
             throw diagnostic.failure(error)
           }
           throw error
+        } finally {
+          if (webpSlotHeld) {
+            this.webpActive = Math.max(0, this.webpActive - 1)
+          }
         }
       }
     }
