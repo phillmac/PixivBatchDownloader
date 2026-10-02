@@ -28,7 +28,7 @@ class ConvertUgoira {
   private webpActive = 0
   private readonly maxWebPCount = 1
 
-  /** GIF/APNG 都会长期持有完整帧像素或编码工作集；共享一个重型转换槽避免峰值叠加。 */
+  /** WebP/GIF/APNG 都会让完整解码帧集与额外编码工作集同时驻留；共享重型槽避免跨作品峰值叠加。 */
   private heavyActive = 0
   private readonly maxHeavyCount = 1
 
@@ -133,7 +133,7 @@ class ConvertUgoira {
 
       const webpSlotAvailable =
         type !== 'webp' || this.webpActive < this.maxWebPCount
-      const heavy = type === 'gif' || type === 'png'
+      const heavy = type === 'webp' || type === 'gif' || type === 'png'
       const heavySlotAvailable = !heavy || this.heavyActive < this.maxHeavyCount
 
       if (
@@ -254,7 +254,7 @@ class ConvertUgoira {
     })
 
     // 另一个已知问题：
-    // 如果图片高度是奇数，那么视频在播放时可能会在边缘出现一条绿线（视播放器和解码器的情况而定，也可能不会出现绿线）。这是 VP9 编码器的处理方式导致的（对奇数尺寸向下取整），不是下载器的问题，目前我也不打算处理。
+    // 如果图片高度是奇数，那么视频在播放时可能会在边缘出现一条绿线（视播放器和解码器而定，也可能不会出现绿线）。这是 VP9 编码器的处理方式导致的（对奇数尺寸向下取整），不是下载器的问题，目前我也不打算处理。
     // 例如 https://www.pixiv.net/artworks/144266793 的图片高度为 281 px，就会有这个问题。
     // 原因：
     // 如果图片的宽度或高度是奇数（尤其是高度），VP9/WebM 编码时容易在边缘（通常是底部）出现一条绿线。

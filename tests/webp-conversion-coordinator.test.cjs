@@ -171,6 +171,26 @@ test('failed WebP conversion releases the dedicated WebP slot', async () => {
 })
 
 
+test('WebP and GIF share the same heavy conversion slot', async () => {
+  const h = harness()
+  const first = h.coordinator.webp(new Blob(['a']), info, 31)
+  const second = h.coordinator.gif(new Blob(['b']), info, 32)
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.calls.length, 1)
+  assert.equal(h.gifCalls.length, 0)
+  assert.equal(h.coordinator.heavyActive, 1)
+
+  h.calls[0].resolve(new Blob(['webp']))
+  await first
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.gifCalls.length, 1)
+
+  h.gifCalls[0].resolve(new Blob(['gif']))
+  await second
+  assert.equal(h.coordinator.heavyActive, 0)
+})
+
 test('GIF and APNG share one heavy conversion slot', async () => {
   const h = harness()
   const first = h.coordinator.gif(new Blob(['a']), info, 11)
