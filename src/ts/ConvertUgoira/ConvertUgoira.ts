@@ -28,6 +28,10 @@ class ConvertUgoira {
   private webpActive = 0
   private readonly maxWebPCount = 1
 
+  /** GIF/APNG 都会长期持有完整帧像素或编码工作集；共享一个重型转换槽避免峰值叠加。 */
+  private heavyActive = 0
+  private readonly maxHeavyCount = 1
+
   /** 缓存每个作品的 ImageBitmap 列表，key 为作品 id */
   private readonly imageBitmapCache = new Map<number, ImageBitmap[]>()
 
@@ -129,12 +133,22 @@ class ConvertUgoira {
 
       const webpSlotAvailable =
         type !== 'webp' || this.webpActive < this.maxWebPCount
+      const heavy = type === 'gif' || type === 'png'
+      const heavySlotAvailable = !heavy || this.heavyActive < this.maxHeavyCount
 
-      if (this._count < this.maxCount && webpSlotAvailable) {
+      if (
+        this._count < this.maxCount &&
+        webpSlotAvailable &&
+        heavySlotAvailable
+      ) {
         this.count = this._count + 1
         const webpSlotHeld = type === 'webp'
         if (webpSlotHeld) {
           this.webpActive++
+        }
+        const heavySlotHeld = heavy
+        if (heavySlotHeld) {
+          this.heavyActive++
         }
 
         // 把这个 id 添加到转换中的 id 列表里，并取消清理它的缓存的定时器
@@ -161,17 +175,50 @@ class ConvertUgoira {
             this.imageBitmapCache.delete(id)
           }
 
+          const format = type === 'png' ? 'apng' : type
+          const firstFrame = imageBitmapList[0]
+          const startedAt = performance.now()
+          console.info('[PPD ugoira conversion stage]', {
+            phase: 'start',
+            artworkId: id,
+            format,
+            frameCount: imageBitmapList.length,
+            width: firstFrame?.width ?? 0,
+            height: firstFrame?.height ?? 0,
+            inputRGBABytes: firstFrame
+              ? firstFrame.width * firstFrame.height * 4 * imageBitmapList.length
+              : 0,
+            activeConversions: this._count,
+            webpActive: this.webpActive,
+            heavyActive: this.heavyActive,
+          })
+
           // 为了在这里统一捕获所有格式在转换时的错误，必须使用 await 等待转换过程
+          let result: Blob
           if (type === 'gif') {
-            return await toGIF.convert(imageBitmapList, info, file.size)
+            result = await toGIF.convert(imageBitmapList, info, file.size)
           } else if (type === 'png') {
-            return await toAPNG.convert(imageBitmapList, info, diagnostic!)
+            result = await toAPNG.convert(imageBitmapList, info, diagnostic!)
           } else if (type === 'webp') {
-            return await toWebP.convert(imageBitmapList, info)
+            result = await toWebP.convert(imageBitmapList, info)
           } else {
-            return await toWebM.convert(imageBitmapList, info)
+            result = await toWebM.convert(imageBitmapList, info)
           }
+          console.info('[PPD ugoira conversion stage]', {
+            phase: 'success',
+            artworkId: id,
+            format,
+            durationMs: Math.round(performance.now() - startedAt),
+            outputBytes: result.size,
+          })
+          return result
         } catch (error) {
+          console.error('[PPD ugoira conversion stage]', {
+            phase: 'failure',
+            artworkId: id,
+            format: type === 'png' ? 'apng' : type,
+            error,
+          })
           // 转换出错时把计数 -1，否则这个错误会一直占据一个转换配额，并且在下载完成后重试出错的文件时，这个计数也依然会被占用
           this.count = this._count - 1
           if (diagnostic) {
@@ -182,6 +229,9 @@ class ConvertUgoira {
         } finally {
           if (webpSlotHeld) {
             this.webpActive = Math.max(0, this.webpActive - 1)
+          }
+          if (heavySlotHeld) {
+            this.heavyActive = Math.max(0, this.heavyActive - 1)
           }
         }
       }

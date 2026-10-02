@@ -20,6 +20,8 @@ function deferred() {
 function harness() {
   const events = new EventTarget()
   const calls = []
+  const gifCalls = []
+  const apngCalls = []
   const browser = { runtime: { getManifest: () => ({ version: 'test' }) } }
   const settings = {
     convertUgoiraThread: 3,
@@ -47,6 +49,26 @@ function harness() {
       })
     },
   }
+  const toGIF = {
+    convert() {
+      const job = deferred()
+      gifCalls.push(job)
+      return job.promise.then((value) => {
+        EVT.fire('convertSuccess')
+        return value
+      })
+    },
+  }
+  const toAPNG = {
+    convert() {
+      const job = deferred()
+      apngCalls.push(job)
+      return job.promise.then((value) => {
+        EVT.fire('convertSuccess')
+        return value
+      })
+    },
+  }
   const mocks = {
     'webextension-polyfill': { default: browser },
     '../EVT': { EVT },
@@ -62,14 +84,25 @@ function harness() {
       Utils: { sleep: () => new Promise((resolve) => setTimeout(resolve, 1)) },
     },
     './ToWebP': { toWebP },
-    './ToGIF': { toGIF: { convert: async () => new Blob() } },
-    './ToAPNG': { toAPNG: { convert: async () => new Blob() } },
+    './ToGIF': { toGIF },
+    './ToAPNG': { toAPNG },
     './ToWebMUseWhammy': { toWebM: { convert: async () => new Blob() } },
-    './APNGDiagnostics': { APNGDiagnostics: class {} },
+    './APNGDiagnostics': {
+      APNGDiagnostics: class {
+        constructor() {
+          this.details = {}
+        }
+        enter() {}
+        failure(error) {
+          return error
+        }
+      },
+    },
   }
   const context = vm.createContext({
     Blob,
     console,
+    performance: { now: () => Date.now() },
     window: {
       addEventListener: events.addEventListener.bind(events),
       clearTimeout() {},
@@ -93,7 +126,7 @@ function harness() {
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })(moduleRequire, exports)
-  return { coordinator: exports.convertUgoira, calls }
+  return { coordinator: exports.convertUgoira, calls, gifCalls, apngCalls }
 }
 
 const info = {
@@ -135,4 +168,44 @@ test('failed WebP conversion releases the dedicated WebP slot', async () => {
   h.calls[1].resolve(new Blob(['second']))
   await second
   assert.equal(h.coordinator.webpActive, 0)
+})
+
+
+test('GIF and APNG share one heavy conversion slot', async () => {
+  const h = harness()
+  const first = h.coordinator.gif(new Blob(['a']), info, 11)
+  const second = h.coordinator.apng(new Blob(['b']), info, 12)
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.gifCalls.length, 1)
+  assert.equal(h.apngCalls.length, 0)
+  assert.equal(h.coordinator.heavyActive, 1)
+
+  h.gifCalls[0].resolve(new Blob(['gif']))
+  await first
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.apngCalls.length, 1)
+
+  h.apngCalls[0].resolve(new Blob(['apng']))
+  await second
+  assert.equal(h.coordinator.heavyActive, 0)
+})
+
+test('failed heavy conversion releases the shared GIF/APNG slot', async () => {
+  const h = harness()
+  const first = h.coordinator.gif(new Blob(['a']), info, 21)
+  const second = h.coordinator.apng(new Blob(['b']), info, 22)
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.gifCalls.length, 1)
+  assert.equal(h.apngCalls.length, 0)
+
+  h.gifCalls[0].reject(new Error('gif failed'))
+  await assert.rejects(first, /gif failed/)
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.apngCalls.length, 1)
+
+  h.apngCalls[0].resolve(new Blob(['apng']))
+  await second
+  assert.equal(h.coordinator.heavyActive, 0)
 })
