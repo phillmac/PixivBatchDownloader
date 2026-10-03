@@ -63,75 +63,88 @@ class ToAPNG {
     info: UgoiraInfo,
     diagnostic: APNGDiagnostics
   ): Promise<Blob> {
-    diagnostic.enter('load-worker')
-    if (!this.workerReady) {
-      this.workerReady = this.loadWorker()
-    }
+    let releasedBitmaps = 0
     try {
-      await this.workerReady
-    } finally {
-      diagnostic.details.workerResources = this.workerResources.slice()
-      diagnostic.details.workerCreatedAt = this.workerCreatedAt
-      diagnostic.details.previousWorkerError = this.workerError
-    }
-
-    diagnostic.enter('read-frame-pixels')
-    diagnostic.details.bitmapCount = imageBitmapList.length
-    if (imageBitmapList.length === 0) {
-      throw new Error('No decoded frames available for APNG conversion')
-    }
-    const width = imageBitmapList[0].width
-    const height = imageBitmapList[0].height
-    diagnostic.details.width = width
-    diagnostic.details.height = height
-    // 仅为输入像素体积，不是 UPNG 的峰值内存；编码时还需要额外缓冲区。
-    diagnostic.details.inputRGBABytes =
-      width * height * 4 * imageBitmapList.length
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) {
-      throw new Error('Could not create a 2D canvas context for APNG')
-    }
-
-    const arrayBuffList: ArrayBuffer[] = []
-    imageBitmapList.forEach((imageBitmap, index) => {
-      diagnostic.details.frame = {
-        index,
-        file: info.frames[index]?.file,
-        width: imageBitmap.width,
-        height: imageBitmap.height,
+      diagnostic.enter('load-worker')
+      if (!this.workerReady) {
+        this.workerReady = this.loadWorker()
       }
-      diagnostic.details.frameOperation = 'drawImage'
-      ctx.drawImage(imageBitmap, 0, 0)
-      diagnostic.details.frameOperation = 'getImageData'
-      arrayBuffList.push(
-        ctx.getImageData(0, 0, width, height).data.buffer as ArrayBuffer
-      )
-      diagnostic.details.framesRead = index + 1
-    })
-    const delayList = info.frames.map((frame) => frame.delay)
-    diagnostic.details.delaySummary = delayList.reduce(
-      (summary, delay) => ({
-        minMs: Math.min(summary.minMs, delay),
-        maxMs: Math.max(summary.maxMs, delay),
-        totalMs: summary.totalMs + delay,
-      }),
-      { minMs: delayList[0] ?? 0, maxMs: 0, totalMs: 0 }
-    )
+      try {
+        await this.workerReady
+      } finally {
+        diagnostic.details.workerResources = this.workerResources.slice()
+        diagnostic.details.workerCreatedAt = this.workerCreatedAt
+        diagnostic.details.previousWorkerError = this.workerError
+      }
 
-    const pngFile = await this.encodeInWorker(
-      arrayBuffList,
-      width,
-      height,
-      delayList,
-      diagnostic
-    )
-    diagnostic.enter('create-apng-blob')
-    const blob = new Blob([pngFile], { type: 'image/vnd.mozilla.apng' })
-    EVT.fire('convertSuccess')
-    return blob
+      diagnostic.enter('read-frame-pixels')
+      diagnostic.details.bitmapCount = imageBitmapList.length
+      if (imageBitmapList.length === 0) {
+        throw new Error('No decoded frames available for APNG conversion')
+      }
+      const width = imageBitmapList[0].width
+      const height = imageBitmapList[0].height
+      diagnostic.details.width = width
+      diagnostic.details.height = height
+      // 仅为输入像素体积，不是 UPNG 的峰值内存；编码时还需要额外缓冲区。
+      diagnostic.details.inputRGBABytes =
+        width * height * 4 * imageBitmapList.length
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+      if (!ctx) {
+        throw new Error('Could not create a 2D canvas context for APNG')
+      }
+
+      const arrayBuffList: ArrayBuffer[] = []
+      imageBitmapList.forEach((imageBitmap, index) => {
+        diagnostic.details.frame = {
+          index,
+          file: info.frames[index]?.file,
+          width: imageBitmap.width,
+          height: imageBitmap.height,
+        }
+        diagnostic.details.frameOperation = 'drawImage'
+        ctx.drawImage(imageBitmap, 0, 0)
+        diagnostic.details.frameOperation = 'getImageData'
+        arrayBuffList.push(
+          ctx.getImageData(0, 0, width, height).data.buffer as ArrayBuffer
+        )
+        diagnostic.details.framesRead = index + 1
+        // The RGBA buffer now owns this frame's pixels; release the decoded
+        // bitmap immediately instead of retaining both full frame sets.
+        imageBitmap.close()
+        releasedBitmaps = index + 1
+      })
+      const delayList = info.frames.map((frame) => frame.delay)
+      diagnostic.details.delaySummary = delayList.reduce(
+        (summary, delay) => ({
+          minMs: Math.min(summary.minMs, delay),
+          maxMs: Math.max(summary.maxMs, delay),
+          totalMs: summary.totalMs + delay,
+        }),
+        { minMs: delayList[0] ?? 0, maxMs: 0, totalMs: 0 }
+      )
+
+      const pngFile = await this.encodeInWorker(
+        arrayBuffList,
+        width,
+        height,
+        delayList,
+        diagnostic
+      )
+      diagnostic.enter('create-apng-blob')
+      const blob = new Blob([pngFile], { type: 'image/vnd.mozilla.apng' })
+      EVT.fire('convertSuccess')
+      return blob
+    } finally {
+      // The converter owns the decoded list from entry, including worker/canvas
+      // setup failures that happen before the frame-copy loop begins.
+      for (let i = releasedBitmaps; i < imageBitmapList.length; i++) {
+        imageBitmapList[i].close()
+      }
+    }
   }
 
   /** 记录 worker 排队、编码、消息传输及超时，并在所有退出路径移除监听器 */

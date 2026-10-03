@@ -10,7 +10,7 @@ const info = {
   mime_type: 'image/jpeg',
   frames: [{ file: '000000.jpg', delay: 80 }],
 }
-const bitmaps = [{ width: 2, height: 3 }]
+const bitmaps = [{ width: 2, height: 3, close() {} }]
 
 // Load the real TypeScript modules with browser boundaries replaced for fault injection.
 function harness() {
@@ -171,6 +171,66 @@ function harness() {
   }
   return h
 }
+
+test('APNG releases each decoded bitmap after copying its pixels', async () => {
+  const h = harness()
+  let closed = 0
+  const owned = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  const localInfo = {
+    mime_type: 'image/jpeg',
+    frames: [
+      { file: '000000.jpg', delay: 80 },
+      { file: '000001.jpg', delay: 80 },
+    ],
+  }
+  const result = h.converter.convert(owned, localInfo, h.diagnostic())
+  const worker = await h.waitForPost()
+  assert.equal(closed, 2)
+  worker.emit('message', {
+    data: { id: worker.messages[0].id, result: new ArrayBuffer(8) },
+  })
+  assert.equal((await result).size, 8)
+})
+
+test('APNG releases decoded bitmaps when worker setup fails', async () => {
+  const h = harness()
+  h.resourceStatus = 404
+  let closed = 0
+  const owned = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  const localInfo = {
+    mime_type: 'image/jpeg',
+    frames: [
+      { file: '000000.jpg', delay: 80 },
+      { file: '000001.jpg', delay: 80 },
+    ],
+  }
+  await assert.rejects(
+    h.converter.convert(owned, localInfo, h.diagnostic()),
+    /HTTP 404/
+  )
+  assert.equal(closed, 2)
+})
+
+test('APNG releases untouched bitmaps when pixel extraction fails', async () => {
+  const h = harness()
+  let closed = 0
+  const owned = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  h.canvasError = new Error('pixel read failed')
+  await assert.rejects(
+    h.converter.convert(owned, { ...info, frames: [info.frames[0], info.frames[0]] }, h.diagnostic()),
+    /pixel read failed/
+  )
+  assert.equal(closed, 2)
+})
 
 test('worker exception preserves name, stack and request context; next attempt can succeed', async () => {
   const h = harness()

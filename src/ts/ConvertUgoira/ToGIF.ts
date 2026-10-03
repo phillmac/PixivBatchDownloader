@@ -27,43 +27,60 @@ class ToGIF {
     info: UgoiraInfo,
     fileSize: number
   ): Promise<Blob> {
-    return new Promise(async (resolve, reject) => {
-      // 配置 gif.js
-      let gif: any = new GIF({
-        workers: 4,
-        quality: this.setQuality(fileSize),
-        workerScript: this.gifWorkerUrl,
+    let releasedBitmaps = 0
+    try {
+      return await new Promise<Blob>((resolve, reject) => {
+        try {
+          // 配置 gif.js
+          const gif: any = new GIF({
+            workers: 4,
+            quality: this.setQuality(fileSize),
+            workerScript: this.gifWorkerUrl,
+          })
+
+          // console.time('gif')
+          // 绑定渲染完成事件
+          gif.on('finished', (file: Blob) => {
+            // console.timeEnd('gif')
+            EVT.fire('convertSuccess')
+            resolve(file)
+          })
+
+          const width = ImageBitmapList[0].width
+          const height = ImageBitmapList[0].height
+          const canvas = document.createElement('canvas')
+          const ctx = canvas.getContext('2d', {
+            willReadFrequently: true,
+          })!
+          canvas.width = width
+          canvas.height = height
+
+          // 添加帧数据
+          ImageBitmapList.forEach((imageBitmap, index) => {
+            ctx.drawImage(imageBitmap, 0, 0)
+            const ImageData = ctx.getImageData(0, 0, width, height)
+            gif.addFrame(ImageData, {
+              delay: info.frames![index].delay,
+            })
+            // gif.js keeps the copied ImageData until render completes, so the
+            // decoded bitmap is no longer needed once this frame has been copied.
+            imageBitmap.close()
+            releasedBitmaps = index + 1
+          })
+
+          // 渲染 gif
+          gif.render()
+        } catch (error) {
+          reject(error)
+        }
       })
-
-      // console.time('gif')
-      // 绑定渲染完成事件
-      gif.on('finished', (file: Blob) => {
-        // console.timeEnd('gif')
-        EVT.fire('convertSuccess')
-        resolve(file)
-      })
-
-      const width = ImageBitmapList[0].width
-      const height = ImageBitmapList[0].height
-      const canvas = document.createElement('canvas')
-      const ctx = canvas.getContext('2d', {
-        willReadFrequently: true,
-      })!
-      canvas.width = width
-      canvas.height = height
-
-      // 添加帧数据
-      ImageBitmapList.forEach((imageBitmap, index) => {
-        ctx.drawImage(imageBitmap, 0, 0)
-        const ImageData = ctx.getImageData(0, 0, width, height)
-        gif.addFrame(ImageData, {
-          delay: info.frames![index].delay,
-        })
-      })
-
-      // 渲染 gif
-      gif.render()
-    })
+    } finally {
+      // Ownership starts when convert() is entered, so setup failures before
+      // pixel extraction must also release every decoded frame.
+      for (let i = releasedBitmaps; i < ImageBitmapList.length; i++) {
+        ImageBitmapList[i].close()
+      }
+    }
   }
 
   private readonly MiB = 1024 * 1024

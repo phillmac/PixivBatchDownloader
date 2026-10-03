@@ -1,6 +1,7 @@
 import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
 import { UgoiraInfo } from '../crawl/CrawlResult'
+import { Tools } from '../Tools'
 
 declare const Whammy: any
 // https://github.com/antimatter15/whammy
@@ -33,6 +34,145 @@ class ToWebM {
     URL.revokeObjectURL(url)
     this.worker.onerror = (ev) => {
       console.error('Whammy worker error:', ev)
+    }
+  }
+
+  /**
+   * Terminate a failed worker and prepare a fresh instance for the next job.
+   * The identity guard prevents an old timeout from replacing a newer worker.
+   */
+  private resetWorker(failedWorker: Worker): void {
+    if (this.worker !== failedWorker) return
+    failedWorker.terminate()
+    this.workerReady = this.loadWorkerJS()
+  }
+
+  /**
+   * Stream a ZIP-backed Ugoira to the WebM worker one decoded bitmap at a time.
+   * Each bitmap is transferred to the worker and acknowledged before the next
+   * frame is decoded, so ownership never spans a complete decoded frame set.
+   * Rejects inconsistent frame metadata rather than inventing frame timing.
+   */
+  public async convertFromZip(
+    file: Blob,
+    info: UgoiraInfo,
+    onStart?: (details: {
+      frameCount: number
+      width: number
+      height: number
+      inputRGBABytes: number
+    }) => void
+  ): Promise<Blob> {
+    if (
+      typeof Worker === 'undefined' ||
+      typeof OffscreenCanvas === 'undefined'
+    ) {
+      const zipFileBuffer = await file.arrayBuffer()
+      const indexList = Tools.getJPGContentIndex(zipFileBuffer)
+      const imageBitmapList = await Tools.extractImage(
+        zipFileBuffer,
+        indexList,
+        'ImageBitmap'
+      )
+      return this.convert(imageBitmapList, info)
+    }
+
+    await this.workerReady
+    const worker = this.worker
+    const zipFileBuffer = await file.arrayBuffer()
+    const indexList = Tools.getJPGContentIndex(zipFileBuffer)
+    if (indexList.length === 0) {
+      throw new Error('No Ugoira frames found for WebM conversion')
+    }
+    if (info.frames.length !== indexList.length) {
+      throw new Error(
+        `WebM frame metadata count mismatch: ZIP has ${indexList.length} frames, metadata has ${info.frames.length}`
+      )
+    }
+    const frameDelays = info.frames.map((frame, index) => {
+      if (!Number.isFinite(frame.delay)) {
+        throw new Error(`Invalid WebM frame delay at index ${index}`)
+      }
+      return frame.delay
+    })
+
+    const id = Date.now() + Math.random()
+    let firstBitmap: ImageBitmap | null = await createImageBitmap(
+      Tools.extractImageFrameBlob(zipFileBuffer, indexList, 0)
+    )
+    const width = firstBitmap.width
+    const height = firstBitmap.height
+    let workerJobStarted = false
+
+    onStart?.({
+      frameCount: indexList.length,
+      width,
+      height,
+      inputRGBABytes: width * height * 4 * indexList.length,
+    })
+
+    try {
+      await this.postAndWait(
+        worker,
+        id,
+        {
+          type: 'start',
+          frameCount: indexList.length,
+          width,
+          height,
+          quality: 0.9,
+        },
+        [],
+        'ready'
+      )
+      workerJobStarted = true
+
+      for (let index = 0; index < indexList.length; index++) {
+        const bitmap =
+          index === 0
+            ? firstBitmap!
+            : await createImageBitmap(
+                Tools.extractImageFrameBlob(zipFileBuffer, indexList, index)
+              )
+        if (index === 0) {
+          firstBitmap = null
+        }
+        await this.postAndWait(
+          worker,
+          id,
+          {
+            type: 'frame',
+            index,
+            bitmap,
+            delay: frameDelays[index],
+          },
+          [bitmap],
+          'frame-complete'
+        )
+      }
+
+      const response = await this.postAndWait(
+        worker,
+        id,
+        { type: 'finish' },
+        [],
+        'result'
+      )
+      workerJobStarted = false
+      if (!response.result || typeof response.result.size !== 'number') {
+        throw new Error('Invalid Whammy worker response')
+      }
+      EVT.fire('convertSuccess')
+      return response.result
+    } catch (error) {
+      if (workerJobStarted && this.worker === worker) {
+        try {
+          worker.postMessage({ id, type: 'cancel' })
+        } catch {}
+      }
+      throw error
+    } finally {
+      firstBitmap?.close()
     }
   }
 
@@ -79,6 +219,53 @@ class ToWebM {
       encoder.compile(false, (video: Blob) => {
         resolve(video)
       })
+    })
+  }
+
+  /**
+   * Send one streaming-protocol message and wait for its acknowledgement.
+   * The worker is captured per request so an inactivity timeout can terminate
+   * that exact instance before the shared heavy-conversion slot is released.
+   */
+  private postAndWait(
+    worker: Worker,
+    id: number,
+    message: Record<string, unknown>,
+    transfer: Transferable[],
+    expectedType: 'ready' | 'frame-complete' | 'result'
+  ): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        cleanup()
+        this.resetWorker(worker)
+        reject(
+          new Error(
+            `Whammy worker inactivity timeout waiting for ${expectedType}`
+          )
+        )
+      }, 120000)
+      const cleanup = () => {
+        window.clearTimeout(timeoutId)
+        worker.removeEventListener('message', handler)
+      }
+      const handler = (ev: MessageEvent) => {
+        if (!ev.data || ev.data.id !== id) return
+        if (ev.data.type === 'error') {
+          cleanup()
+          reject(new Error(ev.data.error || 'Whammy worker error'))
+          return
+        }
+        if (ev.data.type !== expectedType) return
+        cleanup()
+        resolve(ev.data)
+      }
+      worker.addEventListener('message', handler)
+      try {
+        worker.postMessage({ id, ...message }, transfer)
+      } catch (error) {
+        cleanup()
+        reject(error)
+      }
     })
   }
 

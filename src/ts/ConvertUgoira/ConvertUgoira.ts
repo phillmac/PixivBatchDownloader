@@ -24,14 +24,18 @@ class ConvertUgoira {
   /** 同时运行的转换任务的上限 */
   private maxCount = 1
 
+  /** WebP 会触碰完整 RGBA 帧数据；单独限制并发以避免多个大任务叠加峰值。 */
+  private webpActive = 0
+  /** WebP-specific admission cap retained as an explicit safety invariant. */
+  private readonly maxWebPCount = 1
+
+  /** WebM/WebP/GIF/APNG 都会让大型解码/编码帧集驻留；共享重型槽避免跨格式、跨作品峰值叠加。 */
+  private heavyActive = 0
+  /** Maximum number of full-frame Ugoira conversions admitted at once. */
+  private readonly maxHeavyCount = 1
+
   /** 缓存每个作品的 ImageBitmap 列表，key 为作品 id */
   private readonly imageBitmapCache = new Map<number, ImageBitmap[]>()
-
-  /** 当前正在转换中的作品 id 集合 */
-  private readonly convertingIds = new Set<number>()
-
-  /** 保存清理缓存的定时器，key 为作品 id */
-  private readonly clearCacheTimers = new Map<number, number>()
 
   private bindEvents() {
     window.addEventListener(EVT.list.settingChange, (ev: CustomEventInit) => {
@@ -123,44 +127,121 @@ class ConvertUgoira {
         return '' as any
       }
 
-      if (this._count < this.maxCount) {
-        this.count = this._count + 1
+      const webpSlotAvailable =
+        type !== 'webp' || this.webpActive < this.maxWebPCount
+      const heavy =
+        type === 'webm' || type === 'webp' || type === 'gif' || type === 'png'
+      const heavySlotAvailable = !heavy || this.heavyActive < this.maxHeavyCount
 
-        // 把这个 id 添加到转换中的 id 列表里，并取消清理它的缓存的定时器
-        this.convertingIds.add(id)
-        window.clearTimeout(this.clearCacheTimers.get(id))
+      if (
+        this._count < this.maxCount &&
+        webpSlotAvailable &&
+        heavySlotAvailable
+      ) {
+        this.count = this._count + 1
+        const webpSlotHeld = type === 'webp'
+        if (webpSlotHeld) {
+          this.webpActive++
+        }
+        const heavySlotHeld = heavy
+        if (heavySlotHeld) {
+          this.heavyActive++
+        }
+
 
         try {
           if (diagnostic) {
             diagnostic.details.activeConversions = this._count
             diagnostic.details.cachedWorks = this.imageBitmapCache.size
           }
+
+          const format = type === 'png' ? 'apng' : type
+          const startedAt = performance.now()
+
+          // Worker-capable WebM decodes one ZIP frame at a time and waits for
+          // acknowledgement before decoding the next. Do not materialize a full
+          // ImageBitmap[] in the page renderer for this path.
+          if (
+            type === 'webm' &&
+            typeof Worker !== 'undefined' &&
+            typeof OffscreenCanvas !== 'undefined'
+          ) {
+            const result = await toWebM.convertFromZip(file, info, (details) => {
+              console.info('[PPD ugoira conversion stage]', {
+                phase: 'start',
+                artworkId: id,
+                format,
+                ...details,
+                activeConversions: this._count,
+                webpActive: this.webpActive,
+                heavyActive: this.heavyActive,
+              })
+            })
+            console.info('[PPD ugoira conversion stage]', {
+              phase: 'success',
+              artworkId: id,
+              format,
+              durationMs: Math.round(performance.now() - startedAt),
+              outputBytes: result.size,
+            })
+            return result
+          }
+
           const imageBitmapList = await this.getImageBitmapList(
             file,
             id,
             diagnostic
           )
 
-          // WebM worker 会转移 ImageBitmap 的所有权，不能缓存失效对象。
-          if (
-            type === 'webm' &&
-            typeof Worker !== 'undefined' &&
-            typeof OffscreenCanvas !== 'undefined'
-          ) {
+          // GIF/APNG 会把每帧复制成完整 RGBA 数据。让这些格式取得 bitmap
+          // 的所有权并逐帧 close，避免完整 decoded bitmap 集和完整 RGBA 集
+          // 同时驻留。后续格式需要时重新从 ZIP 解码。
+          if (type === 'gif' || type === 'png') {
             this.imageBitmapCache.delete(id)
           }
 
+          const firstFrame = imageBitmapList[0]
+          console.info('[PPD ugoira conversion stage]', {
+            phase: 'start',
+            artworkId: id,
+            format,
+            frameCount: imageBitmapList.length,
+            width: firstFrame?.width ?? 0,
+            height: firstFrame?.height ?? 0,
+            inputRGBABytes: firstFrame
+              ? firstFrame.width * firstFrame.height * 4 * imageBitmapList.length
+              : 0,
+            activeConversions: this._count,
+            webpActive: this.webpActive,
+            heavyActive: this.heavyActive,
+          })
+
           // 为了在这里统一捕获所有格式在转换时的错误，必须使用 await 等待转换过程
+          let result: Blob
           if (type === 'gif') {
-            return await toGIF.convert(imageBitmapList, info, file.size)
+            result = await toGIF.convert(imageBitmapList, info, file.size)
           } else if (type === 'png') {
-            return await toAPNG.convert(imageBitmapList, info, diagnostic!)
+            result = await toAPNG.convert(imageBitmapList, info, diagnostic!)
           } else if (type === 'webp') {
-            return await toWebP.convert(imageBitmapList, info)
+            result = await toWebP.convert(imageBitmapList, info)
           } else {
-            return await toWebM.convert(imageBitmapList, info)
+            result = await toWebM.convert(imageBitmapList, info)
           }
+          console.info('[PPD ugoira conversion stage]', {
+            phase: 'success',
+            artworkId: id,
+            format,
+            durationMs: Math.round(performance.now() - startedAt),
+            outputBytes: result.size,
+          })
+          return result
         } catch (error) {
+          console.error('[PPD ugoira conversion stage]', {
+            phase: 'failure',
+            artworkId: id,
+            format: type === 'png' ? 'apng' : type,
+            error,
+          })
           // 转换出错时把计数 -1，否则这个错误会一直占据一个转换配额，并且在下载完成后重试出错的文件时，这个计数也依然会被占用
           this.count = this._count - 1
           if (diagnostic) {
@@ -168,6 +249,13 @@ class ConvertUgoira {
             throw diagnostic.failure(error)
           }
           throw error
+        } finally {
+          if (webpSlotHeld) {
+            this.webpActive = Math.max(0, this.webpActive - 1)
+          }
+          if (heavySlotHeld) {
+            this.heavyActive = Math.max(0, this.heavyActive - 1)
+          }
         }
       }
     }
@@ -189,7 +277,7 @@ class ConvertUgoira {
     })
 
     // 另一个已知问题：
-    // 如果图片高度是奇数，那么视频在播放时可能会在边缘出现一条绿线（视播放器和解码器的情况而定，也可能不会出现绿线）。这是 VP9 编码器的处理方式导致的（对奇数尺寸向下取整），不是下载器的问题，目前我也不打算处理。
+    // 如果图片高度是奇数，那么视频在播放时可能会在边缘出现一条绿线（视播放器和解码器而定，也可能不会出现绿线）。这是 VP9 编码器的处理方式导致的（对奇数尺寸向下取整），不是下载器的问题，目前我也不打算处理。
     // 例如 https://www.pixiv.net/artworks/144266793 的图片高度为 281 px，就会有这个问题。
     // 原因：
     // 如果图片的宽度或高度是奇数（尤其是高度），VP9/WebM 编码时容易在边缘（通常是底部）出现一条绿线。
@@ -234,27 +322,13 @@ class ConvertUgoira {
     }
   }
 
-  /** 从转换中列表移除 id，并在一定时间后清理不再使用的 ImageBitmap 缓存 */
+  /** 立即释放这个作品的解码帧。后续格式需要时重新从 ZIP 解码。 */
   private clearCache(id: number) {
-    this.convertingIds.delete(id)
-
-    // 延迟一定时间，检查不再使用的 id，并清除其缓存。
-    // 因为一个 id 可能需要执行多次转换格式的操作，所以在一次转换任务完成后，可能接下来还要使用缓存。因此不能立刻清除缓存，而是需要等一段时间，等可能的后续转换任务也完成了之后再清除缓存。
-    window.clearTimeout(this.clearCacheTimers.get(id))
-    this.clearCacheTimers.set(
-      id,
-      window.setTimeout(() => {
-        if (!this.convertingIds.has(id)) {
-          // console.log(`clear ${id}`)
-          const bitmaps = this.imageBitmapCache.get(id)
-          if (bitmaps) {
-            bitmaps.forEach((bitmap) => bitmap.close())
-          }
-          this.imageBitmapCache.delete(id)
-          this.clearCacheTimers.delete(id)
-        }
-      }, 10000)
-    )
+    const bitmaps = this.imageBitmapCache.get(id)
+    if (bitmaps) {
+      bitmaps.forEach((bitmap) => bitmap.close())
+    }
+    this.imageBitmapCache.delete(id)
   }
 }
 
