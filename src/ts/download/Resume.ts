@@ -31,10 +31,12 @@ interface TaskStates {
 class Resume {
   constructor() {
     this.IDB = new IndexedDB()
-    this.init()
+    this.ready = this.init()
   }
 
   private IDB: IndexedDB
+  /** 初始化断点续传数据库和事件绑定的 Promise。 */
+  private readonly ready: Promise<void>
   private readonly DBName = 'PBD'
   private readonly DBVer = 3
   private metaName = 'taskMeta' // 下载任务元数据的表名
@@ -71,6 +73,37 @@ class Resume {
 
     this.regularPutStates()
     this.clearExired()
+  }
+
+  /** 返回当前 URL 对应的持久化未完成任务摘要。 */
+  public async getSavedTaskStatus(url = this.getURL()) {
+    await this.ready
+    const meta = (await this.IDB.get(
+      this.metaName,
+      url,
+      'url'
+    )) as TaskMeta | null
+    if (!meta) {
+      return null
+    }
+    const taskStates = (await this.IDB.get(
+      this.statesName,
+      meta.id
+    )) as TaskStates | null
+    const values = taskStates?.states ?? []
+    return {
+      id: meta.id,
+      url: meta.url,
+      URLWhenCrawlStart: meta.URLWhenCrawlStart,
+      date:
+        meta.date instanceof Date
+          ? meta.date.toISOString()
+          : new Date(meta.date).toISOString(),
+      total: values.length,
+      pending: values.filter((value) => value === -1).length,
+      inProgress: values.filter((value) => value === 0).length,
+      completed: values.filter((value) => value === 1).length,
+    }
   }
 
   // 初始化数据库，获取数据库对象
@@ -453,4 +486,6 @@ class Resume {
   }
 }
 
-new Resume()
+/** 断点续传模块单例。 */
+const resume = new Resume()
+export { resume }
