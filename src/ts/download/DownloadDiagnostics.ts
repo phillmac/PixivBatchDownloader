@@ -47,8 +47,10 @@ interface ActiveTask extends DownloadDiagnosticContext {
   timeline: { stage: string; at: string; elapsedMs: number }[]
 }
 
-/** 提供当前下载控制器状态的只读回调。 */
+/** 提供完整下载诊断控制器状态的只读回调。 */
 type PageStateProvider = () => Record<string, unknown>
+/** 提供高频自动化轮询所需轻量状态的只读回调。 */
+type AutomationStateProvider = () => Record<string, unknown>
 
 /** 手动请求当前页面下载诊断报告的 runtime 消息。 */
 interface GetDownloadDiagnosticsMessage {
@@ -78,6 +80,8 @@ class DownloadDiagnostics {
   private readonly watchdogs = new Map<string, number>()
   /** 获取当前下载控制器状态的回调。 */
   private pageStateProvider: PageStateProvider = () => ({})
+  /** 获取自动化轮询轻量状态的回调。 */
+  private automationStateProvider: AutomationStateProvider = () => ({})
 
   /** 注册只读诊断快照消息处理器。 */
   constructor() {
@@ -91,6 +95,16 @@ class DownloadDiagnostics {
   /** 设置用于快照的下载控制器状态提供器。 */
   public setPageStateProvider(provider: PageStateProvider) {
     this.pageStateProvider = provider
+  }
+
+  /** 设置高频自动化轮询使用的轻量状态提供器。 */
+  public setAutomationStateProvider(provider: AutomationStateProvider) {
+    this.automationStateProvider = provider
+  }
+
+  /** 返回不复制任务列表/下载状态数组的轻量自动化状态。 */
+  public automationSnapshot() {
+    return this.automationStateProvider()
   }
 
   /** 建立一个新的页面侧下载诊断任务。 */

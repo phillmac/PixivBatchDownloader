@@ -1,6 +1,7 @@
 import { downloadDiagnostics } from './DownloadDiagnostics'
 import { resume } from './Resume'
 import { EVT } from '../EVT'
+import { store } from '../store/Store'
 
 /** 自动化客户端可观察的下载器生命周期阶段。 */
 export type AutomationPhase =
@@ -29,11 +30,21 @@ const lifecycle = {
 }
 
 /** 生成带 URL 的事件观察，避免 Pixiv SPA 切页后串用旧状态。 */
-function observe(): LifecycleObservation {
+function normalizeUrl(url: string) {
+  return url.split('#')[0]
+}
+
+/** 生成带 URL 的事件观察，避免 Pixiv SPA 切页后串用旧状态。 */
+function observe(url = window.location.href): LifecycleObservation {
   return {
     at: new Date().toISOString(),
-    url: window.location.href.split('#')[0],
+    url: normalizeUrl(url),
   }
+}
+
+/** 下载生命周期属于抓取该任务时的 URL，而不是事件触发时的 SPA 路由。 */
+function observeDownload(): LifecycleObservation {
+  return observe(store.URLWhenCrawlStart || window.location.href)
 }
 
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
@@ -54,18 +65,18 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe()
 })
 window.addEventListener(EVT.list.downloadStart, () => {
-  lifecycle.downloadStarted = observe()
+  lifecycle.downloadStarted = observeDownload()
   lifecycle.downloadCompleted = null
   lifecycle.downloadStopped = null
 })
 window.addEventListener(EVT.list.downloadComplete, () => {
-  lifecycle.downloadCompleted = observe()
+  lifecycle.downloadCompleted = observeDownload()
 })
 window.addEventListener(EVT.list.downloadPause, () => {
-  lifecycle.downloadPaused = observe()
+  lifecycle.downloadPaused = observeDownload()
 })
 window.addEventListener(EVT.list.downloadStop, () => {
-  lifecycle.downloadStopped = observe()
+  lifecycle.downloadStopped = observeDownload()
 })
 window.addEventListener(EVT.list.resume, () => {
   lifecycle.resumed = observe()
@@ -73,10 +84,9 @@ window.addEventListener(EVT.list.resume, () => {
 
 /** 返回供外部自动化读取的稳定下载器状态。 */
 export async function getAutomationStatus() {
-  const page = downloadDiagnostics.pageSnapshot()
-  const controller = page.controller as Record<string, unknown>
-  const currentUrl = page.page.url.split('#')[0]
-  const durable = await resume.getSavedTaskStatus()
+  const controller = downloadDiagnostics.automationSnapshot()
+  const currentUrl = normalizeUrl(window.location.href)
+  const durable = await resume.getSavedTaskStatus(currentUrl)
   const resultLength = Number(controller.resultLength ?? 0)
   const busy = controller.busy === true
   const downloading = controller.downloading === true
@@ -110,7 +120,7 @@ export async function getAutomationStatus() {
     schemaVersion: 1,
     capturedAt: new Date().toISOString(),
     phase,
-    page: { ...page.page, url: currentUrl },
+    page: { url: currentUrl },
     controller,
     lifecycle: { ...lifecycle },
     durable,

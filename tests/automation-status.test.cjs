@@ -9,12 +9,13 @@ const root = path.resolve(__dirname, '..')
 
 function harness(controller, durable) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
+  const store = { URLWhenCrawlStart: location.href }
   const diagnostics = {
+    automationSnapshot() {
+      return controller
+    },
     pageSnapshot() {
-      return {
-        page: { url: location.href },
-        controller,
-      }
+      throw new Error('automation status must not build the full diagnostic snapshot')
     },
   }
   const resume = {
@@ -59,11 +60,14 @@ function harness(controller, durable) {
       return { downloadDiagnostics: diagnostics }
     if (name === './Resume') return { resume }
     if (name === '../EVT') return { EVT }
+    if (name === '../store/Store') return { store }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   return {
     exports,
     context,
+    store,
+    controller,
     fire(name) {
       for (const callback of listeners.get(name) || []) callback()
     },
@@ -241,6 +245,32 @@ test('stopped state is scoped to the URL where stop occurred', async () => {
   assert.equal((await h.exports.getAutomationStatus()).phase, 'STOPPED')
   h.context.window.location.href = 'https://www.pixiv.net/en/users/1/novels'
   assert.equal((await h.exports.getAutomationStatus()).phase, 'IDLE')
+})
+
+test('download completion stays attributed to the original task URL across SPA navigation', async () => {
+  const controller = {
+    busy: false,
+    downloading: false,
+    pause: false,
+    stop: false,
+    resultLength: 3,
+  }
+  const h = harness(controller, null)
+  const taskUrl = h.context.window.location.href
+  h.store.URLWhenCrawlStart = taskUrl
+  h.fire('crawlComplete')
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
+  controller.busy = true
+  controller.downloading = true
+  h.fire('downloadStart')
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1/manga'
+  controller.busy = false
+  controller.downloading = false
+  h.fire('downloadComplete')
+  h.context.window.location.href = taskUrl
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.phase, 'IDLE')
+  assert.equal(status.lifecycle.downloadCompleted.url, taskUrl)
 })
 
 test('status normalizes URL hashes for lifecycle matching', async () => {
