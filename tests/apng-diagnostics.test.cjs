@@ -195,6 +195,21 @@ test('APNG releases each decoded bitmap after copying its pixels', async () => {
   assert.equal((await result).size, 8)
 })
 
+test('APNG releases untouched bitmaps when pixel extraction fails', async () => {
+  const h = harness()
+  let closed = 0
+  const owned = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  h.canvasError = new Error('pixel read failed')
+  await assert.rejects(
+    h.converter.convert(owned, { ...info, frames: [info.frames[0], info.frames[0]] }, h.diagnostic()),
+    /pixel read failed/
+  )
+  assert.equal(closed, 2)
+})
+
 test('worker exception preserves name, stack and request context; next attempt can succeed', async () => {
   const h = harness()
   const d = h.diagnostic()

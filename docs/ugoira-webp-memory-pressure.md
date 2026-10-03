@@ -272,6 +272,10 @@ A subsequent autonomous smoke proved that serialization alone is not sufficient 
 
 GIF and APNG now take ownership of their decoded bitmap list when they begin full-RGBA materialisation. The coordinator evicts that work from the bitmap cache, and each encoder closes an `ImageBitmap` immediately after copying its pixels. If APNG follows GIF, it deliberately re-decodes the ZIP rather than reusing closed bitmaps. This trades decode time for roughly one full raw-frame set of peak-memory headroom and keeps retry/cache semantics explicit.
 
+A further smoke then crossed the 95% guardrail during the next 1920x1080 WebP before GIF began. The encoder itself was serialized, but the coordinator still retained completed works' decoded bitmap caches for ten seconds so another format of the same work could reuse them. With several download tasks interleaving their format sequences, those delayed caches overlapped the next work's decode and defeated the single-heavy-slot bound.
+
+The conservative production path therefore no longer retains decoded Ugoira frames across formats at all. Every completed conversion immediately closes/deletes its bitmap cache; the next format for that work re-decodes from the source ZIP. The download loop processes a work's formats sequentially, so this changes throughput rather than output ordering or correctness. It also makes the heavy-slot memory invariant much easier to reason about: one encoder plus one work's decoded frame set, rather than one encoder plus an unbounded tail of recently completed caches.
+
 ## Remaining risks and open questions
 
 ### Compressed-frame accumulation

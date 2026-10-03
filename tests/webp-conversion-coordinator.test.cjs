@@ -193,6 +193,22 @@ test('failed WebP conversion releases the dedicated WebP slot', async () => {
 })
 
 
+test('completed WebP is released before WebM re-decodes the same work', async () => {
+  const h = harness()
+  const webp = h.coordinator.webp(new Blob(['a']), structuredClone(info), 61)
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.getExtractCalls(), 1)
+  h.calls[0].resolve(new Blob(['webp']))
+  await webp
+
+  const webm = h.coordinator.webm(new Blob(['a']), structuredClone(info), 61)
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.getExtractCalls(), 2)
+  h.webmCalls[0].resolve(new Blob(['webm']))
+  await webm
+})
+
 test('WebM and WebP share the same heavy conversion slot', async () => {
   const h = harness()
   const first = h.coordinator.webm(new Blob(['a']), structuredClone(info), 41)

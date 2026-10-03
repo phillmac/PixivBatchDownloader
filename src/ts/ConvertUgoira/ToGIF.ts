@@ -53,19 +53,25 @@ class ToGIF {
       canvas.height = height
 
       // 添加帧数据
-      ImageBitmapList.forEach((imageBitmap, index) => {
-        try {
+      let releasedBitmaps = 0
+      try {
+        ImageBitmapList.forEach((imageBitmap, index) => {
           ctx.drawImage(imageBitmap, 0, 0)
           const ImageData = ctx.getImageData(0, 0, width, height)
           gif.addFrame(ImageData, {
             delay: info.frames![index].delay,
           })
-        } finally {
           // gif.js keeps the copied ImageData until render completes, so the
           // decoded bitmap is no longer needed once this frame has been copied.
           imageBitmap.close()
+          releasedBitmaps = index + 1
+        })
+      } finally {
+        // If pixel extraction fails mid-animation, release frames we never reached.
+        for (let i = releasedBitmaps; i < ImageBitmapList.length; i++) {
+          ImageBitmapList[i].close()
         }
-      })
+      }
 
       // 渲染 gif
       gif.render()

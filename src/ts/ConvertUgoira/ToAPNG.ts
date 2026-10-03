@@ -96,8 +96,9 @@ class ToAPNG {
     }
 
     const arrayBuffList: ArrayBuffer[] = []
-    imageBitmapList.forEach((imageBitmap, index) => {
-      try {
+    let releasedBitmaps = 0
+    try {
+      imageBitmapList.forEach((imageBitmap, index) => {
         diagnostic.details.frame = {
           index,
           file: info.frames[index]?.file,
@@ -111,12 +112,17 @@ class ToAPNG {
           ctx.getImageData(0, 0, width, height).data.buffer as ArrayBuffer
         )
         diagnostic.details.framesRead = index + 1
-      } finally {
         // The RGBA buffer now owns this frame's pixels; release the decoded
         // bitmap immediately instead of retaining both full frame sets.
         imageBitmap.close()
+        releasedBitmaps = index + 1
+      })
+    } finally {
+      // If extraction fails, release frames that were not reached by the loop.
+      for (let i = releasedBitmaps; i < imageBitmapList.length; i++) {
+        imageBitmapList[i].close()
       }
-    })
+    }
     const delayList = info.frames.map((frame) => frame.delay)
     diagnostic.details.delaySummary = delayList.reduce(
       (summary, delay) => ({

@@ -35,12 +35,6 @@ class ConvertUgoira {
   /** 缓存每个作品的 ImageBitmap 列表，key 为作品 id */
   private readonly imageBitmapCache = new Map<number, ImageBitmap[]>()
 
-  /** 当前正在转换中的作品 id 集合 */
-  private readonly convertingIds = new Set<number>()
-
-  /** 保存清理缓存的定时器，key 为作品 id */
-  private readonly clearCacheTimers = new Map<number, number>()
-
   private bindEvents() {
     window.addEventListener(EVT.list.settingChange, (ev: CustomEventInit) => {
       const data = ev.detail.data as any
@@ -152,9 +146,6 @@ class ConvertUgoira {
           this.heavyActive++
         }
 
-        // 把这个 id 添加到转换中的 id 列表里，并取消清理它的缓存的定时器
-        this.convertingIds.add(id)
-        window.clearTimeout(this.clearCacheTimers.get(id))
 
         try {
           if (diagnostic) {
@@ -307,27 +298,13 @@ class ConvertUgoira {
     }
   }
 
-  /** 从转换中列表移除 id，并在一定时间后清理不再使用的 ImageBitmap 缓存 */
+  /** 立即释放这个作品的解码帧。后续格式需要时重新从 ZIP 解码。 */
   private clearCache(id: number) {
-    this.convertingIds.delete(id)
-
-    // 延迟一定时间，检查不再使用的 id，并清除其缓存。
-    // 因为一个 id 可能需要执行多次转换格式的操作，所以在一次转换任务完成后，可能接下来还要使用缓存。因此不能立刻清除缓存，而是需要等一段时间，等可能的后续转换任务也完成了之后再清除缓存。
-    window.clearTimeout(this.clearCacheTimers.get(id))
-    this.clearCacheTimers.set(
-      id,
-      window.setTimeout(() => {
-        if (!this.convertingIds.has(id)) {
-          // console.log(`clear ${id}`)
-          const bitmaps = this.imageBitmapCache.get(id)
-          if (bitmaps) {
-            bitmaps.forEach((bitmap) => bitmap.close())
-          }
-          this.imageBitmapCache.delete(id)
-          this.clearCacheTimers.delete(id)
-        }
-      }, 10000)
-    )
+    const bitmaps = this.imageBitmapCache.get(id)
+    if (bitmaps) {
+      bitmaps.forEach((bitmap) => bitmap.close())
+    }
+    this.imageBitmapCache.delete(id)
   }
 }
 
