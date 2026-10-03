@@ -8,6 +8,7 @@ export type AutomationPhase =
   | 'CRAWLING'
   | 'DOWNLOADING'
   | 'BOOKMARKING'
+  | 'BUSY_OTHER'
   | 'PAUSED_RESUMABLE'
   | 'READY'
   | 'RESTORING'
@@ -42,9 +43,11 @@ function observe(url = window.location.href): LifecycleObservation {
   }
 }
 
-/** 下载生命周期属于抓取该任务时的 URL，而不是事件触发时的 SPA 路由。 */
-function observeDownload(): LifecycleObservation {
-  return observe(store.URLWhenCrawlStart || window.location.href)
+let activeDownloadUrl: string | null = null
+
+/** 下载生命周期属于任务启动时绑定的 URL，而不是事件触发时的 SPA 路由。 */
+function downloadTaskUrl() {
+  return activeDownloadUrl || normalizeUrl(store.URLWhenCrawlStart || window.location.href)
 }
 
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
@@ -65,18 +68,21 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe()
 })
 window.addEventListener(EVT.list.downloadStart, () => {
-  lifecycle.downloadStarted = observeDownload()
+  activeDownloadUrl = normalizeUrl(store.URLWhenCrawlStart || window.location.href)
+  lifecycle.downloadStarted = observe(activeDownloadUrl)
   lifecycle.downloadCompleted = null
   lifecycle.downloadStopped = null
 })
 window.addEventListener(EVT.list.downloadComplete, () => {
-  lifecycle.downloadCompleted = observeDownload()
+  lifecycle.downloadCompleted = observe(downloadTaskUrl())
+  activeDownloadUrl = null
 })
 window.addEventListener(EVT.list.downloadPause, () => {
-  lifecycle.downloadPaused = observeDownload()
+  lifecycle.downloadPaused = observe(downloadTaskUrl())
 })
 window.addEventListener(EVT.list.downloadStop, () => {
-  lifecycle.downloadStopped = observeDownload()
+  lifecycle.downloadStopped = observe(downloadTaskUrl())
+  activeDownloadUrl = null
 })
 window.addEventListener(EVT.list.resume, () => {
   lifecycle.resumed = observe()
@@ -97,6 +103,11 @@ export async function getAutomationStatus() {
     lifecycle.crawlStarted?.url === currentUrl ||
     lifecycle.crawlCompleted?.url === currentUrl ||
     lifecycle.crawlEmpty?.url === currentUrl
+  const crawlingForCurrent =
+    busy &&
+    lifecycle.crawlStarted?.url === currentUrl &&
+    lifecycle.crawlCompleted?.url !== currentUrl &&
+    lifecycle.crawlEmpty?.url !== currentUrl
   const resumedForCurrent = lifecycle.resumed?.url === currentUrl
   const liveResultsBoundToCurrent = crawlObservedForCurrent || resumedForCurrent
   const stoppedForCurrent =
@@ -105,7 +116,8 @@ export async function getAutomationStatus() {
   let phase: AutomationPhase = 'IDLE'
   if (downloading) phase = 'DOWNLOADING'
   else if (bookmarkMode) phase = 'BOOKMARKING'
-  else if (busy) phase = 'CRAWLING'
+  else if (crawlingForCurrent) phase = 'CRAWLING'
+  else if (busy) phase = 'BUSY_OTHER'
   else if (stoppedForCurrent) phase = 'STOPPED'
   else if (durable && !liveResultsBoundToCurrent) phase = 'RESTORING'
   else if (pause && durable && resumedForCurrent) phase = 'PAUSED_RESUMABLE'

@@ -3,7 +3,7 @@ import { log } from '../Log'
 import { lang } from '../Language'
 import { store } from '../store/Store'
 import { states } from '../store/States'
-import { downloadStates, DLStatesI } from './DownloadStates'
+import { downloadStates, DLStatesI, DLStateSummary } from './DownloadStates'
 import { Result } from '../store/StoreType'
 import { IndexedDB } from '../utils/IndexedDB'
 import { Utils } from '../utils/Utils'
@@ -15,6 +15,7 @@ interface TaskMeta {
   URLWhenCrawlStart: string
   part: number
   date: Date
+  stateSummary?: DLStateSummary
 }
 
 interface TaskData {
@@ -58,6 +59,8 @@ class Resume {
   private readonly putStatesTime = 1000 // 每隔指定时间存储一次最新的下载状态
 
   private needPutStates = false // 指示是否需要更新存储的下载状态
+  private currentMeta: TaskMeta | null = null
+  private restoreGeneration = 0
 
   private async init() {
     if (!Utils.isPixiv()) {
@@ -89,11 +92,22 @@ class Resume {
     if (!meta) {
       return null
     }
-    const taskStates = (await this.IDB.get(
-      this.statesName,
-      meta.id
-    )) as TaskStates | null
-    const values = taskStates?.states ?? []
+
+    let summary = meta.stateSummary
+    // 兼容旧版保存数据：仅首次读取完整状态数组并回填小型摘要。
+    if (!summary) {
+      const taskStates = (await this.IDB.get(
+        this.statesName,
+        meta.id
+      )) as TaskStates | null
+      summary = this.summarizeStates(taskStates?.states ?? [])
+      const upgradedMeta = { ...meta, stateSummary: summary }
+      await this.IDB.put(this.metaName, upgradedMeta)
+      if (this.currentMeta?.id === meta.id) {
+        this.currentMeta = upgradedMeta
+      }
+    }
+
     return {
       id: meta.id,
       url: meta.url,
@@ -102,10 +116,7 @@ class Resume {
         meta.date instanceof Date
           ? meta.date.toISOString()
           : new Date(meta.date).toISOString(),
-      total: values.length,
-      pending: values.filter((value) => value === -1).length,
-      inProgress: values.filter((value) => value === 0).length,
-      completed: values.filter((value) => value === 1).length,
+      ...summary,
     }
   }
 
@@ -153,7 +164,7 @@ class Resume {
     const evs = [EVT.list.crawlComplete, EVT.list.resultChange]
     for (const ev of evs) {
       window.addEventListener(ev, async () => {
-        this.saveData()
+        this.saveData(this.getURL())
       })
     }
 
@@ -181,6 +192,9 @@ class Resume {
 
   // 恢复未完成任务的数据
   private async restoreData() {
+    const generation = ++this.restoreGeneration
+    const restoreUrl = this.getURL()
+
     // 如果下载器在抓取或者在下载，则不恢复数据
     if (states.busy) {
       return
@@ -189,7 +203,7 @@ class Resume {
     // 1 获取任务的元数据
     const meta = (await this.IDB.get(
       this.metaName,
-      this.getURL(),
+      restoreUrl,
       'url'
     )) as TaskMeta | null
     if (!meta) {
@@ -198,47 +212,38 @@ class Resume {
 
     log.log(lang.transl('_正在恢复抓取结果'))
 
-    this.taskId = meta.id
-
-    // 2 恢复抓取结果
-
-    // 生成每批数据的 id 列表
+    // 2 读取抓取结果和下载状态。先全部读入局部变量，避免旧恢复任务在 SPA 切页后污染当前页面。
     const dataIdList: number[] = this.createIdList(meta.id, meta.part)
-    // 读取全部数据并恢复
-    const promiseList = []
-    for (const id of dataIdList) {
-      promiseList.push(this.IDB.get(this.dataName, id))
-    }
+    const promiseList = dataIdList.map((id) => this.IDB.get(this.dataName, id))
+    const [chunks, taskStates] = await Promise.all([
+      Promise.all(promiseList) as Promise<TaskData[]>,
+      this.IDB.get(this.statesName, meta.id) as Promise<TaskStates | null>,
+    ])
 
-    await Promise.all(promiseList).then((res) => {
-      // 恢复数据时不适合使用 store.addResult，因为那样会被多图作品设置影响，可能导致恢复的数据和之前下载时不一致
-      // 所以这里直接替换整个 store.result
-      store.result = []
-      const r = res as TaskData[]
-      for (const taskData of r) {
-        for (const data of taskData.data) {
-          store.result.push(data)
-        }
-      }
-
-      store.resetDownloadCount()
-    })
-
-    // 3 恢复下载状态
-    const data = (await this.IDB.get(
-      this.statesName,
-      this.taskId
-    )) as TaskStates
-
-    if (data) {
-      downloadStates.replace(data.states)
-    }
-
-    store.crawlCompleteTime = meta.date
-    store.URLWhenCrawlStart = meta.URLWhenCrawlStart || ''
-
-    // 恢复模式就绪
     await states.waitSettingInitialized()
+    if (
+      generation !== this.restoreGeneration ||
+      this.getURL() !== restoreUrl ||
+      states.busy
+    ) {
+      return
+    }
+
+    const restored: Result[] = []
+    for (const taskData of chunks) {
+      restored.push(...taskData.data)
+    }
+    store.result = restored
+    store.resetDownloadCount()
+    if (taskStates) {
+      downloadStates.replace(taskStates.states)
+    }
+
+    this.taskId = meta.id
+    this.currentMeta = meta
+    store.crawlCompleteTime = meta.date
+    store.URLWhenCrawlStart = meta.URLWhenCrawlStart || restoreUrl
+
     log.success(lang.transl('_已恢复抓取结果'), 'restoreCrawlResult')
     EVT.fire('resume')
   }
@@ -248,9 +253,9 @@ class Resume {
   // 导致同一 url 的两条记录撞上 taskMeta 表的 url 唯一索引而报错。
   private saveDataChain: Promise<void> = Promise.resolve()
 
-  private saveData() {
+  private saveData(url = this.getURL()) {
     // 无论上一次保存成功还是失败，都把本次保存接到队列末尾顺序执行
-    const run = () => this.saveDataInner()
+    const run = () => this.saveDataInner(url)
     const p = this.saveDataChain.then(run, run)
     this.saveDataChain = p.catch(() => {
       // 忽略单次保存失败，避免阻塞后续保存
@@ -258,11 +263,11 @@ class Resume {
     return p
   }
 
-  private async saveDataInner() {
+  private async saveDataInner(url: string) {
     // 首先检查这个网址下是否已经存在数据，如果有数据，则清除之前的数据，保持每个网址只有一份数据
     const taskData = (await this.IDB.get(
       this.metaName,
-      this.getURL(),
+      url,
       'url'
     )) as TaskMeta | null
 
@@ -287,14 +292,16 @@ class Resume {
     // 保存 meta 数据
     const metaData = {
       id: this.taskId,
-      url: this.getURL(),
-      URLWhenCrawlStart: store.URLWhenCrawlStart,
+      url,
+      URLWhenCrawlStart: store.URLWhenCrawlStart || url,
       part: this.part.length,
       date: store.crawlCompleteTime,
+      stateSummary: downloadStates.summary(),
     }
 
     // add 必须 await，否则下一个排队的保存可能在它提交前就读取/插入，撞上 url 唯一索引
     // 主键冲突时退化为 put 保存（仍 await，确保本次写入完成后再进行下一次保存）
+    this.currentMeta = metaData
     await this.IDB.add(this.metaName, metaData).catch(async (err) => {
       // 有时错误信息是这样的：Key already exists in the object store
       // 所以尝试使用 put 来保存 meta 数据
@@ -374,7 +381,17 @@ class Resume {
         if (downloadStates.downloadedCount() === store.result.length) {
           return
         }
-        this.IDB.put(this.statesName, statesData)
+        const writes: Promise<unknown>[] = [
+          this.IDB.put(this.statesName, statesData),
+        ]
+        if (this.currentMeta?.id === this.taskId) {
+          this.currentMeta = {
+            ...this.currentMeta,
+            stateSummary: downloadStates.summary(),
+          }
+          writes.push(this.IDB.put(this.metaName, this.currentMeta))
+        }
+        void Promise.all(writes)
       }
     }, this.putStatesTime)
   }
@@ -391,6 +408,7 @@ class Resume {
 
     this.IDB.delete(this.metaName, this.taskId)
     this.IDB.delete(this.statesName, this.taskId)
+    if (this.currentMeta?.id === this.taskId) this.currentMeta = null
 
     const dataIdList = this.createIdList(this.taskId, meta.part)
     for (const id of dataIdList) {
@@ -441,6 +459,21 @@ class Resume {
     }
 
     this.IDB.openCursor(this.metaName, callback)
+  }
+
+  private summarizeStates(values: DLStatesI): DLStateSummary {
+    const summary: DLStateSummary = {
+      total: values.length,
+      pending: 0,
+      inProgress: 0,
+      completed: 0,
+    }
+    for (const value of values) {
+      if (value === -1) summary.pending++
+      else if (value === 0) summary.inProgress++
+      else if (value === 1) summary.completed++
+    }
+    return summary
   }
 
   // 计算 part 数组里的数字之和
