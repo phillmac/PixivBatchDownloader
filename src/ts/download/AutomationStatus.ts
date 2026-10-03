@@ -50,19 +50,29 @@ function downloadTaskUrl() {
   return activeDownloadUrl || normalizeUrl(store.URLWhenCrawlStart || window.location.href)
 }
 
+function resetDownloadLifecycle() {
+  lifecycle.downloadStarted = null
+  lifecycle.downloadCompleted = null
+  lifecycle.downloadPaused = null
+  lifecycle.downloadStopped = null
+  activeDownloadUrl = null
+}
+
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
 window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe()
   lifecycle.crawlCompleted = null
   lifecycle.crawlEmpty = null
-  lifecycle.downloadStarted = null
-  lifecycle.downloadCompleted = null
-  lifecycle.downloadPaused = null
-  lifecycle.downloadStopped = null
+  resetDownloadLifecycle()
   lifecycle.resumed = null
 })
 window.addEventListener(EVT.list.crawlComplete, () => {
   lifecycle.crawlCompleted = observe()
+  resetDownloadLifecycle()
+})
+window.addEventListener(EVT.list.resultChange, () => {
+  lifecycle.crawlCompleted = observe()
+  resetDownloadLifecycle()
 })
 window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe()
@@ -120,7 +130,7 @@ export async function getAutomationStatus() {
   else if (busy) phase = 'BUSY_OTHER'
   else if (stoppedForCurrent) phase = 'STOPPED'
   else if (durable && !liveResultsBoundToCurrent) phase = 'RESTORING'
-  else if (pause && durable && resumedForCurrent) phase = 'PAUSED_RESUMABLE'
+  else if (pause && durable && liveResultsBoundToCurrent) phase = 'PAUSED_RESUMABLE'
   else if (
     resultLength > 0 &&
     (resumedForCurrent || lifecycle.crawlCompleted?.url === currentUrl) &&

@@ -29,6 +29,7 @@ function harness(controller, durable) {
       crawlStart: 'crawlStart',
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
+      resultChange: 'resultChange',
       downloadStart: 'downloadStart',
       downloadComplete: 'downloadComplete',
       downloadPause: 'downloadPause',
@@ -273,6 +274,34 @@ test('download completion stays attributed to the original task URL across SPA n
   const status = await h.exports.getAutomationStatus()
   assert.equal(status.phase, 'IDLE')
   assert.equal(status.lifecycle.downloadCompleted.url, taskUrl)
+})
+
+test('freshly crawled paused queue reports PAUSED_RESUMABLE', async () => {
+  const controller = {
+    busy: false, downloading: false, pause: true, stop: false, resultLength: 3,
+  }
+  const h = harness(controller, { total: 3 })
+  h.fire('crawlComplete')
+  h.fire('downloadStart')
+  h.fire('downloadPause')
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'PAUSED_RESUMABLE')
+})
+
+test('new crawlComplete or resultChange clears stale completed-download state', async () => {
+  const controller = {
+    busy: false, downloading: false, pause: false, stop: false, resultLength: 3,
+  }
+  const h = harness(controller, null)
+  h.fire('crawlComplete')
+  h.fire('downloadStart')
+  h.fire('downloadComplete')
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'IDLE')
+  h.fire('crawlComplete')
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
+  h.fire('downloadStart')
+  h.fire('downloadComplete')
+  h.fire('resultChange')
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
 })
 
 test('status normalizes URL hashes for lifecycle matching', async () => {
