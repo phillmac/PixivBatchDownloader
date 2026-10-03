@@ -8,10 +8,11 @@ const ts = require('typescript')
 const root = path.resolve(__dirname, '..')
 
 function harness(controller, durable) {
+  const location = { href: 'https://www.pixiv.net/en/users/1' }
   const diagnostics = {
     pageSnapshot() {
       return {
-        page: { url: 'https://www.pixiv.net/en/users/1' },
+        page: { url: location.href },
         controller,
       }
     },
@@ -34,6 +35,7 @@ function harness(controller, durable) {
     },
   }
   const window = {
+    location,
     addEventListener(name, callback) {
       const callbacks = listeners.get(name) || []
       callbacks.push(callback)
@@ -161,6 +163,29 @@ test('ready results and empty controller report READY and IDLE', async () => {
   h.fire('crawlComplete')
   h.fire('downloadComplete')
   assert.equal((await h.exports.getAutomationStatus()).phase, 'IDLE')
+})
+
+
+test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 3,
+    },
+    null
+  )
+  h.fire('crawlComplete')
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1/manga'
+  const moved = await h.exports.getAutomationStatus()
+  assert.equal(moved.phase, 'IDLE')
+  assert.equal(
+    moved.lifecycle.crawlCompleted.url,
+    'https://www.pixiv.net/en/users/1'
+  )
 })
 
 test('isolated world exposes read-only automation function', async () => {

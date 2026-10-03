@@ -12,31 +12,57 @@ export type AutomationPhase =
   | 'STOPPED'
   | 'IDLE'
 
-/** 当前页面加载周期内观察到的生命周期事件。 */
+/** 单个真实下载器事件的观察记录。 */
+type LifecycleObservation = { at: string; url: string }
+
+/** 当前内容脚本生命周期内观察到的真实下载器事件。 */
 const lifecycle = {
-  crawlStartedAt: null as string | null,
-  crawlCompletedAt: null as string | null,
-  crawlEmptyAt: null as string | null,
-  downloadStartedAt: null as string | null,
-  downloadCompletedAt: null as string | null,
-  downloadPausedAt: null as string | null,
-  resumedAt: null as string | null,
+  crawlStarted: null as LifecycleObservation | null,
+  crawlCompleted: null as LifecycleObservation | null,
+  crawlEmpty: null as LifecycleObservation | null,
+  downloadStarted: null as LifecycleObservation | null,
+  downloadCompleted: null as LifecycleObservation | null,
+  downloadPaused: null as LifecycleObservation | null,
+  resumed: null as LifecycleObservation | null,
+}
+
+/** 生成带 URL 的事件观察，避免 Pixiv SPA 切页后串用旧状态。 */
+function observe(): LifecycleObservation {
+  return {
+    at: new Date().toISOString(),
+    url: window.location.href.split('#')[0],
+  }
 }
 
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
-for (const [event, key] of [
-  [EVT.list.crawlStart, 'crawlStartedAt'],
-  [EVT.list.crawlComplete, 'crawlCompletedAt'],
-  [EVT.list.crawlEmpty, 'crawlEmptyAt'],
-  [EVT.list.downloadStart, 'downloadStartedAt'],
-  [EVT.list.downloadComplete, 'downloadCompletedAt'],
-  [EVT.list.downloadPause, 'downloadPausedAt'],
-  [EVT.list.resume, 'resumedAt'],
-] as const) {
-  window.addEventListener(event, () => {
-    lifecycle[key] = new Date().toISOString()
-  })
-}
+window.addEventListener(EVT.list.crawlStart, () => {
+  lifecycle.crawlStarted = observe()
+  lifecycle.crawlCompleted = null
+  lifecycle.crawlEmpty = null
+  lifecycle.downloadStarted = null
+  lifecycle.downloadCompleted = null
+  lifecycle.downloadPaused = null
+  lifecycle.resumed = null
+})
+window.addEventListener(EVT.list.crawlComplete, () => {
+  lifecycle.crawlCompleted = observe()
+})
+window.addEventListener(EVT.list.crawlEmpty, () => {
+  lifecycle.crawlEmpty = observe()
+})
+window.addEventListener(EVT.list.downloadStart, () => {
+  lifecycle.downloadStarted = observe()
+  lifecycle.downloadCompleted = null
+})
+window.addEventListener(EVT.list.downloadComplete, () => {
+  lifecycle.downloadCompleted = observe()
+})
+window.addEventListener(EVT.list.downloadPause, () => {
+  lifecycle.downloadPaused = observe()
+})
+window.addEventListener(EVT.list.resume, () => {
+  lifecycle.resumed = observe()
+})
 
 /** 返回供外部自动化读取的稳定下载器状态。 */
 export async function getAutomationStatus() {
@@ -57,8 +83,8 @@ export async function getAutomationStatus() {
   else if (pause && durable) phase = 'PAUSED_RESUMABLE'
   else if (
     resultLength > 0 &&
-    (durable !== null || lifecycle.crawlCompletedAt !== null) &&
-    lifecycle.downloadCompletedAt === null
+    (durable !== null || lifecycle.crawlCompleted?.url === page.page.url) &&
+    lifecycle.downloadCompleted?.url !== page.page.url
   )
     phase = 'READY'
 
