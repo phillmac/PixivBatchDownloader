@@ -21,8 +21,11 @@ class DownloadStates {
   }
 
   public states: DLStatesI = []
+  /** states 中值为 -1 的数量；与其余计数之和始终等于 states.length。 */
   private pending = 0
+  /** states 中值为 0 的数量；所有 set/replace/init 操作都必须同步维护。 */
   private inProgress = 0
+  /** states 中值为 1 的数量；downloadedCount() 直接返回此标量。 */
   private completed = 0
 
   private bindEvents() {

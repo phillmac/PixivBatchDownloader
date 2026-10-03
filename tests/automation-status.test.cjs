@@ -1032,3 +1032,28 @@ test('Resume checkpoints state array and scalar summary through one atomic write
     }
   )
 })
+
+test('expired Resume task invalidates matching checkpoint ownership before deletion', async () => {
+  const h = createResumeHarness()
+  await h.resume.ready
+  h.resume.taskId = 701
+  h.resume.currentMeta = {
+    id: 701,
+    url: h.window.location.href,
+    URLWhenCrawlStart: h.window.location.href,
+    part: 1,
+    date: new Date(0),
+  }
+  h.resume.needPutStates = true
+  h.resume.legacySummaryCache.set(701, {
+    total: 1,
+    pending: 1,
+    inProgress: 0,
+    completed: 0,
+  })
+  h.resume.invalidateTaskOwnership(701)
+  assert.equal(h.resume.taskId, 0)
+  assert.equal(h.resume.currentMeta, null)
+  assert.equal(h.resume.needPutStates, false)
+  assert.equal(h.resume.legacySummaryCache.has(701), false)
+})

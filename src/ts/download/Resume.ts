@@ -457,6 +457,18 @@ class Resume {
     }, this.putStatesTime)
   }
 
+  /** 清除指定持久化任务在内存中的 checkpoint 所有权和旧版摘要缓存。 */
+  private invalidateTaskOwnership(taskId: number) {
+    this.legacySummaryCache.delete(taskId)
+    if (this.currentMeta?.id === taskId) {
+      this.currentMeta = null
+    }
+    if (this.taskId === taskId) {
+      this.taskId = 0
+      this.needPutStates = false
+    }
+  }
+
   private async clearData(ev: string) {
     if (!this.taskId) {
       return
@@ -468,13 +480,12 @@ class Resume {
     }
 
     this.persistenceGeneration++
-    this.needPutStates = false
-    this.IDB.delete(this.metaName, this.taskId)
-    this.IDB.delete(this.statesName, this.taskId)
-    this.legacySummaryCache.delete(this.taskId)
-    if (this.currentMeta?.id === this.taskId) this.currentMeta = null
+    const taskId = this.taskId
+    this.invalidateTaskOwnership(taskId)
+    this.IDB.delete(this.metaName, taskId)
+    this.IDB.delete(this.statesName, taskId)
 
-    const dataIdList = this.createIdList(this.taskId, meta.part)
+    const dataIdList = this.createIdList(taskId, meta.part)
     for (const id of dataIdList) {
       this.IDB.delete(this.dataName, id)
     }
@@ -510,6 +521,8 @@ class Resume {
       if (item) {
         const data = item.value as TaskMeta
         if (nowTime - data.id > expiryTime) {
+          // 先释放内存 ownership，避免后续进度 checkpoint 复活已过期元数据。
+          this.invalidateTaskOwnership(data.id)
           this.IDB.delete(this.metaName, data.id)
           this.IDB.delete(this.statesName, data.id)
 
