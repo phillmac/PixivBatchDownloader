@@ -97,19 +97,25 @@ class ToAPNG {
 
     const arrayBuffList: ArrayBuffer[] = []
     imageBitmapList.forEach((imageBitmap, index) => {
-      diagnostic.details.frame = {
-        index,
-        file: info.frames[index]?.file,
-        width: imageBitmap.width,
-        height: imageBitmap.height,
+      try {
+        diagnostic.details.frame = {
+          index,
+          file: info.frames[index]?.file,
+          width: imageBitmap.width,
+          height: imageBitmap.height,
+        }
+        diagnostic.details.frameOperation = 'drawImage'
+        ctx.drawImage(imageBitmap, 0, 0)
+        diagnostic.details.frameOperation = 'getImageData'
+        arrayBuffList.push(
+          ctx.getImageData(0, 0, width, height).data.buffer as ArrayBuffer
+        )
+        diagnostic.details.framesRead = index + 1
+      } finally {
+        // The RGBA buffer now owns this frame's pixels; release the decoded
+        // bitmap immediately instead of retaining both full frame sets.
+        imageBitmap.close()
       }
-      diagnostic.details.frameOperation = 'drawImage'
-      ctx.drawImage(imageBitmap, 0, 0)
-      diagnostic.details.frameOperation = 'getImageData'
-      arrayBuffList.push(
-        ctx.getImageData(0, 0, width, height).data.buffer as ArrayBuffer
-      )
-      diagnostic.details.framesRead = index + 1
     })
     const delayList = info.frames.map((frame) => frame.delay)
     diagnostic.details.delaySummary = delayList.reduce(

@@ -54,11 +54,17 @@ class ToGIF {
 
       // 添加帧数据
       ImageBitmapList.forEach((imageBitmap, index) => {
-        ctx.drawImage(imageBitmap, 0, 0)
-        const ImageData = ctx.getImageData(0, 0, width, height)
-        gif.addFrame(ImageData, {
-          delay: info.frames![index].delay,
-        })
+        try {
+          ctx.drawImage(imageBitmap, 0, 0)
+          const ImageData = ctx.getImageData(0, 0, width, height)
+          gif.addFrame(ImageData, {
+            delay: info.frames![index].delay,
+          })
+        } finally {
+          // gif.js keeps the copied ImageData until render completes, so the
+          // decoded bitmap is no longer needed once this frame has been copied.
+          imageBitmap.close()
+        }
       })
 
       // 渲染 gif

@@ -10,7 +10,7 @@ const info = {
   mime_type: 'image/jpeg',
   frames: [{ file: '000000.jpg', delay: 80 }],
 }
-const bitmaps = [{ width: 2, height: 3 }]
+const bitmaps = [{ width: 2, height: 3, close() {} }]
 
 // Load the real TypeScript modules with browser boundaries replaced for fault injection.
 function harness() {
@@ -171,6 +171,29 @@ function harness() {
   }
   return h
 }
+
+test('APNG releases each decoded bitmap after copying its pixels', async () => {
+  const h = harness()
+  let closed = 0
+  const owned = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  const localInfo = {
+    mime_type: 'image/jpeg',
+    frames: [
+      { file: '000000.jpg', delay: 80 },
+      { file: '000001.jpg', delay: 80 },
+    ],
+  }
+  const result = h.converter.convert(owned, localInfo, h.diagnostic())
+  const worker = await h.waitForPost()
+  assert.equal(closed, 2)
+  worker.emit('message', {
+    data: { id: worker.messages[0].id, result: new ArrayBuffer(8) },
+  })
+  assert.equal((await result).size, 8)
+})
 
 test('worker exception preserves name, stack and request context; next attempt can succeed', async () => {
   const h = harness()

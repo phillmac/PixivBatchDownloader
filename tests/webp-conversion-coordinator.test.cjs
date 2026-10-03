@@ -23,6 +23,7 @@ function harness() {
   const webmCalls = []
   const gifCalls = []
   const apngCalls = []
+  let extractCalls = 0
   const browser = { runtime: { getManifest: () => ({ version: 'test' }) } }
   const settings = {
     convertUgoiraThread: 3,
@@ -88,7 +89,10 @@ function harness() {
     '../Tools': {
       Tools: {
         getJPGContentIndex: () => [0],
-        extractImage: async () => [{ width: 2, height: 2, close() {} }],
+        extractImage: async () => {
+          extractCalls++
+          return [{ width: 2, height: 2, close() {} }]
+        },
       },
     },
     '../utils/Utils': {
@@ -137,7 +141,14 @@ function harness() {
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })(moduleRequire, exports)
-  return { coordinator: exports.convertUgoira, calls, webmCalls, gifCalls, apngCalls }
+  return {
+    coordinator: exports.convertUgoira,
+    calls,
+    webmCalls,
+    gifCalls,
+    apngCalls,
+    getExtractCalls: () => extractCalls,
+  }
 }
 
 const info = {
@@ -220,6 +231,22 @@ test('WebP and GIF share the same heavy conversion slot', async () => {
   h.gifCalls[0].resolve(new Blob(['gif']))
   await second
   assert.equal(h.coordinator.heavyActive, 0)
+})
+
+test('GIF evicts decoded bitmaps so APNG re-decodes the same work', async () => {
+  const h = harness()
+  const gif = h.coordinator.gif(new Blob(['a']), info, 51)
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.getExtractCalls(), 1)
+  h.gifCalls[0].resolve(new Blob(['gif']))
+  await gif
+
+  const apng = h.coordinator.apng(new Blob(['a']), info, 51)
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.getExtractCalls(), 2)
+  h.apngCalls[0].resolve(new Blob(['apng']))
+  await apng
 })
 
 test('GIF and APNG share one heavy conversion slot', async () => {

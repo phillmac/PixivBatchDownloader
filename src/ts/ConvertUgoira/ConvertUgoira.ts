@@ -176,6 +176,13 @@ class ConvertUgoira {
             this.imageBitmapCache.delete(id)
           }
 
+          // GIF/APNG 会把每帧复制成完整 RGBA 数据。让这些格式取得 bitmap
+          // 的所有权并逐帧 close，避免完整 decoded bitmap 集和完整 RGBA 集
+          // 同时驻留。后续格式需要时重新从 ZIP 解码。
+          if (type === 'gif' || type === 'png') {
+            this.imageBitmapCache.delete(id)
+          }
+
           const format = type === 'png' ? 'apng' : type
           const firstFrame = imageBitmapList[0]
           const startedAt = performance.now()

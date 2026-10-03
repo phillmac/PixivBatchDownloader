@@ -268,6 +268,10 @@ This changes the containment conclusion. The remaining production risk is not sp
 
 As an immediate conservative containment, all WebM/WebP/GIF/APNG conversions now share one full-frame conversion slot. This intentionally trades throughput for a deterministic upper bound on cross-format overlap. A future byte-aware admission controller can recover safe concurrency once peak-memory accounting is understood well enough.
 
+A subsequent autonomous smoke proved that serialization alone is not sufficient for the largest GIF case. With only one heavy conversion active, a 150-frame 1920x1080 GIF still drove the 12 GiB no-swap container to 99.30% before the 95% guardrail paused the downloader. `gif.js` retains the copied `ImageData` for every frame until `render()`, while the downloader was also retaining the full decoded `ImageBitmap[]`. That recreates two full frame sets inside one conversion even without cross-work overlap.
+
+GIF and APNG now take ownership of their decoded bitmap list when they begin full-RGBA materialisation. The coordinator evicts that work from the bitmap cache, and each encoder closes an `ImageBitmap` immediately after copying its pixels. If APNG follows GIF, it deliberately re-decodes the ZIP rather than reusing closed bitmaps. This trades decode time for roughly one full raw-frame set of peak-memory headroom and keeps retry/cache semantics explicit.
+
 ## Remaining risks and open questions
 
 ### Compressed-frame accumulation
