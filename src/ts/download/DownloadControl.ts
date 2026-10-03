@@ -48,6 +48,7 @@ class DownloadControl {
       stop: this.stop,
       busy: states.busy,
       downloading: states.downloading,
+      bookmarkMode: states.bookmarkMode,
       downloadStates: [...downloadStates.states],
       taskList: { ...this.taskList },
     }))

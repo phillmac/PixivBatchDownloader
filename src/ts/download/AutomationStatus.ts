@@ -6,6 +6,7 @@ import { EVT } from '../EVT'
 export type AutomationPhase =
   | 'CRAWLING'
   | 'DOWNLOADING'
+  | 'BOOKMARKING'
   | 'PAUSED_RESUMABLE'
   | 'READY'
   | 'RESTORING'
@@ -23,6 +24,7 @@ const lifecycle = {
   downloadStarted: null as LifecycleObservation | null,
   downloadCompleted: null as LifecycleObservation | null,
   downloadPaused: null as LifecycleObservation | null,
+  downloadStopped: null as LifecycleObservation | null,
   resumed: null as LifecycleObservation | null,
 }
 
@@ -42,6 +44,7 @@ window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.downloadStarted = null
   lifecycle.downloadCompleted = null
   lifecycle.downloadPaused = null
+  lifecycle.downloadStopped = null
   lifecycle.resumed = null
 })
 window.addEventListener(EVT.list.crawlComplete, () => {
@@ -53,12 +56,16 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
 window.addEventListener(EVT.list.downloadStart, () => {
   lifecycle.downloadStarted = observe()
   lifecycle.downloadCompleted = null
+  lifecycle.downloadStopped = null
 })
 window.addEventListener(EVT.list.downloadComplete, () => {
   lifecycle.downloadCompleted = observe()
 })
 window.addEventListener(EVT.list.downloadPause, () => {
   lifecycle.downloadPaused = observe()
+})
+window.addEventListener(EVT.list.downloadStop, () => {
+  lifecycle.downloadStopped = observe()
 })
 window.addEventListener(EVT.list.resume, () => {
   lifecycle.resumed = observe()
@@ -73,18 +80,28 @@ export async function getAutomationStatus() {
   const resultLength = Number(controller.resultLength ?? 0)
   const busy = controller.busy === true
   const downloading = controller.downloading === true
+  const bookmarkMode = controller.bookmarkMode === true
   const pause = controller.pause === true
   const stop = controller.stop === true
+  const crawlObservedForCurrent =
+    lifecycle.crawlStarted?.url === currentUrl ||
+    lifecycle.crawlCompleted?.url === currentUrl ||
+    lifecycle.crawlEmpty?.url === currentUrl
+  const resumedForCurrent = lifecycle.resumed?.url === currentUrl
+  const liveResultsBoundToCurrent = crawlObservedForCurrent || resumedForCurrent
+  const stoppedForCurrent =
+    stop && lifecycle.downloadStopped?.url === currentUrl
 
   let phase: AutomationPhase = 'IDLE'
   if (downloading) phase = 'DOWNLOADING'
+  else if (bookmarkMode) phase = 'BOOKMARKING'
   else if (busy) phase = 'CRAWLING'
-  else if (stop) phase = 'STOPPED'
-  else if (durable && resultLength === 0) phase = 'RESTORING'
-  else if (pause && durable) phase = 'PAUSED_RESUMABLE'
+  else if (stoppedForCurrent) phase = 'STOPPED'
+  else if (durable && !liveResultsBoundToCurrent) phase = 'RESTORING'
+  else if (pause && durable && resumedForCurrent) phase = 'PAUSED_RESUMABLE'
   else if (
     resultLength > 0 &&
-    (durable !== null || lifecycle.crawlCompleted?.url === currentUrl) &&
+    (resumedForCurrent || lifecycle.crawlCompleted?.url === currentUrl) &&
     lifecycle.downloadCompleted?.url !== currentUrl
   )
     phase = 'READY'

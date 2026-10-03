@@ -78,6 +78,9 @@ class Resume {
   /** 返回当前 URL 对应的持久化未完成任务摘要。 */
   public async getSavedTaskStatus(url = this.getURL()) {
     await this.ready
+    if (!Utils.isPixiv()) {
+      return null
+    }
     const meta = (await this.IDB.get(
       this.metaName,
       url,
