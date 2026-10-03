@@ -15,12 +15,14 @@ function harness(controller, durable) {
       return controller
     },
     pageSnapshot() {
-      throw new Error('automation status must not build the full diagnostic snapshot')
+      throw new Error(
+        'automation status must not build the full diagnostic snapshot'
+      )
     },
   }
   const resume = {
     async getSavedTaskStatus() {
-      return durable
+      return typeof durable === 'function' ? durable() : durable
     },
   }
   const listeners = new Map()
@@ -189,7 +191,6 @@ test('ready results and empty controller report READY and IDLE', async () => {
   assert.equal((await h.exports.getAutomationStatus()).phase, 'IDLE')
 })
 
-
 test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async () => {
   const h = harness(
     {
@@ -278,18 +279,29 @@ test('download completion stays attributed to the original task URL across SPA n
 
 test('freshly crawled paused queue reports PAUSED_RESUMABLE', async () => {
   const controller = {
-    busy: false, downloading: false, pause: true, stop: false, resultLength: 3,
+    busy: false,
+    downloading: false,
+    pause: true,
+    stop: false,
+    resultLength: 3,
   }
   const h = harness(controller, { total: 3 })
   h.fire('crawlComplete')
   h.fire('downloadStart')
   h.fire('downloadPause')
-  assert.equal((await h.exports.getAutomationStatus()).phase, 'PAUSED_RESUMABLE')
+  assert.equal(
+    (await h.exports.getAutomationStatus()).phase,
+    'PAUSED_RESUMABLE'
+  )
 })
 
 test('new crawlComplete or resultChange clears stale completed-download state', async () => {
   const controller = {
-    busy: false, downloading: false, pause: false, stop: false, resultLength: 3,
+    busy: false,
+    downloading: false,
+    pause: false,
+    stop: false,
+    resultLength: 3,
   }
   const h = harness(controller, null)
   h.fire('crawlComplete')
@@ -382,21 +394,29 @@ function createResumeHarness(options = {}) {
   const getCalls = []
   const putCalls = []
   const metaByUrl = new Map(Object.entries(options.metaByUrl || {}))
-  const dataById = new Map(Object.entries(options.dataById || {}).map(([k, v]) => [Number(k), v]))
-  const statesById = new Map(Object.entries(options.statesById || {}).map(([k, v]) => [Number(k), v]))
+  const dataById = new Map(
+    Object.entries(options.dataById || {}).map(([k, v]) => [Number(k), v])
+  )
+  const statesById = new Map(
+    Object.entries(options.statesById || {}).map(([k, v]) => [Number(k), v])
+  )
   class IndexedDB {
     async open() {}
     async get(storeName, key, index) {
       getCalls.push([storeName, key, index])
-      if (storeName === 'taskMeta' && index === 'url') return metaByUrl.get(key) || null
+      if (storeName === 'taskMeta' && index === 'url')
+        return metaByUrl.get(key) || null
       if (storeName === 'taskMeta') {
         return [...metaByUrl.values()].find((item) => item.id === key) || null
       }
       if (storeName === 'taskData') {
         const value = dataById.get(key)
-        return typeof value === 'function' ? value() : value ?? null
+        return typeof value === 'function' ? value() : (value ?? null)
       }
-      if (storeName === 'taskStates') return statesById.get(key) || null
+      if (storeName === 'taskStates') {
+        const value = statesById.get(key)
+        return typeof value === 'function' ? value() : value || null
+      }
       return null
     }
     async put(storeName, value) {
@@ -405,18 +425,32 @@ function createResumeHarness(options = {}) {
     }
     async add() {}
     async delete() {}
-    async clear() {}
+    async clear(storeName) {
+      if (storeName === 'taskMeta') metaByUrl.clear()
+      if (storeName === 'taskStates') statesById.clear()
+      if (storeName === 'taskData') dataById.clear()
+    }
     openCursor() {}
   }
   const EVT = {
     list: {
-      pageSwitch: 'pageSwitch', settingInitialized: 'settingInitialized',
-      crawlComplete: 'crawlComplete', resultChange: 'resultChange',
-      downloadSuccess: 'downloadSuccess', skipDownload: 'skipDownload',
-      downloadComplete: 'downloadComplete', downloadStop: 'downloadStop',
-      clearSavedCrawl: 'clearSavedCrawl', resume: 'resume',
+      pageSwitch: 'pageSwitch',
+      settingInitialized: 'settingInitialized',
+      crawlComplete: 'crawlComplete',
+      resultChange: 'resultChange',
+      downloadSuccess: 'downloadSuccess',
+      skipDownload: 'skipDownload',
+      downloadComplete: 'downloadComplete',
+      downloadStop: 'downloadStop',
+      downloadPause: 'downloadPause',
+      stopCrawl: 'stopCrawl',
+      bookmarkModeEnd: 'bookmarkModeEnd',
+      clearSavedCrawl: 'clearSavedCrawl',
+      resume: 'resume',
     },
-    fire(name) { fired.push(name) },
+    fire(name) {
+      fired.push(name)
+    },
   }
   const window = {
     location,
@@ -425,10 +459,18 @@ function createResumeHarness(options = {}) {
       callbacks.push(callback)
       listeners.set(name, callbacks)
     },
-    setInterval() { return 1 },
+    setInterval() {
+      return 1
+    },
+    setTimeout(callback) {
+      callback()
+      return 1
+    },
   }
   const localStorage = {
-    getItem() { return String(Date.now()) },
+    getItem() {
+      return String(Date.now())
+    },
     setItem() {},
   }
   const store = {
@@ -444,19 +486,36 @@ function createResumeHarness(options = {}) {
   }
   const downloadStates = {
     states: [],
-    replace(value) { this.states = value },
-    downloadedCount() { return 0 },
-    summary() { return { total: this.states.length, pending: this.states.length, inProgress: 0, completed: 0 } },
+    replace(value) {
+      this.states = value
+    },
+    downloadedCount() {
+      return 0
+    },
+    summary() {
+      return {
+        total: this.states.length,
+        pending: this.states.length,
+        inProgress: 0,
+        completed: 0,
+      }
+    },
   }
   const context = vm.createContext({ console, Date, window, localStorage })
   const file = path.join(root, 'src/ts/download/Resume.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
   }).outputText
   const exports = {}
-  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, { filename: file })((name) => {
+  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
+    filename: file,
+  })((name) => {
     if (name === '../EVT') return { EVT }
-    if (name === '../Log') return { log: { log() {}, success() {}, warning() {}, error() {} } }
+    if (name === '../Log')
+      return { log: { log() {}, success() {}, warning() {}, error() {} } }
     if (name === '../Language') return { lang: { transl: (value) => value } }
     if (name === '../store/Store') return { store }
     if (name === '../store/States') return { states }
@@ -466,7 +525,20 @@ function createResumeHarness(options = {}) {
     if (name === '../Toast') return { toast: { success() {} } }
     throw new Error(`unexpected require ${name}`)
   }, exports)
-  return { ...exports, context, window, store, states, downloadStates, fired, getCalls, putCalls }
+  return {
+    ...exports,
+    context,
+    window,
+    store,
+    states,
+    downloadStates,
+    fired,
+    getCalls,
+    putCalls,
+    fire(name) {
+      for (const callback of listeners.get(name) || []) callback()
+    },
+  }
 }
 
 test('Resume status uses metadata summary without cloning taskStates', async () => {
@@ -475,9 +547,17 @@ test('Resume status uses metadata summary without cloning taskStates', async () 
     url,
     metaByUrl: {
       [url]: {
-        id: 101, url, URLWhenCrawlStart: url, part: 1,
+        id: 101,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
         date: new Date('2026-10-03T00:00:00Z'),
-        stateSummary: { total: 50000, pending: 123, inProgress: 2, completed: 49875 },
+        stateSummary: {
+          total: 50000,
+          pending: 123,
+          inProgress: 2,
+          completed: 49875,
+        },
       },
     },
     statesById: { 101: { id: 101, states: new Array(50000).fill(1) } },
@@ -493,13 +573,18 @@ test('obsolete Resume restore cannot land after SPA navigation', async () => {
   const urlA = 'https://www.pixiv.net/en/users/1'
   const urlB = 'https://www.pixiv.net/en/users/2'
   let resolveChunk
-  const chunk = new Promise((resolve) => { resolveChunk = resolve })
+  const chunk = new Promise((resolve) => {
+    resolveChunk = resolve
+  })
   const h = createResumeHarness({
     url: urlA,
     initialResults: [{ id: 'keep-current' }],
     metaByUrl: {
       [urlA]: {
-        id: 100, url: urlA, URLWhenCrawlStart: urlA, part: 1,
+        id: 100,
+        url: urlA,
+        URLWhenCrawlStart: urlA,
+        part: 1,
         date: new Date('2026-10-03T00:00:00Z'),
         stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
       },
@@ -521,27 +606,44 @@ test('obsolete Resume restore cannot land after SPA navigation', async () => {
 test('DownloadStates maintains scalar counts incrementally', () => {
   const listeners = new Map()
   const store = { result: new Array(4).fill({}) }
-  const EVT = { list: { crawlComplete: 'crawlComplete', resultChange: 'resultChange' } }
-  const window = { addEventListener(name, callback) { listeners.set(name, callback) } }
+  const EVT = {
+    list: { crawlComplete: 'crawlComplete', resultChange: 'resultChange' },
+  }
+  const window = {
+    addEventListener(name, callback) {
+      listeners.set(name, callback)
+    },
+  }
   const context = vm.createContext({ window })
   const file = path.join(root, 'src/ts/download/DownloadStates.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
   }).outputText
   const exports = {}
-  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, { filename: file })((name) => {
+  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
+    filename: file,
+  })((name) => {
     if (name === '../EVT') return { EVT }
     if (name === '../store/Store') return { store }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   const ds = exports.downloadStates
   ds.init()
-  assert.deepEqual({ ...ds.summary() }, { total: 4, pending: 4, inProgress: 0, completed: 0 })
+  assert.deepEqual(
+    { ...ds.summary() },
+    { total: 4, pending: 4, inProgress: 0, completed: 0 }
+  )
   ds.setState(0, 0)
   ds.setState(0, 1)
   ds.setState(1, 1)
   assert.equal(ds.downloadedCount(), 2)
-  assert.deepEqual({ ...ds.summary() }, { total: 4, pending: 2, inProgress: 0, completed: 2 })
+  assert.deepEqual(
+    { ...ds.summary() },
+    { total: 4, pending: 2, inProgress: 0, completed: 2 }
+  )
 })
 
 test('imported results bind the queue to the current page URL', async () => {
@@ -549,40 +651,61 @@ test('imported results bind the queue to the current page URL', async () => {
   const fired = []
   const window = {
     location: { href: 'https://www.pixiv.net/en/users/9#works' },
-    addEventListener(name, callback) { listeners.set(name, callback) },
+    addEventListener(name, callback) {
+      listeners.set(name, callback)
+    },
   }
   const EVT = {
     list: { importResult: 'importResult', crawlComplete: 'crawlComplete' },
-    fire(name) { fired.push(name) },
+    fire(name) {
+      fired.push(name)
+    },
   }
   const store = {
     result: [],
     URLWhenCrawlStart: 'https://www.pixiv.net/en/users/old',
     crawlCompleteTime: new Date(0),
-    reset() { this.result = [] },
-    addResult(value) { this.result.push(value) },
+    reset() {
+      this.result = []
+    },
+    addResult(value) {
+      this.result.push(value)
+    },
   }
   const imported = {
-    idNum: 1, id: '1', original: 'https://example.invalid/1.jpg',
-    type: 0, ext: 'jpg', pageCount: 1,
+    idNum: 1,
+    id: '1',
+    original: 'https://example.invalid/1.jpg',
+    type: 0,
+    ext: 'jpg',
+    pageCount: 1,
   }
   const context = vm.createContext({ console, Date, window })
   const file = path.join(root, 'src/ts/download/ImportResult.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
   }).outputText
   const exports = {}
-  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, { filename: file })((name) => {
+  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
+    filename: file,
+  })((name) => {
     if (name === '../EVT') return { EVT }
     if (name === '../store/StoreType') return {}
     if (name === '../Language') return { lang: { transl: (value) => value } }
-    if (name === '../utils/Utils') return { Utils: { loadJSONFile: async () => [imported] } }
+    if (name === '../utils/Utils')
+      return { Utils: { loadJSONFile: async () => [imported] } }
     if (name === '../store/States') return { states: { busy: false } }
     if (name === '../store/Store') return { store }
     if (name === '../Toast') return { toast: { error() {} } }
-    if (name === '../MsgBox') return { msgBox: { error() {}, warning() {}, success() {} } }
-    if (name === '../filter/Filter') return { filter: { check: async () => true } }
-    if (name === '../Tools') return { Tools: { getWorkTypeString: () => 'artwork' } }
+    if (name === '../MsgBox')
+      return { msgBox: { error() {}, warning() {}, success() {} } }
+    if (name === '../filter/Filter')
+      return { filter: { check: async () => true } }
+    if (name === '../Tools')
+      return { Tools: { getWorkTypeString: () => 'artwork' } }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   listeners.get('importResult')()
@@ -592,4 +715,137 @@ test('imported results bind the queue to the current page URL', async () => {
   assert.equal(store.crawlCompleteTime instanceof Date, true)
   assert.equal(store.result.length, 1)
   assert.equal(fired.includes('crawlComplete'), true)
+})
+
+test('automation status snapshots live controller after durable lookup', async () => {
+  let resolveDurable
+  const durable = new Promise((resolve) => {
+    resolveDurable = resolve
+  })
+  const controller = {
+    busy: false,
+    downloading: false,
+    pause: false,
+    stop: false,
+    resultLength: 3,
+  }
+  const h = harness(controller, () => durable)
+  h.fire('crawlComplete')
+  const pending = h.exports.getAutomationStatus()
+  controller.busy = true
+  controller.downloading = true
+  resolveDurable(null)
+  assert.equal((await pending).phase, 'DOWNLOADING')
+})
+
+test('automation status returns detached lifecycle observations', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 2,
+    },
+    null
+  )
+  h.fire('crawlComplete')
+  const first = await h.exports.getAutomationStatus()
+  first.lifecycle.crawlCompleted.url = 'https://example.invalid/mutated'
+  const second = await h.exports.getAutomationStatus()
+  assert.equal(second.phase, 'READY')
+  assert.equal(
+    second.lifecycle.crawlCompleted.url,
+    'https://www.pixiv.net/en/users/1'
+  )
+})
+
+test('legacy status migration does not resurrect metadata deleted during lookup', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  let h
+  h = createResumeHarness({
+    url,
+    metaByUrl: {
+      [url]: {
+        id: 201,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
+        date: new Date(0),
+      },
+    },
+    statesById: {
+      201: () => {
+        // Simulate download completion deleting metadata while the legacy state array is read.
+        // The subsequent id lookup must observe deletion and return null without put().
+        return { id: 201, states: [-1, 1] }
+      },
+    },
+  })
+  // Replace metadata id lookup behavior by clearing through the harness-visible private DB path.
+  const originalGet = h.resume.IDB.get.bind(h.resume.IDB)
+  let stateRead = false
+  h.resume.IDB.get = async (storeName, key, index) => {
+    const value = await originalGet(storeName, key, index)
+    if (storeName === 'taskStates') {
+      stateRead = true
+      await h.resume.IDB.clear('taskMeta')
+    }
+    return value
+  }
+  const status = await h.resume.getSavedTaskStatus(url)
+  assert.equal(stateRead, true)
+  assert.equal(status, null)
+  assert.equal(h.putCalls.length, 0)
+})
+
+test('clear saved crawl invalidates cached persistence ownership before clearing stores', async () => {
+  const h = createResumeHarness()
+  await h.resume.ready
+  h.resume.taskId = 301
+  h.resume.currentMeta = { id: 301, url: h.window.location.href }
+  h.resume.needPutStates = true
+  h.resume.restorePending = true
+  h.resume.legacySummaryCache.set(301, {
+    total: 1,
+    pending: 1,
+    inProgress: 0,
+    completed: 0,
+  })
+  await h.resume.clearSavedCrawl()
+  assert.equal(h.resume.taskId, 0)
+  assert.equal(h.resume.currentMeta, null)
+  assert.equal(h.resume.needPutStates, false)
+  assert.equal(h.resume.restorePending, false)
+  assert.equal(h.resume.legacySummaryCache.size, 0)
+})
+
+test('busy page-switch restore retries on the next idle event', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const h = createResumeHarness({
+    url,
+    initialResults: [{ id: 'old' }],
+    metaByUrl: {
+      [url]: {
+        id: 401,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
+        date: new Date('2026-10-03T00:00:00Z'),
+        stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
+      },
+    },
+    dataById: { 4010: { id: 4010, data: [{ id: 'restored' }] } },
+    statesById: { 401: { id: 401, states: [-1] } },
+  })
+  await h.resume.ready
+  h.states.busy = true
+  await h.resume.restoreData()
+  assert.equal(h.resume.restorePending, true)
+  h.states.busy = false
+  h.fire('downloadComplete')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.store.result.length, 1)
+  assert.equal(h.store.result[0].id, 'restored')
+  assert.equal(h.fired.includes('resume'), true)
 })

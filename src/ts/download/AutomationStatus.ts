@@ -43,13 +43,18 @@ function observe(url = window.location.href): LifecycleObservation {
   }
 }
 
+/** 当前活动下载所绑定的任务 URL；跨 SPA 导航时保持不变。 */
 let activeDownloadUrl: string | null = null
 
 /** 下载生命周期属于任务启动时绑定的 URL，而不是事件触发时的 SPA 路由。 */
 function downloadTaskUrl() {
-  return activeDownloadUrl || normalizeUrl(store.URLWhenCrawlStart || window.location.href)
+  return (
+    activeDownloadUrl ||
+    normalizeUrl(store.URLWhenCrawlStart || window.location.href)
+  )
 }
 
+/** 清除上一下载队列的终止状态，并释放当前下载 URL 所有权。 */
 function resetDownloadLifecycle() {
   lifecycle.downloadStarted = null
   lifecycle.downloadCompleted = null
@@ -78,7 +83,9 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe()
 })
 window.addEventListener(EVT.list.downloadStart, () => {
-  activeDownloadUrl = normalizeUrl(store.URLWhenCrawlStart || window.location.href)
+  activeDownloadUrl = normalizeUrl(
+    store.URLWhenCrawlStart || window.location.href
+  )
   lifecycle.downloadStarted = observe(activeDownloadUrl)
   lifecycle.downloadCompleted = null
   lifecycle.downloadStopped = null
@@ -100,9 +107,13 @@ window.addEventListener(EVT.list.resume, () => {
 
 /** 返回供外部自动化读取的稳定下载器状态。 */
 export async function getAutomationStatus() {
-  const controller = downloadDiagnostics.automationSnapshot()
+  const requestedUrl = normalizeUrl(window.location.href)
+  const durable = await resume.getSavedTaskStatus(requestedUrl)
   const currentUrl = normalizeUrl(window.location.href)
-  const durable = await resume.getSavedTaskStatus(currentUrl)
+  if (currentUrl !== requestedUrl) {
+    return getAutomationStatus()
+  }
+  const controller = downloadDiagnostics.automationSnapshot()
   const resultLength = Number(controller.resultLength ?? 0)
   const busy = controller.busy === true
   const downloading = controller.downloading === true
@@ -130,7 +141,8 @@ export async function getAutomationStatus() {
   else if (busy) phase = 'BUSY_OTHER'
   else if (stoppedForCurrent) phase = 'STOPPED'
   else if (durable && !liveResultsBoundToCurrent) phase = 'RESTORING'
-  else if (pause && durable && liveResultsBoundToCurrent) phase = 'PAUSED_RESUMABLE'
+  else if (pause && durable && liveResultsBoundToCurrent)
+    phase = 'PAUSED_RESUMABLE'
   else if (
     resultLength > 0 &&
     (resumedForCurrent || lifecycle.crawlCompleted?.url === currentUrl) &&
@@ -144,7 +156,12 @@ export async function getAutomationStatus() {
     phase,
     page: { url: currentUrl },
     controller,
-    lifecycle: { ...lifecycle },
+    lifecycle: Object.fromEntries(
+      Object.entries(lifecycle).map(([key, value]) => [
+        key,
+        value ? { ...value } : null,
+      ])
+    ),
     durable,
   }
 }

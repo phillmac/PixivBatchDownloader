@@ -61,6 +61,9 @@ class Resume {
   private needPutStates = false // 指示是否需要更新存储的下载状态
   private currentMeta: TaskMeta | null = null
   private restoreGeneration = 0
+  private restorePending = false
+  private persistenceGeneration = 0
+  private readonly legacySummaryCache = new Map<number, DLStateSummary>()
 
   private async init() {
     if (!Utils.isPixiv()) {
@@ -93,18 +96,25 @@ class Resume {
       return null
     }
 
-    let summary = meta.stateSummary
-    // 兼容旧版保存数据：仅首次读取完整状态数组并回填小型摘要。
+    let summary = meta.stateSummary || this.legacySummaryCache.get(meta.id)
+    // 兼容旧版保存数据：只在内存里缓存一次标量摘要，避免轮询重写/复活已删除元数据。
     if (!summary) {
       const taskStates = (await this.IDB.get(
         this.statesName,
         meta.id
       )) as TaskStates | null
-      summary = this.summarizeStates(taskStates?.states ?? [])
-      const upgradedMeta = { ...meta, stateSummary: summary }
-      await this.IDB.put(this.metaName, upgradedMeta)
-      if (this.currentMeta?.id === meta.id) {
-        this.currentMeta = upgradedMeta
+      const currentMeta = (await this.IDB.get(
+        this.metaName,
+        meta.id
+      )) as TaskMeta | null
+      if (!currentMeta || currentMeta.url !== meta.url) {
+        return null
+      }
+      summary =
+        currentMeta.stateSummary ||
+        this.summarizeStates(taskStates?.states ?? [])
+      if (!currentMeta.stateSummary) {
+        this.legacySummaryCache.set(meta.id, summary)
       }
     }
 
@@ -160,11 +170,29 @@ class Resume {
       })
     })
 
+    const restoreRetryEvt = [
+      EVT.list.stopCrawl,
+      EVT.list.crawlComplete,
+      EVT.list.downloadPause,
+      EVT.list.downloadStop,
+      EVT.list.downloadComplete,
+      EVT.list.bookmarkModeEnd,
+    ]
+    restoreRetryEvt.forEach((evt) => {
+      window.addEventListener(evt, () => {
+        window.setTimeout(() => {
+          if (this.restorePending && !states.busy) {
+            this.restoreData()
+          }
+        }, 0)
+      })
+    })
+
     // 抓取完成时，保存这次任务的数据
     const evs = [EVT.list.crawlComplete, EVT.list.resultChange]
     for (const ev of evs) {
       window.addEventListener(ev, async () => {
-        this.saveData(this.getURL())
+        this.saveData(store.URLWhenCrawlStart || this.getURL())
       })
     }
 
@@ -195,10 +223,12 @@ class Resume {
     const generation = ++this.restoreGeneration
     const restoreUrl = this.getURL()
 
-    // 如果下载器在抓取或者在下载，则不恢复数据
+    // 如果下载器在抓取或者在下载，则记住待恢复状态，在下一次 idle 事件后重试。
     if (states.busy) {
+      this.restorePending = true
       return
     }
+    this.restorePending = false
 
     // 1 获取任务的元数据
     const meta = (await this.IDB.get(
@@ -254,8 +284,9 @@ class Resume {
   private saveDataChain: Promise<void> = Promise.resolve()
 
   private saveData(url = this.getURL()) {
+    const generation = this.persistenceGeneration
     // 无论上一次保存成功还是失败，都把本次保存接到队列末尾顺序执行
-    const run = () => this.saveDataInner(url)
+    const run = () => this.saveDataInner(url, generation)
     const p = this.saveDataChain.then(run, run)
     this.saveDataChain = p.catch(() => {
       // 忽略单次保存失败，避免阻塞后续保存
@@ -263,7 +294,8 @@ class Resume {
     return p
   }
 
-  private async saveDataInner(url: string) {
+  private async saveDataInner(url: string, generation: number) {
+    if (generation !== this.persistenceGeneration) return
     // 首先检查这个网址下是否已经存在数据，如果有数据，则清除之前的数据，保持每个网址只有一份数据
     const taskData = (await this.IDB.get(
       this.metaName,
@@ -275,6 +307,7 @@ class Resume {
       await this.IDB.delete(this.metaName, taskData.id)
       await this.IDB.delete(this.statesName, taskData.id)
     }
+    if (generation !== this.persistenceGeneration) return
 
     // 保存本次任务的数据
     // 如果此时本次任务已经完成，就不进行保存了
@@ -287,7 +320,8 @@ class Resume {
 
     this.part = []
 
-    await this.saveTaskData()
+    await this.saveTaskData(generation)
+    if (generation !== this.persistenceGeneration) return
 
     // 保存 meta 数据
     const metaData = {
@@ -320,7 +354,10 @@ class Resume {
   }
 
   // 存储抓取结果
-  private async saveTaskData(): Promise<void> {
+  private async saveTaskData(
+    generation = this.persistenceGeneration
+  ): Promise<void> {
+    if (generation !== this.persistenceGeneration) return
     // 每一批任务的第一次执行会尝试保存所有剩余数据(0.5 的 0 次幂是 1)
     // 如果出错了，则每次执行会尝试保存上一次数据量的一半，直到这次存储成功
     // 之后继续进行下一批任务（如果有）
@@ -346,7 +383,7 @@ class Resume {
         return
       } else {
         // 任务数据没有添加完毕，继续添加
-        return this.saveTaskData()
+        return this.saveTaskData(generation)
       }
     } catch (error: Error | any) {
       // 当存储失败时
@@ -357,7 +394,7 @@ class Resume {
           // 体积超大
           // 尝试次数 + 1 ，进行下一次尝试
           this.try++
-          return this.saveTaskData()
+          return this.saveTaskData(generation)
         } else {
           // 未知错误，不再进行尝试
           this.try = 0
@@ -371,6 +408,9 @@ class Resume {
   // 定时 put 下载状态
   private async regularPutStates() {
     window.setInterval(() => {
+      if (this.restorePending && !states.busy) {
+        void this.restoreData()
+      }
       if (this.needPutStates) {
         const statesData = {
           id: this.taskId,
@@ -406,8 +446,11 @@ class Resume {
       return
     }
 
+    this.persistenceGeneration++
+    this.needPutStates = false
     this.IDB.delete(this.metaName, this.taskId)
     this.IDB.delete(this.statesName, this.taskId)
+    this.legacySummaryCache.delete(this.taskId)
     if (this.currentMeta?.id === this.taskId) this.currentMeta = null
 
     const dataIdList = this.createIdList(this.taskId, meta.part)
@@ -513,6 +556,13 @@ class Resume {
 
   // 清空已保存的抓取结果
   private async clearSavedCrawl() {
+    this.restoreGeneration++
+    this.persistenceGeneration++
+    this.restorePending = false
+    this.currentMeta = null
+    this.needPutStates = false
+    this.taskId = 0
+    this.legacySummaryCache.clear()
     await Promise.all([
       this.IDB.clear(this.metaName),
       this.IDB.clear(this.dataName),
