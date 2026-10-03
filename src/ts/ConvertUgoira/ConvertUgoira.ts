@@ -28,7 +28,7 @@ class ConvertUgoira {
   private webpActive = 0
   private readonly maxWebPCount = 1
 
-  /** WebP/GIF/APNG 都会让完整解码帧集与额外编码工作集同时驻留；共享重型槽避免跨作品峰值叠加。 */
+  /** WebM/WebP/GIF/APNG 都会让大型解码/编码帧集驻留；共享重型槽避免跨格式、跨作品峰值叠加。 */
   private heavyActive = 0
   private readonly maxHeavyCount = 1
 
@@ -133,7 +133,8 @@ class ConvertUgoira {
 
       const webpSlotAvailable =
         type !== 'webp' || this.webpActive < this.maxWebPCount
-      const heavy = type === 'webp' || type === 'gif' || type === 'png'
+      const heavy =
+        type === 'webm' || type === 'webp' || type === 'gif' || type === 'png'
       const heavySlotAvailable = !heavy || this.heavyActive < this.maxHeavyCount
 
       if (

@@ -20,6 +20,7 @@ function deferred() {
 function harness() {
   const events = new EventTarget()
   const calls = []
+  const webmCalls = []
   const gifCalls = []
   const apngCalls = []
   const browser = { runtime: { getManifest: () => ({ version: 'test' }) } }
@@ -43,6 +44,16 @@ function harness() {
     convert() {
       const job = deferred()
       calls.push(job)
+      return job.promise.then((value) => {
+        EVT.fire('convertSuccess')
+        return value
+      })
+    },
+  }
+  const toWebM = {
+    convert() {
+      const job = deferred()
+      webmCalls.push(job)
       return job.promise.then((value) => {
         EVT.fire('convertSuccess')
         return value
@@ -86,7 +97,7 @@ function harness() {
     './ToWebP': { toWebP },
     './ToGIF': { toGIF },
     './ToAPNG': { toAPNG },
-    './ToWebMUseWhammy': { toWebM: { convert: async () => new Blob() } },
+    './ToWebMUseWhammy': { toWebM },
     './APNGDiagnostics': {
       APNGDiagnostics: class {
         constructor() {
@@ -126,7 +137,7 @@ function harness() {
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })(moduleRequire, exports)
-  return { coordinator: exports.convertUgoira, calls, gifCalls, apngCalls }
+  return { coordinator: exports.convertUgoira, calls, webmCalls, gifCalls, apngCalls }
 }
 
 const info = {
@@ -170,6 +181,26 @@ test('failed WebP conversion releases the dedicated WebP slot', async () => {
   assert.equal(h.coordinator.webpActive, 0)
 })
 
+
+test('WebM and WebP share the same heavy conversion slot', async () => {
+  const h = harness()
+  const first = h.coordinator.webm(new Blob(['a']), structuredClone(info), 41)
+  const second = h.coordinator.webp(new Blob(['b']), structuredClone(info), 42)
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.webmCalls.length, 1)
+  assert.equal(h.calls.length, 0)
+  assert.equal(h.coordinator.heavyActive, 1)
+
+  h.webmCalls[0].resolve(new Blob(['webm']))
+  await first
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(h.calls.length, 1)
+
+  h.calls[0].resolve(new Blob(['webp']))
+  await second
+  assert.equal(h.coordinator.heavyActive, 0)
+})
 
 test('WebP and GIF share the same heavy conversion slot', async () => {
   const h = harness()

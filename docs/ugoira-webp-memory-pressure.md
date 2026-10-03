@@ -253,6 +253,21 @@ A follow-up browser smoke should measure:
 
 Synthetic large-frame tests are preferable to relying on a particular live work.
 
+## Production smoke findings after the initial WebP fix
+
+The streaming WebP protocol fixed the original whole-animation RGBA duplication pattern and produced fresh WebP outputs successfully in repeated production-like smokes. High-frequency instrumentation then exposed a broader admission-control problem.
+
+The smoke environment used the normal 12 GiB Chromium container with `memory.swap.max=0`, one-second cgroup sampling, structured conversion-stage telemetry, and an automatic 95% memory guardrail. With WebP limited to one slot and GIF/APNG sharing one heavy slot:
+
+- a 150-frame 1920x1080 WebP completed successfully without the original runaway allocation signature
+- a later run still reached 99.99% of the container limit during a single large APNG conversion
+- a fully autonomous run subsequently crossed the 95% guardrail while a 150-frame 1920x1080 WebM was still active and a 144-frame 1350x1080 WebP had just started
+- the guardrail paused the downloader without OOM-killing Chromium; no conversion-stage failure was reported before the pause
+
+This changes the containment conclusion. The remaining production risk is not specific to WebP or APNG: different full-frame conversion formats may overlap while decoded/cached frame sets from several works are still resident. A format-specific slot cannot express the actual renderer memory budget.
+
+As an immediate conservative containment, all WebM/WebP/GIF/APNG conversions now share one full-frame conversion slot. This intentionally trades throughput for a deterministic upper bound on cross-format overlap. A future byte-aware admission controller can recover safe concurrency once peak-memory accounting is understood well enough.
+
 ## Remaining risks and open questions
 
 ### Compressed-frame accumulation
@@ -271,11 +286,11 @@ Possible later approaches:
 - transfer bitmaps to a worker once no later format needs them
 - make the conversion pipeline own frame decoding instead of caching the whole work
 
-### GIF and APNG
+### Cross-format conversion overlap
 
-GIF and APNG also call `getImageData()` across full animations and can retain large raw-pixel sets. They did not cause this specific incident, but the same memory-budgeting principles should eventually cover them.
+GIF and APNG call `getImageData()` across full animations, WebM can own a complete decoded frame set while its worker encodes, and WebP still has a substantial decoded/encoded working set even after raw-frame streaming. Production smoke data showed that overlapping different formats can saturate the renderer without any individual encoder failing.
 
-APNG diagnostics are currently better than WebP diagnostics. The architectural memory fix should not be limited to WebP forever.
+The shared full-frame slot is therefore an intentional safety constraint, not just a WebP workaround. APNG diagnostics remain useful for distinguishing encoder-internal pressure from cross-format overlap.
 
 ### Retry amplification
 
