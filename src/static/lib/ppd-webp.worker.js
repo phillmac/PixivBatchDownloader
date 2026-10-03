@@ -161,6 +161,7 @@ function assembleAnimatedWebP(frames, loopCount) {
 
 // ─── Worker entry point ───────────────────────────────────────────────────────
 
+/** Current single animated-WebP worker job; null while the worker is idle. */
 var state = null
 
 /** Report a structured worker error while preserving the failing stage and frame index. */

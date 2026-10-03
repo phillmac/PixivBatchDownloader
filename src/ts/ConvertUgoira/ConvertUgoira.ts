@@ -26,10 +26,12 @@ class ConvertUgoira {
 
   /** WebP 会触碰完整 RGBA 帧数据；单独限制并发以避免多个大任务叠加峰值。 */
   private webpActive = 0
+  /** WebP-specific admission cap retained as an explicit safety invariant. */
   private readonly maxWebPCount = 1
 
   /** WebM/WebP/GIF/APNG 都会让大型解码/编码帧集驻留；共享重型槽避免跨格式、跨作品峰值叠加。 */
   private heavyActive = 0
+  /** Maximum number of full-frame Ugoira conversions admitted at once. */
   private readonly maxHeavyCount = 1
 
   /** 缓存每个作品的 ImageBitmap 列表，key 为作品 id */

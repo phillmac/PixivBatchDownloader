@@ -27,6 +27,7 @@ function compileVideo(encoder) {
   })
 }
 
+/** Active acknowledged-streaming WebM jobs, keyed by request id. */
 var jobs = new Map()
 
 /**

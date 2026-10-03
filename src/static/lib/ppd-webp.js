@@ -13,6 +13,7 @@
 
   /** Animated WebP encoder with one-frame-at-a-time worker backpressure. */
   var PPDWebP = {
+    /** Configure the worker script used for bounded animated WebP encoding. */
     init: function (workerUrl) {
       _workerUrl = workerUrl
     },
