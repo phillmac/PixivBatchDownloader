@@ -163,6 +163,7 @@ function assembleAnimatedWebP(frames, loopCount) {
 
 var state = null
 
+/** Report a structured worker error while preserving the failing stage and frame index. */
 function postError(stage, index, error) {
   self.postMessage({
     type: 'error',

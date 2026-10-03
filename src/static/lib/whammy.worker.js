@@ -1,5 +1,6 @@
 // whammy.js is prepended to this script before the worker is created.
 
+/** Convert encoded frame bytes to base64 without overflowing the argument stack. */
 function bytesToBase64(bytes) {
   var chunkSize = 0x8000
   var binary = ''
@@ -10,12 +11,14 @@ function bytesToBase64(bytes) {
   return btoa(binary)
 }
 
+/** Convert an encoded WebP frame blob into the data URL expected by Whammy. */
 function blobToDataURL(blob) {
   return blob.arrayBuffer().then(function (buffer) {
     return 'data:image/webp;base64,' + bytesToBase64(new Uint8Array(buffer))
   })
 }
 
+/** Compile the accumulated Whammy frames and resolve with the resulting WebM blob. */
 function compileVideo(encoder) {
   return new Promise(function (resolve) {
     encoder.compile(false, function (blob) {
@@ -26,6 +29,10 @@ function compileVideo(encoder) {
 
 var jobs = new Map()
 
+/**
+ * Encode one transferred bitmap into the active Whammy job.
+ * The worker owns the bitmap on entry and always closes it before returning.
+ */
 async function encodeFrame(job, bitmap, delay) {
   try {
     job.ctx.clearRect(0, 0, job.width, job.height)
@@ -41,6 +48,10 @@ async function encodeFrame(job, bitmap, delay) {
   }
 }
 
+/**
+ * Handle the acknowledged streaming protocol used by the page coordinator.
+ * Each frame is fully encoded and released before frame-complete is posted.
+ */
 async function handleStreaming(data) {
   if (typeof OffscreenCanvas === 'undefined') {
     throw new Error('Whammy worker requires OffscreenCanvas')
@@ -89,6 +100,10 @@ async function handleStreaming(data) {
   throw new Error('Unknown Whammy worker message type')
 }
 
+/**
+ * Handle the legacy whole-bitmap-list protocol for fallback callers.
+ * Every transferred bitmap is closed on both success and failure.
+ */
 async function handleLegacy(data) {
   var bitmaps = data.bitmaps
   var canvas = new OffscreenCanvas(data.width, data.height)

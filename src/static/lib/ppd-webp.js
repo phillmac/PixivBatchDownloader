@@ -3,6 +3,7 @@
 
   var _workerUrl = ''
 
+  /** Attach bounded encoder diagnostics to the error returned to the caller. */
   function makeError(message, cause, diagnostic) {
     var error = cause instanceof Error ? cause : new Error(message)
     if (!error.message) error.message = message
