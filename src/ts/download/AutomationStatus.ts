@@ -68,6 +68,7 @@ window.addEventListener(EVT.list.resume, () => {
 export async function getAutomationStatus() {
   const page = downloadDiagnostics.pageSnapshot()
   const controller = page.controller as Record<string, unknown>
+  const currentUrl = page.page.url.split('#')[0]
   const durable = await resume.getSavedTaskStatus()
   const resultLength = Number(controller.resultLength ?? 0)
   const busy = controller.busy === true
@@ -83,8 +84,8 @@ export async function getAutomationStatus() {
   else if (pause && durable) phase = 'PAUSED_RESUMABLE'
   else if (
     resultLength > 0 &&
-    (durable !== null || lifecycle.crawlCompleted?.url === page.page.url) &&
-    lifecycle.downloadCompleted?.url !== page.page.url
+    (durable !== null || lifecycle.crawlCompleted?.url === currentUrl) &&
+    lifecycle.downloadCompleted?.url !== currentUrl
   )
     phase = 'READY'
 
@@ -92,7 +93,7 @@ export async function getAutomationStatus() {
     schemaVersion: 1,
     capturedAt: new Date().toISOString(),
     phase,
-    page: page.page,
+    page: { ...page.page, url: currentUrl },
     controller,
     lifecycle: { ...lifecycle },
     durable,

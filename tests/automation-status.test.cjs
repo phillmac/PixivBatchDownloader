@@ -188,6 +188,24 @@ test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async 
   )
 })
 
+test('status normalizes URL hashes for lifecycle matching', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 2,
+    },
+    null
+  )
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1#works'
+  h.fire('crawlComplete')
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.phase, 'READY')
+  assert.equal(status.page.url, 'https://www.pixiv.net/en/users/1')
+})
+
 test('isolated world exposes read-only automation function', async () => {
   const h = harness(
     {
