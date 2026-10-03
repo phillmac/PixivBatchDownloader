@@ -7,11 +7,7 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function harness(
-  controller,
-  durable,
-  lifecycle = { crawlCompleteTime: 2, downloadCompleteTime: 1 }
-) {
+function harness(controller, durable) {
   const diagnostics = {
     pageSnapshot() {
       return {
@@ -25,7 +21,26 @@ function harness(
       return durable
     },
   }
-  const context = vm.createContext({ console, Date })
+  const listeners = new Map()
+  const EVT = {
+    list: {
+      crawlStart: 'crawlStart',
+      crawlComplete: 'crawlComplete',
+      crawlEmpty: 'crawlEmpty',
+      downloadStart: 'downloadStart',
+      downloadComplete: 'downloadComplete',
+      downloadPause: 'downloadPause',
+      resume: 'resume',
+    },
+  }
+  const window = {
+    addEventListener(name, callback) {
+      const callbacks = listeners.get(name) || []
+      callbacks.push(callback)
+      listeners.set(name, callbacks)
+    },
+  }
+  const context = vm.createContext({ console, Date, window })
   const file = path.join(root, 'src/ts/download/AutomationStatus.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: {
@@ -40,10 +55,16 @@ function harness(
     if (name === './DownloadDiagnostics')
       return { downloadDiagnostics: diagnostics }
     if (name === './Resume') return { resume }
-    if (name === '../store/States') return { states: lifecycle }
+    if (name === '../EVT') return { EVT }
     throw new Error(`unexpected require ${name}`)
   }, exports)
-  return { exports, context }
+  return {
+    exports,
+    context,
+    fire(name) {
+      for (const callback of listeners.get(name) || []) callback()
+    },
+  }
 }
 
 test('durable task with unloaded live results reports RESTORING', async () => {
@@ -113,6 +134,8 @@ test('ready results and empty controller report READY and IDLE', async () => {
     },
     null
   )
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'IDLE')
+  h.fire('crawlComplete')
   assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
   h = harness(
     {
@@ -133,9 +156,10 @@ test('ready results and empty controller report READY and IDLE', async () => {
       stop: false,
       resultLength: 3,
     },
-    null,
-    { crawlCompleteTime: 2, downloadCompleteTime: 3 }
+    null
   )
+  h.fire('crawlComplete')
+  h.fire('downloadComplete')
   assert.equal((await h.exports.getAutomationStatus()).phase, 'IDLE')
 })
 
