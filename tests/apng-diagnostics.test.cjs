@@ -195,6 +195,28 @@ test('APNG releases each decoded bitmap after copying its pixels', async () => {
   assert.equal((await result).size, 8)
 })
 
+test('APNG releases decoded bitmaps when worker setup fails', async () => {
+  const h = harness()
+  h.resourceStatus = 404
+  let closed = 0
+  const owned = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  const localInfo = {
+    mime_type: 'image/jpeg',
+    frames: [
+      { file: '000000.jpg', delay: 80 },
+      { file: '000001.jpg', delay: 80 },
+    ],
+  }
+  await assert.rejects(
+    h.converter.convert(owned, localInfo, h.diagnostic()),
+    /HTTP 404/
+  )
+  assert.equal(closed, 2)
+})
+
 test('APNG releases untouched bitmaps when pixel extraction fails', async () => {
   const h = harness()
   let closed = 0

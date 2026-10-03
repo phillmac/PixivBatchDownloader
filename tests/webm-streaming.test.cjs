@@ -7,14 +7,24 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function harness({ failFrame = null } = {}) {
+function harness({ failFrame = null, stallFrameOnce = null, fastTimeout = false } = {}) {
   const messages = []
   const events = []
   let outstanding = 0
   let maxOutstanding = 0
   let decoded = 0
+  let stalled = false
+  let createdWorkers = 0
+  let terminatedWorkers = 0
 
   class FakeWorker extends EventTarget {
+    constructor() {
+      super()
+      createdWorkers++
+    }
+    terminate() {
+      terminatedWorkers++
+    }
     postMessage(message) {
       messages.push({ type: message.type, index: message.index, delay: message.delay })
       queueMicrotask(() => {
@@ -26,6 +36,10 @@ function harness({ failFrame = null } = {}) {
         }
         if (message.type === 'frame') {
           message.bitmap.close()
+          if (message.index === stallFrameOnce && !stalled) {
+            stalled = true
+            return
+          }
           if (message.index === failFrame) {
             this.dispatchEvent(new MessageEvent('message', {
               data: { id: message.id, type: 'error', error: 'frame failed' },
@@ -84,7 +98,7 @@ function harness({ failFrame = null } = {}) {
     URL: { createObjectURL: () => 'blob:worker', revokeObjectURL() {} },
     fetch: async () => ({ text: async () => '' }),
     window: {
-      setTimeout,
+      setTimeout: fastTimeout ? (fn) => setTimeout(fn, 0) : setTimeout,
       clearTimeout,
     },
   })
@@ -119,6 +133,8 @@ function harness({ failFrame = null } = {}) {
     getDecoded: () => decoded,
     getOutstanding: () => outstanding,
     getMaxOutstanding: () => maxOutstanding,
+    getCreatedWorkers: () => createdWorkers,
+    getTerminatedWorkers: () => terminatedWorkers,
   }
 }
 
@@ -170,4 +186,47 @@ test('WebM streaming cancels the worker job after a frame failure', async () => 
     ['start', 'frame', 'frame', 'cancel']
   )
   assert.deepEqual(h.events, [])
+})
+
+
+test('WebM rejects inconsistent ZIP and metadata frame counts', async () => {
+  const h = harness()
+  await assert.rejects(
+    h.toWebM.convertFromZip(
+      new Blob(['fake-zip']),
+      { frames: [{ delay: 80 }, { delay: 90 }] }
+    ),
+    /metadata count mismatch/
+  )
+  assert.equal(h.getDecoded(), 0)
+  assert.deepEqual(h.messages, [])
+})
+
+test('WebM rejects a missing frame delay instead of substituting zero', async () => {
+  const h = harness()
+  await assert.rejects(
+    h.toWebM.convertFromZip(
+      new Blob(['fake-zip']),
+      { frames: [{ delay: 80 }, {}, { delay: 100 }] }
+    ),
+    /Invalid WebM frame delay at index 1/
+  )
+  assert.equal(h.getDecoded(), 0)
+  assert.deepEqual(h.messages, [])
+})
+
+test('WebM timeout terminates the in-flight worker before retry', async () => {
+  const h = harness({ stallFrameOnce: 1, fastTimeout: true })
+  const info = { frames: [{ delay: 80 }, { delay: 90 }, { delay: 100 }] }
+  await assert.rejects(
+    h.toWebM.convertFromZip(new Blob(['fake-zip']), info),
+    /inactivity timeout/
+  )
+  assert.equal(h.getTerminatedWorkers(), 1)
+  assert.equal(h.getOutstanding(), 0)
+
+  const retry = await h.toWebM.convertFromZip(new Blob(['fake-zip']), info)
+  assert.equal(retry.size, 4)
+  assert.equal(h.getCreatedWorkers(), 2)
+  assert.equal(h.getOutstanding(), 0)
 })

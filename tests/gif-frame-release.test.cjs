@@ -7,11 +7,12 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function loadGIFHarness() {
+function loadGIFHarness({ constructorError = null } = {}) {
   const added = []
   const events = []
   class FakeGIF {
     constructor() {
+      if (constructorError) throw constructorError
       this.handlers = new Map()
     }
     on(name, fn) {
@@ -83,4 +84,22 @@ test('GIF releases each decoded bitmap after copying its pixels', async () => {
   assert.equal(h.added.length, 2)
   assert.deepEqual(h.added.map((x) => x.options.delay), [80, 90])
   assert.deepEqual(h.events, ['convertSuccess'])
+})
+
+
+test('GIF releases decoded bitmaps when setup fails before frame copying', async () => {
+  const h = loadGIFHarness({ constructorError: new Error('gif setup failed') })
+  let closed = 0
+  const bitmaps = [
+    { width: 2, height: 3, close() { closed++ } },
+    { width: 2, height: 3, close() { closed++ } },
+  ]
+  const info = {
+    frames: [
+      { file: '000000.jpg', delay: 80 },
+      { file: '000001.jpg', delay: 90 },
+    ],
+  }
+  await assert.rejects(h.toGIF.convert(bitmaps, info, 1024), /gif setup failed/)
+  assert.equal(closed, 2)
 })

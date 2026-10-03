@@ -37,6 +37,22 @@ class ToWebM {
     }
   }
 
+  /**
+   * Terminate a failed worker and prepare a fresh instance for the next job.
+   * The identity guard prevents an old timeout from replacing a newer worker.
+   */
+  private resetWorker(failedWorker: Worker): void {
+    if (this.worker !== failedWorker) return
+    failedWorker.terminate()
+    this.workerReady = this.loadWorkerJS()
+  }
+
+  /**
+   * Stream a ZIP-backed Ugoira to the WebM worker one decoded bitmap at a time.
+   * Each bitmap is transferred to the worker and acknowledged before the next
+   * frame is decoded, so ownership never spans a complete decoded frame set.
+   * Rejects inconsistent frame metadata rather than inventing frame timing.
+   */
   public async convertFromZip(
     file: Blob,
     info: UgoiraInfo,
@@ -62,11 +78,23 @@ class ToWebM {
     }
 
     await this.workerReady
+    const worker = this.worker
     const zipFileBuffer = await file.arrayBuffer()
     const indexList = Tools.getJPGContentIndex(zipFileBuffer)
     if (indexList.length === 0) {
       throw new Error('No Ugoira frames found for WebM conversion')
     }
+    if (info.frames.length !== indexList.length) {
+      throw new Error(
+        `WebM frame metadata count mismatch: ZIP has ${indexList.length} frames, metadata has ${info.frames.length}`
+      )
+    }
+    const frameDelays = info.frames.map((frame, index) => {
+      if (!Number.isFinite(frame.delay)) {
+        throw new Error(`Invalid WebM frame delay at index ${index}`)
+      }
+      return frame.delay
+    })
 
     const id = Date.now() + Math.random()
     let firstBitmap: ImageBitmap | null = await createImageBitmap(
@@ -85,6 +113,7 @@ class ToWebM {
 
     try {
       await this.postAndWait(
+        worker,
         id,
         {
           type: 'start',
@@ -109,12 +138,13 @@ class ToWebM {
           firstBitmap = null
         }
         await this.postAndWait(
+          worker,
           id,
           {
             type: 'frame',
             index,
             bitmap,
-            delay: info.frames[index]?.delay ?? 0,
+            delay: frameDelays[index],
           },
           [bitmap],
           'frame-complete'
@@ -122,6 +152,7 @@ class ToWebM {
       }
 
       const response = await this.postAndWait(
+        worker,
         id,
         { type: 'finish' },
         [],
@@ -134,9 +165,9 @@ class ToWebM {
       EVT.fire('convertSuccess')
       return response.result
     } catch (error) {
-      if (workerJobStarted) {
+      if (workerJobStarted && this.worker === worker) {
         try {
-          this.worker.postMessage({ id, type: 'cancel' })
+          worker.postMessage({ id, type: 'cancel' })
         } catch {}
       }
       throw error
@@ -191,7 +222,13 @@ class ToWebM {
     })
   }
 
+  /**
+   * Send one streaming-protocol message and wait for its acknowledgement.
+   * The worker is captured per request so an inactivity timeout can terminate
+   * that exact instance before the shared heavy-conversion slot is released.
+   */
   private postAndWait(
+    worker: Worker,
     id: number,
     message: Record<string, unknown>,
     transfer: Transferable[],
@@ -200,11 +237,16 @@ class ToWebM {
     return new Promise((resolve, reject) => {
       const timeoutId = window.setTimeout(() => {
         cleanup()
-        reject(new Error(`Whammy worker inactivity timeout waiting for ${expectedType}`))
+        this.resetWorker(worker)
+        reject(
+          new Error(
+            `Whammy worker inactivity timeout waiting for ${expectedType}`
+          )
+        )
       }, 120000)
       const cleanup = () => {
         window.clearTimeout(timeoutId)
-        this.worker.removeEventListener('message', handler)
+        worker.removeEventListener('message', handler)
       }
       const handler = (ev: MessageEvent) => {
         if (!ev.data || ev.data.id !== id) return
@@ -217,9 +259,9 @@ class ToWebM {
         cleanup()
         resolve(ev.data)
       }
-      this.worker.addEventListener('message', handler)
+      worker.addEventListener('message', handler)
       try {
-        this.worker.postMessage({ id, ...message }, transfer)
+        worker.postMessage({ id, ...message }, transfer)
       } catch (error) {
         cleanup()
         reject(error)
