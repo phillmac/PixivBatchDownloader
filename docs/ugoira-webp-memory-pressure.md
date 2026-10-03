@@ -276,6 +276,10 @@ A further smoke then crossed the 95% guardrail during the next 1920x1080 WebP be
 
 The conservative production path therefore no longer retains decoded Ugoira frames across formats at all. Every completed conversion immediately closes/deletes its bitmap cache; the next format for that work re-decodes from the source ZIP. The download loop processes a work's formats sequentially, so this changes throughput rather than output ordering or correctness. It also makes the heavy-slot memory invariant much easier to reason about: one encoder plus one work's decoded frame set, rather than one encoder plus an unbounded tail of recently completed caches.
 
+That change allowed the 150-frame 1920x1080 WebP to complete below the guardrail, but the following WebM still reached 95.28% with no other heavy conversion active. The remaining WebM peak came from `Tools.extractImage()` decoding the entire animation with `Promise.all()` before transferring the complete `ImageBitmap[]` to the Whammy worker. Serialization cannot bound that single-job decoded-frame set.
+
+WebM therefore now uses the same backpressure principle as WebP, but one step earlier in the pipeline: the source ZIP is indexed once, one JPEG frame is sliced and decoded to an `ImageBitmap`, that bitmap is transferred to the Whammy worker, and the next frame is not decoded until the worker acknowledges `frame-complete`. The worker keeps only its compressed WebP frame representation inside Whammy, closes each transferred bitmap after encoding, and compiles the WebM only after an explicit `finish` message. Cancellation and inactivity timeout paths clean up the worker job. The legacy whole-list path remains only as the Worker/OffscreenCanvas fallback.
+
 ## Remaining risks and open questions
 
 ### Compressed-frame accumulation

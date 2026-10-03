@@ -60,6 +60,15 @@ function harness() {
         return value
       })
     },
+    convertFromZip(_file, _info, onStart) {
+      onStart?.({ frameCount: 1, width: 2, height: 2, inputRGBABytes: 16 })
+      const job = deferred()
+      webmCalls.push(job)
+      return job.promise.then((value) => {
+        EVT.fire('convertSuccess')
+        return value
+      })
+    },
   }
   const toGIF = {
     convert() {
@@ -118,6 +127,8 @@ function harness() {
     Blob,
     console,
     performance: { now: () => Date.now() },
+    Worker: class {},
+    OffscreenCanvas: class {},
     window: {
       addEventListener: events.addEventListener.bind(events),
       clearTimeout() {},
@@ -193,7 +204,7 @@ test('failed WebP conversion releases the dedicated WebP slot', async () => {
 })
 
 
-test('completed WebP is released before WebM re-decodes the same work', async () => {
+test('completed WebP releases cache before GIF re-decodes the same work', async () => {
   const h = harness()
   const webp = h.coordinator.webp(new Blob(['a']), structuredClone(info), 61)
 
@@ -202,11 +213,11 @@ test('completed WebP is released before WebM re-decodes the same work', async ()
   h.calls[0].resolve(new Blob(['webp']))
   await webp
 
-  const webm = h.coordinator.webm(new Blob(['a']), structuredClone(info), 61)
+  const gif = h.coordinator.gif(new Blob(['a']), structuredClone(info), 61)
   await new Promise((resolve) => setTimeout(resolve, 15))
   assert.equal(h.getExtractCalls(), 2)
-  h.webmCalls[0].resolve(new Blob(['webm']))
-  await webm
+  h.gifCalls[0].resolve(new Blob(['gif']))
+  await gif
 })
 
 test('WebM and WebP share the same heavy conversion slot', async () => {

@@ -152,20 +152,44 @@ class ConvertUgoira {
             diagnostic.details.activeConversions = this._count
             diagnostic.details.cachedWorks = this.imageBitmapCache.size
           }
-          const imageBitmapList = await this.getImageBitmapList(
-            file,
-            id,
-            diagnostic
-          )
 
-          // WebM worker 会转移 ImageBitmap 的所有权，不能缓存失效对象。
+          const format = type === 'png' ? 'apng' : type
+          const startedAt = performance.now()
+
+          // Worker-capable WebM decodes one ZIP frame at a time and waits for
+          // acknowledgement before decoding the next. Do not materialize a full
+          // ImageBitmap[] in the page renderer for this path.
           if (
             type === 'webm' &&
             typeof Worker !== 'undefined' &&
             typeof OffscreenCanvas !== 'undefined'
           ) {
-            this.imageBitmapCache.delete(id)
+            const result = await toWebM.convertFromZip(file, info, (details) => {
+              console.info('[PPD ugoira conversion stage]', {
+                phase: 'start',
+                artworkId: id,
+                format,
+                ...details,
+                activeConversions: this._count,
+                webpActive: this.webpActive,
+                heavyActive: this.heavyActive,
+              })
+            })
+            console.info('[PPD ugoira conversion stage]', {
+              phase: 'success',
+              artworkId: id,
+              format,
+              durationMs: Math.round(performance.now() - startedAt),
+              outputBytes: result.size,
+            })
+            return result
           }
+
+          const imageBitmapList = await this.getImageBitmapList(
+            file,
+            id,
+            diagnostic
+          )
 
           // GIF/APNG 会把每帧复制成完整 RGBA 数据。让这些格式取得 bitmap
           // 的所有权并逐帧 close，避免完整 decoded bitmap 集和完整 RGBA 集
@@ -174,9 +198,7 @@ class ConvertUgoira {
             this.imageBitmapCache.delete(id)
           }
 
-          const format = type === 'png' ? 'apng' : type
           const firstFrame = imageBitmapList[0]
-          const startedAt = performance.now()
           console.info('[PPD ugoira conversion stage]', {
             phase: 'start',
             artworkId: id,

@@ -24,45 +24,111 @@ function compileVideo(encoder) {
   })
 }
 
-onmessage = async function (ev) {
-  var data = ev.data
-  var bitmaps = data.bitmaps
+var jobs = new Map()
 
+async function encodeFrame(job, bitmap, delay) {
   try {
-    if (typeof OffscreenCanvas === 'undefined') {
-      throw new Error('Whammy worker requires OffscreenCanvas')
-    }
-
-    var canvas = new OffscreenCanvas(data.width, data.height)
-    var ctx = canvas.getContext('2d')
-    var encoder = new Whammy.Video()
-
-    for (var i = 0; i < bitmaps.length; i++) {
-      ctx.clearRect(0, 0, data.width, data.height)
-      ctx.drawImage(bitmaps[i], 0, 0)
-
-      var blob = await canvas.convertToBlob({
-        type: 'image/webp',
-        quality: data.quality,
-      })
-      var dataURL = await blobToDataURL(blob)
-      encoder.add(dataURL, data.delays[i])
-    }
-
-    var webm = await compileVideo(encoder)
-    self.postMessage({ id: data.id, result: webm })
-  } catch (error) {
-    self.postMessage({
-      id: data.id,
-      error: error && error.message ? error.message : String(error),
+    job.ctx.clearRect(0, 0, job.width, job.height)
+    job.ctx.drawImage(bitmap, 0, 0)
+    var blob = await job.canvas.convertToBlob({
+      type: 'image/webp',
+      quality: job.quality,
     })
+    var dataURL = await blobToDataURL(blob)
+    job.encoder.add(dataURL, delay)
+  } finally {
+    if (bitmap && bitmap.close) bitmap.close()
+  }
+}
+
+async function handleStreaming(data) {
+  if (typeof OffscreenCanvas === 'undefined') {
+    throw new Error('Whammy worker requires OffscreenCanvas')
+  }
+  if (data.type === 'start') {
+    var canvas = new OffscreenCanvas(data.width, data.height)
+    jobs.set(data.id, {
+      canvas: canvas,
+      ctx: canvas.getContext('2d'),
+      encoder: new Whammy.Video(),
+      width: data.width,
+      height: data.height,
+      quality: data.quality,
+      nextIndex: 0,
+    })
+    self.postMessage({ id: data.id, type: 'ready' })
+    return
+  }
+
+  if (data.type === 'cancel') {
+    jobs.delete(data.id)
+    self.postMessage({ id: data.id, type: 'cancelled' })
+    return
+  }
+
+  var job = jobs.get(data.id)
+  if (!job) throw new Error('Unknown Whammy streaming job')
+
+  if (data.type === 'frame') {
+    if (data.index !== job.nextIndex) {
+      throw new Error('Unexpected Whammy frame index')
+    }
+    await encodeFrame(job, data.bitmap, data.delay)
+    job.nextIndex++
+    self.postMessage({ id: data.id, type: 'frame-complete', index: data.index })
+    return
+  }
+
+  if (data.type === 'finish') {
+    var result = await compileVideo(job.encoder)
+    jobs.delete(data.id)
+    self.postMessage({ id: data.id, type: 'result', result: result })
+    return
+  }
+
+  throw new Error('Unknown Whammy worker message type')
+}
+
+async function handleLegacy(data) {
+  var bitmaps = data.bitmaps
+  var canvas = new OffscreenCanvas(data.width, data.height)
+  var job = {
+    canvas: canvas,
+    ctx: canvas.getContext('2d'),
+    encoder: new Whammy.Video(),
+    width: data.width,
+    height: data.height,
+    quality: data.quality,
+  }
+  try {
+    for (var i = 0; i < bitmaps.length; i++) {
+      await encodeFrame(job, bitmaps[i], data.delays[i])
+    }
+    var webm = await compileVideo(job.encoder)
+    self.postMessage({ id: data.id, result: webm })
   } finally {
     if (bitmaps && bitmaps.length) {
       bitmaps.forEach(function (bitmap) {
-        if (bitmap && bitmap.close) {
-          bitmap.close()
-        }
+        if (bitmap && bitmap.close) bitmap.close()
       })
     }
+  }
+}
+
+onmessage = async function (ev) {
+  var data = ev.data
+  try {
+    if (data.type) {
+      await handleStreaming(data)
+    } else {
+      await handleLegacy(data)
+    }
+  } catch (error) {
+    jobs.delete(data.id)
+    self.postMessage({
+      id: data.id,
+      type: data.type ? 'error' : undefined,
+      error: error && error.message ? error.message : String(error),
+    })
   }
 }

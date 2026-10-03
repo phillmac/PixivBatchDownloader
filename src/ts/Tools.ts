@@ -1054,6 +1054,23 @@ class Tools {
     return new Blob([zipFile.slice(start, end)], { type: 'image/jpeg' })
   }
 
+  /** 从 Ugoira ZIP 的索引中提取一帧 JPEG Blob。 */
+  static extractImageFrameBlob(
+    zipFile: ArrayBuffer,
+    indexList: number[],
+    frameIndex: number
+  ): Blob {
+    const start = indexList[frameIndex]
+    if (start === undefined) {
+      throw new Error(`Ugoira frame index out of range: ${frameIndex}`)
+    }
+    let end = indexList[frameIndex + 1] - 30 - 10
+    if (frameIndex === indexList.length - 1) {
+      end = zipFile.byteLength
+    }
+    return new Blob([zipFile.slice(start, end)], { type: 'image/jpeg' })
+  }
+
   /**从 zip 压缩包里提取出图像数据 */
   static async extractImage(
     zipFile: ArrayBuffer,
@@ -1073,23 +1090,8 @@ class Tools {
     target: 'img' | 'ImageBitmap'
   ) {
     const promises = indexList.map((index, i) => {
-      // 起始位置
-      const start = index
-      // 截止下一个文件名之前
-      // 删除不需要的数据：
-      // 30 字节的是 zip 文件添加的数据，虽然没有实际影响，但还是去掉
-      // 10 字节的是下一个 jpg 的文件名
-      let end = indexList[i + 1] - 30 - 10
-      if (i === indexList.length - 1) {
-        // 如果是最后一个 jpg 文件，则截止到 zip 文件的结尾
-        // 这导致它会包含 zip 的目录数据，但是不会影响图片的显示
-        end = zipFile.byteLength
-      }
-
       // 动图 zip 文件里的图片都是 jpg 格式。在用户投稿动图时，不管上传的图片是 jpg 还是 png，都会被 Pixiv 转换，生成新的 jpg 图片保存到 zip 文件里。只不过 Pixiv 转换图片时压缩等级比较高，所以有时候转换后的 jpg 图片体积比原图还大。
-      const blob = new Blob([zipFile.slice(start, end)], {
-        type: 'image/jpeg',
-      })
+      const blob = Tools.extractImageFrameBlob(zipFile, indexList, i)
       if (target === 'ImageBitmap') {
         return createImageBitmap(blob) as Promise<
           ImageBitmap | HTMLImageElement

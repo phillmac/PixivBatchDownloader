@@ -1,6 +1,7 @@
 import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
 import { UgoiraInfo } from '../crawl/CrawlResult'
+import { Tools } from '../Tools'
 
 declare const Whammy: any
 // https://github.com/antimatter15/whammy
@@ -33,6 +34,114 @@ class ToWebM {
     URL.revokeObjectURL(url)
     this.worker.onerror = (ev) => {
       console.error('Whammy worker error:', ev)
+    }
+  }
+
+  public async convertFromZip(
+    file: Blob,
+    info: UgoiraInfo,
+    onStart?: (details: {
+      frameCount: number
+      width: number
+      height: number
+      inputRGBABytes: number
+    }) => void
+  ): Promise<Blob> {
+    if (
+      typeof Worker === 'undefined' ||
+      typeof OffscreenCanvas === 'undefined'
+    ) {
+      const zipFileBuffer = await file.arrayBuffer()
+      const indexList = Tools.getJPGContentIndex(zipFileBuffer)
+      const imageBitmapList = await Tools.extractImage(
+        zipFileBuffer,
+        indexList,
+        'ImageBitmap'
+      )
+      return this.convert(imageBitmapList, info)
+    }
+
+    await this.workerReady
+    const zipFileBuffer = await file.arrayBuffer()
+    const indexList = Tools.getJPGContentIndex(zipFileBuffer)
+    if (indexList.length === 0) {
+      throw new Error('No Ugoira frames found for WebM conversion')
+    }
+
+    const id = Date.now() + Math.random()
+    let firstBitmap: ImageBitmap | null = await createImageBitmap(
+      Tools.extractImageFrameBlob(zipFileBuffer, indexList, 0)
+    )
+    const width = firstBitmap.width
+    const height = firstBitmap.height
+    let workerJobStarted = false
+
+    onStart?.({
+      frameCount: indexList.length,
+      width,
+      height,
+      inputRGBABytes: width * height * 4 * indexList.length,
+    })
+
+    try {
+      await this.postAndWait(
+        id,
+        {
+          type: 'start',
+          frameCount: indexList.length,
+          width,
+          height,
+          quality: 0.9,
+        },
+        [],
+        'ready'
+      )
+      workerJobStarted = true
+
+      for (let index = 0; index < indexList.length; index++) {
+        const bitmap =
+          index === 0
+            ? firstBitmap!
+            : await createImageBitmap(
+                Tools.extractImageFrameBlob(zipFileBuffer, indexList, index)
+              )
+        if (index === 0) {
+          firstBitmap = null
+        }
+        await this.postAndWait(
+          id,
+          {
+            type: 'frame',
+            index,
+            bitmap,
+            delay: info.frames[index]?.delay ?? 0,
+          },
+          [bitmap],
+          'frame-complete'
+        )
+      }
+
+      const response = await this.postAndWait(
+        id,
+        { type: 'finish' },
+        [],
+        'result'
+      )
+      workerJobStarted = false
+      if (!response.result || typeof response.result.size !== 'number') {
+        throw new Error('Invalid Whammy worker response')
+      }
+      EVT.fire('convertSuccess')
+      return response.result
+    } catch (error) {
+      if (workerJobStarted) {
+        try {
+          this.worker.postMessage({ id, type: 'cancel' })
+        } catch {}
+      }
+      throw error
+    } finally {
+      firstBitmap?.close()
     }
   }
 
@@ -79,6 +188,42 @@ class ToWebM {
       encoder.compile(false, (video: Blob) => {
         resolve(video)
       })
+    })
+  }
+
+  private postAndWait(
+    id: number,
+    message: Record<string, unknown>,
+    transfer: Transferable[],
+    expectedType: 'ready' | 'frame-complete' | 'result'
+  ): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        cleanup()
+        reject(new Error(`Whammy worker inactivity timeout waiting for ${expectedType}`))
+      }, 120000)
+      const cleanup = () => {
+        window.clearTimeout(timeoutId)
+        this.worker.removeEventListener('message', handler)
+      }
+      const handler = (ev: MessageEvent) => {
+        if (!ev.data || ev.data.id !== id) return
+        if (ev.data.type === 'error') {
+          cleanup()
+          reject(new Error(ev.data.error || 'Whammy worker error'))
+          return
+        }
+        if (ev.data.type !== expectedType) return
+        cleanup()
+        resolve(ev.data)
+      }
+      this.worker.addEventListener('message', handler)
+      try {
+        this.worker.postMessage({ id, ...message }, transfer)
+      } catch (error) {
+        cleanup()
+        reject(error)
+      }
     })
   }
 
