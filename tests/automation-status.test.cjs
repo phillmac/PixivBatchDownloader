@@ -393,6 +393,8 @@ function createResumeHarness(options = {}) {
   const fired = []
   const getCalls = []
   const putCalls = []
+  const putManyCalls = []
+  const intervalCallbacks = []
   const metaByUrl = new Map(Object.entries(options.metaByUrl || {}))
   const dataById = new Map(
     Object.entries(options.dataById || {}).map(([k, v]) => [Number(k), v])
@@ -422,9 +424,29 @@ function createResumeHarness(options = {}) {
     async put(storeName, value) {
       putCalls.push([storeName, value])
       if (storeName === 'taskMeta') metaByUrl.set(value.url, value)
+      if (storeName === 'taskStates') statesById.set(value.id, value)
+      if (storeName === 'taskData') dataById.set(value.id, value)
     }
-    async add() {}
-    async delete() {}
+    async putMany(entries) {
+      putManyCalls.push(entries)
+      for (const { storeName, data } of entries) {
+        await this.put(storeName, data)
+      }
+    }
+    async add(storeName, value) {
+      if (storeName === 'taskMeta') metaByUrl.set(value.url, value)
+      if (storeName === 'taskStates') statesById.set(value.id, value)
+      if (storeName === 'taskData') dataById.set(value.id, value)
+    }
+    async delete(storeName, key) {
+      if (storeName === 'taskMeta') {
+        for (const [url, value] of metaByUrl) {
+          if (value.id === key) metaByUrl.delete(url)
+        }
+      }
+      if (storeName === 'taskStates') statesById.delete(key)
+      if (storeName === 'taskData') dataById.delete(key)
+    }
     async clear(storeName) {
       if (storeName === 'taskMeta') metaByUrl.clear()
       if (storeName === 'taskStates') statesById.clear()
@@ -459,8 +481,9 @@ function createResumeHarness(options = {}) {
       callbacks.push(callback)
       listeners.set(name, callbacks)
     },
-    setInterval() {
-      return 1
+    setInterval(callback) {
+      intervalCallbacks.push(callback)
+      return intervalCallbacks.length
     },
     setTimeout(callback) {
       callback()
@@ -490,14 +513,14 @@ function createResumeHarness(options = {}) {
       this.states = value
     },
     downloadedCount() {
-      return 0
+      return this.states.filter((value) => value === 1).length
     },
     summary() {
       return {
         total: this.states.length,
-        pending: this.states.length,
-        inProgress: 0,
-        completed: 0,
+        pending: this.states.filter((value) => value === -1).length,
+        inProgress: this.states.filter((value) => value === 0).length,
+        completed: this.states.filter((value) => value === 1).length,
       }
     },
   }
@@ -535,6 +558,11 @@ function createResumeHarness(options = {}) {
     fired,
     getCalls,
     putCalls,
+    putManyCalls,
+    intervalCallbacks,
+    metaByUrl,
+    dataById,
+    statesById,
     fire(name) {
       for (const callback of listeners.get(name) || []) callback()
     },
@@ -848,4 +876,159 @@ test('busy page-switch restore retries on the next idle event', async () => {
   assert.equal(h.store.result.length, 1)
   assert.equal(h.store.result[0].id, 'restored')
   assert.equal(h.fired.includes('resume'), true)
+})
+
+test('crawl completion stays attributed to the original task URL across SPA navigation', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 2,
+    },
+    null
+  )
+  const original = h.context.window.location.href
+  h.fire('crawlStart')
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/2'
+  h.fire('crawlComplete')
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.phase, 'IDLE')
+  assert.equal(status.lifecycle.crawlCompleted.url, original)
+})
+
+test('Resume keeps retry pending when page becomes busy during async restore', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  let resolveChunk
+  const chunk = new Promise((resolve) => {
+    resolveChunk = resolve
+  })
+  const h = createResumeHarness({
+    url,
+    initialResults: [{ id: 'old' }],
+    metaByUrl: {
+      [url]: {
+        id: 501,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
+        date: new Date('2026-10-03T00:00:00Z'),
+        stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
+      },
+    },
+    dataById: { 5010: () => chunk },
+    statesById: { 501: { id: 501, states: [-1] } },
+  })
+  await h.resume.ready
+  const first = h.resume.restoreData()
+  await new Promise((resolve) => setImmediate(resolve))
+  h.states.busy = true
+  resolveChunk({ id: 5010, data: [{ id: 'restored' }] })
+  await first
+  assert.equal(h.resume.restorePending, true)
+  assert.equal(h.fired.includes('resume'), false)
+  h.states.busy = false
+  h.fire('downloadPause')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.store.result[0].id, 'restored')
+  assert.equal(h.fired.includes('resume'), true)
+})
+
+test('Resume persistence normalizes fragment-bearing task URLs', async () => {
+  const url = 'https://www.pixiv.net/en/users/9'
+  const h = createResumeHarness({
+    url: `${url}#works`,
+    initialResults: [{ id: 'a' }],
+  })
+  await h.resume.ready
+  h.store.URLWhenCrawlStart = `${url}#works`
+  h.store.crawlCompleteTime = new Date('2026-10-03T01:02:03Z')
+  h.downloadStates.states = [-1]
+  await h.resume.saveData(`${url}#works`)
+  const meta = h.metaByUrl.get(url)
+  assert.ok(meta)
+  assert.equal(meta.url, url)
+  assert.equal(meta.URLWhenCrawlStart, url)
+  assert.equal(h.metaByUrl.has(`${url}#works`), false)
+})
+
+test('queued Resume save persists an immutable queue snapshot', async () => {
+  const urlA = 'https://www.pixiv.net/en/users/1'
+  const urlB = 'https://www.pixiv.net/en/users/2'
+  const h = createResumeHarness({ url: urlA, initialResults: [{ id: 'A' }] })
+  await h.resume.ready
+  h.store.URLWhenCrawlStart = urlA
+  h.store.crawlCompleteTime = new Date('2026-10-03T01:00:00Z')
+  h.downloadStates.states = [-1]
+  let release
+  h.resume.saveDataChain = new Promise((resolve) => {
+    release = resolve
+  })
+  const pending = h.resume.saveData(urlA)
+
+  h.window.location.href = urlB
+  h.store.URLWhenCrawlStart = urlB
+  h.store.result = [{ id: 'B1' }, { id: 'B2' }]
+  h.store.crawlCompleteTime = new Date('2026-10-03T02:00:00Z')
+  h.downloadStates.states = [1, 1]
+  release()
+  await pending
+
+  const meta = h.metaByUrl.get(urlA)
+  assert.ok(meta)
+  assert.equal(meta.URLWhenCrawlStart, urlA)
+  assert.equal(new Date(meta.date).toISOString(), '2026-10-03T01:00:00.000Z')
+  assert.deepEqual(
+    { ...meta.stateSummary },
+    {
+      total: 1,
+      pending: 1,
+      inProgress: 0,
+      completed: 0,
+    }
+  )
+  const data = h.dataById.get(Number(`${meta.id}0`))
+  assert.equal(data.data.length, 1)
+  assert.equal(data.data[0].id, 'A')
+  assert.deepEqual([...h.statesById.get(meta.id).states], [-1])
+})
+
+test('Resume checkpoints state array and scalar summary through one atomic write', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const h = createResumeHarness({ url, initialResults: [{}, {}, {}] })
+  await h.resume.ready
+  h.resume.taskId = 601
+  h.resume.currentMeta = {
+    id: 601,
+    url,
+    URLWhenCrawlStart: url,
+    part: 1,
+    date: new Date(0),
+    stateSummary: { total: 3, pending: 3, inProgress: 0, completed: 0 },
+  }
+  h.downloadStates.states = [-1, 0, 1]
+  h.resume.needPutStates = true
+  assert.ok(h.intervalCallbacks.length > 0)
+  h.intervalCallbacks[0]()
+  await new Promise((resolve) => setImmediate(resolve))
+  const atomic = h.putManyCalls.at(-1)
+  assert.ok(atomic)
+  assert.equal(
+    atomic
+      .map((entry) => entry.storeName)
+      .sort()
+      .join(','),
+    'taskMeta,taskStates'
+  )
+  const meta = atomic.find((entry) => entry.storeName === 'taskMeta').data
+  assert.deepEqual(
+    { ...meta.stateSummary },
+    {
+      total: 3,
+      pending: 1,
+      inProgress: 1,
+      completed: 1,
+    }
+  )
 })

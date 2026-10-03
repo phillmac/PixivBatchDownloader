@@ -28,6 +28,16 @@ interface TaskStates {
   states: DLStatesI
 }
 
+interface SaveSnapshot {
+  url: string
+  URLWhenCrawlStart: string
+  results: Result[]
+  states: DLStatesI
+  stateSummary: DLStateSummary
+  date: Date
+  generation: number
+}
+
 // 断点续传。恢复未完成的下载
 class Resume {
   constructor() {
@@ -46,10 +56,6 @@ class Resume {
   // 本模块所操作的下载数据的 id
   private taskId!: number
 
-  private part: number[] = [] // 储存每个分段里的数据的数量
-
-  private try = 0 // 任务结果是分批储存的，记录每批失败了几次。根据失败次数减少每批的数量
-
   // 尝试存储抓取结果时，单次存储的数量不能超过这个数字。因为超过这个数字可能会碰到单次存储的上限
   // 由于每个结果的体积可能不同，所以这只是一个预估值
   // 这有助于减少尝试次数。因为存储的思路是存储失败时改为上次数量的 1/2。例如有 100 w 个结果，存储算法会依次尝试存入 100 w、50 w、25 w、12.5 w 以此类推，直到最后有一次能成功存储一批数据。这样的话就进行了 4 次尝试才成功存入一批数据。但通过直接指定一批数据的大小为 onceMax，理想情况下可以只尝试一次就成功存入一批数据。
@@ -59,10 +65,15 @@ class Resume {
   private readonly putStatesTime = 1000 // 每隔指定时间存储一次最新的下载状态
 
   private needPutStates = false // 指示是否需要更新存储的下载状态
+  /** 当前活动持久化任务的元数据；清除/切换所有权时必须同步失效。 */
   private currentMeta: TaskMeta | null = null
+  /** 每次恢复尝试递增；用于阻止旧 SPA 路由的异步恢复落地。 */
   private restoreGeneration = 0
+  /** 表示恢复因 busy 被跳过或中途打断，下一次 idle 时必须重试。 */
   private restorePending = false
+  /** 清除持久化数据时递增；使已排队/进行中的保存请求失效。 */
   private persistenceGeneration = 0
+  /** 旧版无摘要任务的进程内标量缓存，避免状态轮询反复读取大数组。 */
   private readonly legacySummaryCache = new Map<number, DLStateSummary>()
 
   private async init() {
@@ -87,9 +98,10 @@ class Resume {
     if (!Utils.isPixiv()) {
       return null
     }
+    const normalizedUrl = this.normalizeURL(url)
     const meta = (await this.IDB.get(
       this.metaName,
-      url,
+      normalizedUrl,
       'url'
     )) as TaskMeta | null
     if (!meta) {
@@ -251,11 +263,11 @@ class Resume {
     ])
 
     await states.waitSettingInitialized()
-    if (
-      generation !== this.restoreGeneration ||
-      this.getURL() !== restoreUrl ||
-      states.busy
-    ) {
+    if (generation !== this.restoreGeneration || this.getURL() !== restoreUrl) {
+      return
+    }
+    if (states.busy) {
+      this.restorePending = true
       return
     }
 
@@ -272,7 +284,9 @@ class Resume {
     this.taskId = meta.id
     this.currentMeta = meta
     store.crawlCompleteTime = meta.date
-    store.URLWhenCrawlStart = meta.URLWhenCrawlStart || restoreUrl
+    store.URLWhenCrawlStart = this.normalizeURL(
+      meta.URLWhenCrawlStart || restoreUrl
+    )
 
     log.success(lang.transl('_已恢复抓取结果'), 'restoreCrawlResult')
     EVT.fire('resume')
@@ -284,22 +298,37 @@ class Resume {
   private saveDataChain: Promise<void> = Promise.resolve()
 
   private saveData(url = this.getURL()) {
-    const generation = this.persistenceGeneration
-    // 无论上一次保存成功还是失败，都把本次保存接到队列末尾顺序执行
-    const run = () => this.saveDataInner(url, generation)
-    const p = this.saveDataChain.then(run, run)
-    this.saveDataChain = p.catch(() => {
-      // 忽略单次保存失败，避免阻塞后续保存
+    const normalizedUrl = this.normalizeURL(url)
+    // 新队列开始持久化时先释放上一任务的 checkpoint 所有权。若下载已经开始，
+    // downloadSuccess/skipDownload 会重新置 needPutStates，待新任务元数据落地后再统一 checkpoint。
+    this.currentMeta = null
+    this.taskId = 0
+    this.needPutStates = false
+    const snapshot: SaveSnapshot = {
+      url: normalizedUrl,
+      URLWhenCrawlStart: this.normalizeURL(
+        store.URLWhenCrawlStart || normalizedUrl
+      ),
+      results: [...store.result],
+      states: [...downloadStates.states] as DLStatesI,
+      stateSummary: { ...downloadStates.summary() },
+      date: new Date(store.crawlCompleteTime),
+      generation: this.persistenceGeneration,
+    }
+    // 无论上一次保存成功还是失败，都把本次保存接到队列末尾顺序执行。
+    const run = () => this.saveDataInner(snapshot)
+    const promise = this.saveDataChain.then(run, run)
+    this.saveDataChain = promise.catch(() => {
+      // 忽略单次保存失败，避免阻塞后续保存。
     })
-    return p
+    return promise
   }
 
-  private async saveDataInner(url: string, generation: number) {
-    if (generation !== this.persistenceGeneration) return
-    // 首先检查这个网址下是否已经存在数据，如果有数据，则清除之前的数据，保持每个网址只有一份数据
+  private async saveDataInner(snapshot: SaveSnapshot) {
+    if (snapshot.generation !== this.persistenceGeneration) return
     const taskData = (await this.IDB.get(
       this.metaName,
-      url,
+      snapshot.url,
       'url'
     )) as TaskMeta | null
 
@@ -307,100 +336,86 @@ class Resume {
       await this.IDB.delete(this.metaName, taskData.id)
       await this.IDB.delete(this.statesName, taskData.id)
     }
-    if (generation !== this.persistenceGeneration) return
+    if (snapshot.generation !== this.persistenceGeneration) return
+    if (snapshot.stateSummary.completed === snapshot.results.length) return
 
-    // 保存本次任务的数据
-    // 如果此时本次任务已经完成，就不进行保存了
-    if (downloadStates.downloadedCount() === store.result.length) {
-      return
+    const taskId = Date.now()
+    const parts: number[] = []
+    await this.saveTaskData(
+      snapshot.results,
+      taskId,
+      parts,
+      snapshot.generation
+    )
+    if (snapshot.generation !== this.persistenceGeneration) return
+
+    const metaData: TaskMeta = {
+      id: taskId,
+      url: snapshot.url,
+      URLWhenCrawlStart: snapshot.URLWhenCrawlStart,
+      part: parts.length,
+      date: snapshot.date,
+      stateSummary: snapshot.stateSummary,
     }
-
-    // log.warning(lang.transl('_正在保存抓取结果'))
-    this.taskId = Date.now()
-
-    this.part = []
-
-    await this.saveTaskData(generation)
-    if (generation !== this.persistenceGeneration) return
-
-    // 保存 meta 数据
-    const metaData = {
-      id: this.taskId,
-      url,
-      URLWhenCrawlStart: store.URLWhenCrawlStart || url,
-      part: this.part.length,
-      date: store.crawlCompleteTime,
-      stateSummary: downloadStates.summary(),
+    const statesData: TaskStates = {
+      id: taskId,
+      states: snapshot.states,
     }
+    await this.IDB.putMany([
+      { storeName: this.metaName, data: metaData },
+      { storeName: this.statesName, data: statesData },
+    ])
 
-    // add 必须 await，否则下一个排队的保存可能在它提交前就读取/插入，撞上 url 唯一索引
-    // 主键冲突时退化为 put 保存（仍 await，确保本次写入完成后再进行下一次保存）
-    this.currentMeta = metaData
-    await this.IDB.add(this.metaName, metaData).catch(async (err) => {
-      // 有时错误信息是这样的：Key already exists in the object store
-      // 所以尝试使用 put 来保存 meta 数据
-      await this.IDB.put(this.metaName, metaData)
-    })
-
-    // 保存 states 数据
-    const statesData = {
-      id: this.taskId,
-      states: downloadStates.states,
+    // 仅当页面仍属于这份队列时，把后续下载进度 checkpoint 的所有权交给它。
+    if (
+      this.normalizeURL(store.URLWhenCrawlStart || this.getURL()) ===
+      snapshot.URLWhenCrawlStart
+    ) {
+      this.taskId = taskId
+      this.currentMeta = metaData
     }
-
-    await this.IDB.add(this.statesName, statesData)
 
     log.success(lang.transl('_已保存抓取结果'), 'saveCrawlResult')
   }
 
-  // 存储抓取结果
+  // 存储抓取结果。结果数组和任务 URL 在排队 saveData 时已快照，避免后续抓取污染。
   private async saveTaskData(
-    generation = this.persistenceGeneration
+    results: Result[],
+    taskId: number,
+    parts: number[],
+    generation: number,
+    attempt = 0
   ): Promise<void> {
     if (generation !== this.persistenceGeneration) return
-    // 每一批任务的第一次执行会尝试保存所有剩余数据(0.5 的 0 次幂是 1)
-    // 如果出错了，则每次执行会尝试保存上一次数据量的一半，直到这次存储成功
-    // 之后继续进行下一批任务（如果有）
-    let tryNum = Math.floor(store.result.length * Math.pow(0.5, this.try))
-    // 如果这批尝试数据大于指定数量，则设置为指定数量
+    let tryNum = Math.floor(results.length * Math.pow(0.5, attempt))
     tryNum > this.onceMax && (tryNum = this.onceMax)
-    let data = {
-      id: this.numAppendNum(this.taskId, this.part.length),
-      data: store.result.slice(
-        this.getPartTotal(),
-        this.getPartTotal() + tryNum
-      ),
+    const offset = parts.reduce((total, count) => total + count, 0)
+    const data = {
+      id: this.numAppendNum(taskId, parts.length),
+      data: results.slice(offset, offset + tryNum),
     }
 
     try {
-      // 当成功存储了一批数据时
       await this.IDB.add(this.dataName, data)
-      this.part.push(data.data.length) // 记录这一次保存的结果数量
-      this.try = 0 // 重置已尝试次数
-
-      // 任务数据全部添加完毕
-      if (this.getPartTotal() >= store.result.length) {
-        return
-      } else {
-        // 任务数据没有添加完毕，继续添加
-        return this.saveTaskData(generation)
+      parts.push(data.data.length)
+      if (offset + data.data.length < results.length) {
+        return this.saveTaskData(results, taskId, parts, generation, 0)
       }
     } catch (error: Error | any) {
-      // 当存储失败时
       console.error(error)
       if (error.target && error.target.error && error.target.error.message) {
         const msg = error.target.error.message as string
         if (msg.includes('too large')) {
-          // 体积超大
-          // 尝试次数 + 1 ，进行下一次尝试
-          this.try++
-          return this.saveTaskData(generation)
-        } else {
-          // 未知错误，不再进行尝试
-          this.try = 0
-          log.error('IndexedDB: ' + msg)
-          throw error
+          return this.saveTaskData(
+            results,
+            taskId,
+            parts,
+            generation,
+            attempt + 1
+          )
         }
+        log.error('IndexedDB: ' + msg)
+        throw error
       }
     }
   }
@@ -412,26 +427,32 @@ class Resume {
         void this.restoreData()
       }
       if (this.needPutStates) {
-        const statesData = {
-          id: this.taskId,
-          states: downloadStates.states,
-        }
-        this.needPutStates = false
-        // 如果此时本次任务已经完成，就不进行保存了
-        if (downloadStates.downloadedCount() === store.result.length) {
+        // 初次保存尚未提交时没有有效所有权；保留标记，等 currentMeta 建立后再写最新状态。
+        if (!this.currentMeta || this.currentMeta.id !== this.taskId) {
           return
         }
-        const writes: Promise<unknown>[] = [
-          this.IDB.put(this.statesName, statesData),
-        ]
-        if (this.currentMeta?.id === this.taskId) {
-          this.currentMeta = {
-            ...this.currentMeta,
-            stateSummary: downloadStates.summary(),
-          }
-          writes.push(this.IDB.put(this.metaName, this.currentMeta))
+        const statesData = {
+          id: this.taskId,
+          states: [...downloadStates.states] as DLStatesI,
         }
-        void Promise.all(writes)
+        // 如果此时本次任务已经完成，就不进行保存了
+        if (downloadStates.downloadedCount() === store.result.length) {
+          this.needPutStates = false
+          return
+        }
+        const updatedMeta = {
+          ...this.currentMeta,
+          stateSummary: downloadStates.summary(),
+        }
+        this.needPutStates = false
+        void this.IDB.putMany([
+          { storeName: this.statesName, data: statesData },
+          { storeName: this.metaName, data: updatedMeta },
+        ]).then(() => {
+          if (this.currentMeta?.id === updatedMeta.id) {
+            this.currentMeta = updatedMeta
+          }
+        })
       }
     }, this.putStatesTime)
   }
@@ -519,20 +540,14 @@ class Resume {
     return summary
   }
 
-  // 计算 part 数组里的数字之和
-  private getPartTotal() {
-    if (this.part.length === 0) {
-      return 0
-    }
-
-    return this.part.reduce((prev, curr) => {
-      return prev + curr
-    })
+  // 统一去掉 hash，保证持久化 key 与恢复/状态查询使用相同 URL。
+  private normalizeURL(url: string) {
+    return url.split('#')[0]
   }
 
   // 处理本页面的 url
   private getURL() {
-    return window.location.href.split('#')[0]
+    return this.normalizeURL(window.location.href)
   }
 
   // 在数字后面追加数字

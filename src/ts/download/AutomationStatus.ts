@@ -63,24 +63,29 @@ function resetDownloadLifecycle() {
   activeDownloadUrl = null
 }
 
+/** 返回抓取队列绑定的原始 URL，而不是事件触发时的 SPA 路由。 */
+function crawlTaskUrl() {
+  return normalizeUrl(store.URLWhenCrawlStart || window.location.href)
+}
+
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
 window.addEventListener(EVT.list.crawlStart, () => {
-  lifecycle.crawlStarted = observe()
+  lifecycle.crawlStarted = observe(window.location.href)
   lifecycle.crawlCompleted = null
   lifecycle.crawlEmpty = null
   resetDownloadLifecycle()
   lifecycle.resumed = null
 })
 window.addEventListener(EVT.list.crawlComplete, () => {
-  lifecycle.crawlCompleted = observe()
+  lifecycle.crawlCompleted = observe(crawlTaskUrl())
   resetDownloadLifecycle()
 })
 window.addEventListener(EVT.list.resultChange, () => {
-  lifecycle.crawlCompleted = observe()
+  lifecycle.crawlCompleted = observe(crawlTaskUrl())
   resetDownloadLifecycle()
 })
 window.addEventListener(EVT.list.crawlEmpty, () => {
-  lifecycle.crawlEmpty = observe()
+  lifecycle.crawlEmpty = observe(crawlTaskUrl())
 })
 window.addEventListener(EVT.list.downloadStart, () => {
   activeDownloadUrl = normalizeUrl(

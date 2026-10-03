@@ -72,6 +72,30 @@ class IndexedDB {
     })
   }
 
+  /** Atomically put records spanning one or more object stores. */
+  public async putMany(
+    entries: Array<{ storeName: string; data: object }>
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [...new Set(entries.map((entry) => entry.storeName))]
+      const transaction = this.db.transaction(stores, 'readwrite')
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = (ev) => {
+        console.error('putMany failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      for (const entry of entries) {
+        transaction.objectStore(entry.storeName).put(entry.data)
+      }
+    })
+  }
+
   // 向一个存储库中批量添加数据
   public async batchAddData(storeName: string, dataList: any[], key: any) {
     return new Promise<void>(async (resolve, reject) => {
