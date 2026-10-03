@@ -81,6 +81,9 @@ class ImportResult {
     // 恢复数据
     // 通过 store.addResult 添加数据，可以应用多图作品设置，对导入的结果进行调整
     store.reset()
+    // 导入结果属于当前页面，而不是之前抓取/恢复任务遗留的 URL。
+    store.URLWhenCrawlStart = window.location.href
+    store.crawlCompleteTime = new Date()
     for (const r of temp) {
       store.addResult(r)
     }

@@ -7,6 +7,13 @@ import { store } from '../store/Store'
 // 1 下载完成
 type DLStatesI = (-1 | 0 | 1)[]
 
+interface DLStateSummary {
+  total: number
+  pending: number
+  inProgress: number
+  completed: number
+}
+
 // 下载状态列表
 class DownloadStates {
   constructor() {
@@ -14,6 +21,12 @@ class DownloadStates {
   }
 
   public states: DLStatesI = []
+  /** states 中值为 -1 的数量；与其余计数之和始终等于 states.length。 */
+  private pending = 0
+  /** states 中值为 0 的数量；所有 set/replace/init 操作都必须同步维护。 */
+  private inProgress = 0
+  /** states 中值为 1 的数量；downloadedCount() 直接返回此标量。 */
+  private completed = 0
 
   private bindEvents() {
     // 初始化下载状态
@@ -28,24 +41,38 @@ class DownloadStates {
   // 创建新的状态列表
   public init() {
     this.states = new Array(store.result.length).fill(-1)
+    this.pending = this.states.length
+    this.inProgress = 0
+    this.completed = 0
   }
 
   // 统计下载完成的数量
   public downloadedCount() {
-    let count = 0
-    const length = this.states.length
-    for (let i = 0; i < length; i++) {
-      if (this.states[i] === 1) {
-        count++
-      }
+    return this.completed
+  }
+
+  // 返回无需遍历完整队列即可读取的状态摘要。
+  public summary(): DLStateSummary {
+    return {
+      total: this.states.length,
+      pending: this.pending,
+      inProgress: this.inProgress,
+      completed: this.completed,
     }
-    return count
   }
 
   // 接受传入的状态数据
   // 目前只有在恢复下载的时候使用
   public replace(states: DLStatesI) {
     this.states = states
+    this.pending = 0
+    this.inProgress = 0
+    this.completed = 0
+    for (const value of states) {
+      if (value === -1) this.pending++
+      else if (value === 0) this.inProgress++
+      else if (value === 1) this.completed++
+    }
   }
 
   // 恢复之前的下载任务
@@ -73,13 +100,24 @@ class DownloadStates {
 
   // 设置已下载列表中的标记
   public setState(index: number, value: -1 | 0 | 1) {
+    const previous = this.states[index]
+    if (previous === value) return
+    if (previous === -1) this.pending--
+    else if (previous === 0) this.inProgress--
+    else if (previous === 1) this.completed--
     this.states[index] = value
+    if (value === -1) this.pending++
+    else if (value === 0) this.inProgress++
+    else this.completed++
   }
 
   public clear() {
     this.states = []
+    this.pending = 0
+    this.inProgress = 0
+    this.completed = 0
   }
 }
 
 const downloadStates = new DownloadStates()
-export { downloadStates, DLStatesI }
+export { downloadStates, DLStatesI, DLStateSummary }

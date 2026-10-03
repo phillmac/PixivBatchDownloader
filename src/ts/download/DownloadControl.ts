@@ -48,8 +48,18 @@ class DownloadControl {
       stop: this.stop,
       busy: states.busy,
       downloading: states.downloading,
+      bookmarkMode: states.bookmarkMode,
       downloadStates: [...downloadStates.states],
       taskList: { ...this.taskList },
+    }))
+    downloadDiagnostics.setAutomationStateProvider(() => ({
+      remainingDownload: store.remainingDownload,
+      resultLength: store.result.length,
+      pause: this.pause,
+      stop: this.stop,
+      busy: states.busy,
+      downloading: states.downloading,
+      bookmarkMode: states.bookmarkMode,
     }))
 
     const statusTipWrap = this.wrapper.querySelector(
