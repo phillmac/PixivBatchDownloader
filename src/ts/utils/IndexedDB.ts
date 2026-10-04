@@ -134,6 +134,158 @@ class IndexedDB {
     })
   }
 
+  /** Atomically read records spanning one or more object stores. */
+  public async getMany(
+    entries: Array<{ storeName: string; key: IDBValidKey }>
+  ): Promise<any[]> {
+    return new Promise<any[]>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [...new Set(entries.map((entry) => entry.storeName))]
+      const transaction = this.db.transaction(stores, 'readonly')
+      const results = new Array(entries.length).fill(null)
+      transaction.oncomplete = () => resolve(results)
+      transaction.onerror = (ev) => {
+        console.error('getMany failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      entries.forEach((entry, index) => {
+        const request = transaction.objectStore(entry.storeName).get(entry.key)
+        request.onsuccess = () => {
+          results[index] = request.result ?? null
+        }
+      })
+    })
+  }
+
+  /** Atomically delete records spanning one or more object stores. */
+  public async deleteMany(
+    entries: Array<{ storeName: string; key: IDBValidKey }>
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [...new Set(entries.map((entry) => entry.storeName))]
+      const transaction = this.db.transaction(stores, 'readwrite')
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = (ev) => {
+        console.error('deleteMany failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      for (const entry of entries) {
+        transaction.objectStore(entry.storeName).delete(entry.key)
+      }
+    })
+  }
+
+  /** Atomically clear multiple object stores. */
+  public async clearMany(storeNames: string[]): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [...new Set(storeNames)]
+      const transaction = this.db.transaction(stores, 'readwrite')
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = (ev) => {
+        console.error('clearMany failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      for (const storeName of stores) {
+        transaction.objectStore(storeName).clear()
+      }
+    })
+  }
+
+  /** Atomically write records only while a shared guard field still matches. */
+  public async putManyIfFieldEquals(
+    entries: Array<{ storeName: string; data: object }>,
+    guardStoreName: string,
+    guardKey: IDBValidKey,
+    field: string,
+    expected: unknown
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [
+        ...new Set([
+          guardStoreName,
+          ...entries.map((entry) => entry.storeName),
+        ]),
+      ]
+      const transaction = this.db.transaction(stores, 'readwrite')
+      let matched = false
+      transaction.oncomplete = () => resolve(matched)
+      transaction.onerror = (ev) => {
+        console.error('putManyIfFieldEquals failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      const guard = transaction.objectStore(guardStoreName).get(guardKey)
+      guard.onsuccess = () => {
+        const value = guard.result as Record<string, unknown> | undefined
+        if (!value || value[field] !== expected) return
+        matched = true
+        for (const entry of entries) {
+          transaction.objectStore(entry.storeName).put(entry.data)
+        }
+      }
+    })
+  }
+
+  /** Atomically increment a shared numeric field and clear related stores. */
+  public async incrementFieldAndClear(
+    guardStoreName: string,
+    guardKey: IDBValidKey,
+    field: string,
+    clearStoreNames: string[]
+  ): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [guardStoreName, ...clearStoreNames]
+      const transaction = this.db.transaction([...new Set(stores)], 'readwrite')
+      let nextValue = 0
+      transaction.oncomplete = () => resolve(nextValue)
+      transaction.onerror = (ev) => {
+        console.error('incrementFieldAndClear failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      const guardStore = transaction.objectStore(guardStoreName)
+      const guard = guardStore.get(guardKey)
+      guard.onsuccess = () => {
+        const current = (guard.result || { id: guardKey }) as Record<
+          string,
+          unknown
+        >
+        nextValue = Number(current[field] ?? 0) + 1
+        guardStore.put({ ...current, [field]: nextValue })
+        for (const storeName of new Set(clearStoreNames)) {
+          transaction.objectStore(storeName).clear()
+        }
+      }
+    })
+  }
+
   // 向一个存储库中批量添加数据
   public async batchAddData(storeName: string, dataList: any[], key: any) {
     return new Promise<void>(async (resolve, reject) => {

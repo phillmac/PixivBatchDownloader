@@ -36,6 +36,14 @@ interface SaveSnapshot {
   stateSummary: DLStateSummary
   date: Date
   generation: number
+  sharedGeneration: number
+}
+
+interface PendingSaveRequest {
+  url: string
+  generation: number
+  sharedGeneration: number
+  waiters: Array<{ resolve: () => void; reject: (reason?: unknown) => void }>
 }
 
 // 断点续传。恢复未完成的下载
@@ -49,10 +57,14 @@ class Resume {
   /** 初始化断点续传数据库和事件绑定的 Promise。 */
   private readonly ready: Promise<void>
   private readonly DBName = 'PBD'
-  private readonly DBVer = 3
+  private readonly DBVer = 4
   private metaName = 'taskMeta' // 下载任务元数据的表名
   private dataName = 'taskData' // 下载任务数据的表名
   private statesName = 'taskStates' // 下载状态列表的表名
+  /** 跨标签页共享的断点续传控制记录表。 */
+  private readonly controlName = 'resumeControl'
+  /** 共享控制记录的固定主键。 */
+  private readonly controlKey = 'shared'
   // 本模块所操作的下载数据的 id
   private taskId!: number
 
@@ -84,6 +96,7 @@ class Resume {
     }
 
     await this.initDB()
+    await this.ensureControlRecord()
     this.bindEvents()
 
     if (states.settingInitialized) {
@@ -169,10 +182,38 @@ class Resume {
         })
         statesStore.createIndex('id', 'id', { unique: true })
       }
+
+      if (!db.objectStoreNames.contains(this.controlName)) {
+        db.createObjectStore(this.controlName, { keyPath: 'id' })
+      }
     }
 
     // 打开数据库
     return this.IDB.open(this.DBName, this.DBVer, onUpdate)
+  }
+
+  /** 确保跨标签页共享的清除代数记录存在。 */
+  private async ensureControlRecord() {
+    const current = await this.IDB.get(this.controlName, this.controlKey)
+    if (current) return
+    try {
+      await this.IDB.add(this.controlName, {
+        id: this.controlKey,
+        generation: 0,
+      })
+    } catch {
+      // 另一个标签页可能已经同时创建了相同记录。
+      if (!(await this.IDB.get(this.controlName, this.controlKey)))
+        throw new Error('failed to initialize Resume control record')
+    }
+  }
+
+  /** 读取跨标签页共享的清除代数。 */
+  private async getSharedGeneration() {
+    const current = (await this.IDB.get(this.controlName, this.controlKey)) as {
+      generation?: number
+    } | null
+    return Number(current?.generation ?? 0)
   }
 
   private bindEvents() {
@@ -256,25 +297,24 @@ class Resume {
 
     log.log(lang.transl('_正在恢复抓取结果'))
 
-    // 2 读取抓取结果和下载状态。先全部读入局部变量，避免旧恢复任务在 SPA 切页后污染当前页面。
-    const dataIdList: number[] = this.createIdList(meta.id, meta.part)
-    const promiseList = dataIdList.map((id) => this.IDB.get(this.dataName, id))
-    const [chunks, taskStates] = await Promise.all([
-      Promise.all(promiseList) as Promise<TaskData[]>,
-      this.IDB.get(this.statesName, meta.id) as Promise<TaskStates | null>,
-    ])
-
     await states.waitSettingInitialized()
-    const sharedMeta = (await this.IDB.get(
-      this.metaName,
-      meta.id
-    )) as TaskMeta | null
+    const dataIdList: number[] = this.createIdList(meta.id, meta.part)
+    const snapshot = await this.IDB.getMany([
+      { storeName: this.metaName, key: meta.id },
+      { storeName: this.statesName, key: meta.id },
+      ...dataIdList.map((id) => ({ storeName: this.dataName, key: id })),
+    ])
+    const sharedMeta = snapshot[0] as TaskMeta | null
+    const taskStates = snapshot[1] as TaskStates | null
+    const chunks = snapshot.slice(2) as Array<TaskData | null>
     if (
       generation !== this.restoreGeneration ||
       this.getURL() !== restoreUrl ||
       this.invalidatedRestoreTaskIds.has(meta.id) ||
       !sharedMeta ||
-      sharedMeta.url !== meta.url
+      sharedMeta.url !== meta.url ||
+      !taskStates ||
+      chunks.some((chunk) => !chunk)
     ) {
       return
     }
@@ -285,7 +325,7 @@ class Resume {
 
     const restored: Result[] = []
     for (const taskData of chunks) {
-      restored.push(...taskData.data)
+      restored.push(...taskData!.data)
     }
     store.result = restored
     store.resetDownloadCount()
@@ -304,36 +344,76 @@ class Resume {
     EVT.fire('resume')
   }
 
-  // 保存数据的串行队列。把每次保存请求串到同一条队列上，
-  // 保证 get → delete → add 严格按顺序执行，避免并发的 saveData 互相穿插，
-  // 导致同一 url 的两条记录撞上 taskMeta 表的 url 唯一索引而报错。
-  private saveDataChain: Promise<void> = Promise.resolve()
+  /** 等待持久化的轻量请求；同一 URL 的重复 resultChange 会在这里合并。 */
+  private readonly pendingSaveRequests: PendingSaveRequest[] = []
+  /** 指示保存队列当前是否有一个快照正在写入 IndexedDB。 */
+  private saveDataDraining = false
 
-  private saveData(url = this.getURL()) {
+  private async saveData(url = this.getURL()) {
     const normalizedUrl = this.normalizeURL(url)
-    // 新队列开始持久化时先释放上一任务的 checkpoint 所有权。若下载已经开始，
-    // downloadSuccess/skipDownload 会重新置 needPutStates，待新任务元数据落地后再统一 checkpoint。
-    this.currentMeta = null
-    this.taskId = 0
-    this.needPutStates = false
-    const snapshot: SaveSnapshot = {
-      url: normalizedUrl,
-      URLWhenCrawlStart: this.normalizeURL(
-        store.URLWhenCrawlStart || normalizedUrl
-      ),
-      results: [...store.result],
-      states: [...downloadStates.states] as DLStatesI,
-      stateSummary: { ...downloadStates.summary() },
-      date: new Date(store.crawlCompleteTime),
-      generation: this.persistenceGeneration,
-    }
-    // 无论上一次保存成功还是失败，都把本次保存接到队列末尾顺序执行。
-    const run = () => this.saveDataInner(snapshot)
-    const promise = this.saveDataChain.then(run, run)
-    this.saveDataChain = promise.catch(() => {
-      // 忽略单次保存失败，避免阻塞后续保存。
+    const generation = this.persistenceGeneration
+    const sharedGeneration = await this.getSharedGeneration()
+    return new Promise<void>((resolve, reject) => {
+      const pending = this.pendingSaveRequests.find(
+        (request) => request.url === normalizedUrl
+      )
+      if (pending) {
+        pending.generation = generation
+        pending.sharedGeneration = sharedGeneration
+        pending.waiters.push({ resolve, reject })
+      } else {
+        this.pendingSaveRequests.push({
+          url: normalizedUrl,
+          generation,
+          sharedGeneration,
+          waiters: [{ resolve, reject }],
+        })
+      }
+      void this.drainSaveDataQueue()
     })
-    return promise
+  }
+
+  /** 串行处理保存请求，并只在真正开始写入时复制大型结果/状态数组。 */
+  private async drainSaveDataQueue() {
+    if (this.saveDataDraining) return
+    this.saveDataDraining = true
+    try {
+      while (this.pendingSaveRequests.length > 0) {
+        const request = this.pendingSaveRequests.shift()!
+        try {
+          if (request.generation !== this.persistenceGeneration) {
+            request.waiters.forEach(({ resolve }) => resolve())
+            continue
+          }
+          const liveTaskUrl = this.normalizeURL(
+            store.URLWhenCrawlStart || this.getURL()
+          )
+          if (liveTaskUrl !== request.url) {
+            request.waiters.forEach(({ resolve }) => resolve())
+            continue
+          }
+          const snapshot: SaveSnapshot = {
+            url: request.url,
+            URLWhenCrawlStart: liveTaskUrl,
+            results: [...store.result],
+            states: [...downloadStates.states] as DLStatesI,
+            stateSummary: { ...downloadStates.summary() },
+            date: new Date(store.crawlCompleteTime),
+            generation: request.generation,
+            sharedGeneration: request.sharedGeneration,
+          }
+          await this.saveDataInner(snapshot)
+          request.waiters.forEach(({ resolve }) => resolve())
+        } catch (error) {
+          request.waiters.forEach(({ reject }) => reject(error))
+        }
+      }
+    } finally {
+      this.saveDataDraining = false
+      if (this.pendingSaveRequests.length > 0) {
+        void this.drainSaveDataQueue()
+      }
+    }
   }
 
   private async saveDataInner(snapshot: SaveSnapshot) {
@@ -345,8 +425,8 @@ class Resume {
     )) as TaskMeta | null
 
     if (taskData) {
-      await this.IDB.delete(this.metaName, taskData.id)
-      await this.IDB.delete(this.statesName, taskData.id)
+      this.invalidateTaskOwnership(taskData.id)
+      await this.deleteTaskRecords(taskData)
     }
     if (snapshot.generation !== this.persistenceGeneration) return
     if (snapshot.stateSummary.completed === snapshot.results.length) return
@@ -359,7 +439,10 @@ class Resume {
       parts,
       snapshot.generation
     )
-    if (snapshot.generation !== this.persistenceGeneration) return
+    if (snapshot.generation !== this.persistenceGeneration) {
+      await this.deleteTaskDataChunks(taskId, parts.length)
+      return
+    }
 
     const metaData: TaskMeta = {
       id: taskId,
@@ -373,10 +456,20 @@ class Resume {
       id: taskId,
       states: snapshot.states,
     }
-    await this.IDB.putMany([
-      { storeName: this.metaName, data: metaData },
-      { storeName: this.statesName, data: statesData },
-    ])
+    const persisted = await this.IDB.putManyIfFieldEquals(
+      [
+        { storeName: this.metaName, data: metaData },
+        { storeName: this.statesName, data: statesData },
+      ],
+      this.controlName,
+      this.controlKey,
+      'generation',
+      snapshot.sharedGeneration
+    )
+    if (!persisted) {
+      await this.deleteTaskDataChunks(taskId, parts.length)
+      return
+    }
 
     // 仅当页面仍属于这份队列时，把后续下载进度 checkpoint 的所有权交给它。
     if (
@@ -430,6 +523,27 @@ class Resume {
         throw error
       }
     }
+  }
+
+  /** 删除尚未提交元数据的任务分块，避免取消保存留下孤儿数据。 */
+  private async deleteTaskDataChunks(taskId: number, part: number) {
+    const entries = this.createIdList(taskId, part).map((id) => ({
+      storeName: this.dataName,
+      key: id,
+    }))
+    if (entries.length > 0) await this.IDB.deleteMany(entries)
+  }
+
+  /** 原子删除一个完整的持久化任务。 */
+  private async deleteTaskRecords(meta: TaskMeta) {
+    await this.IDB.deleteMany([
+      { storeName: this.metaName, key: meta.id },
+      { storeName: this.statesName, key: meta.id },
+      ...this.createIdList(meta.id, meta.part).map((id) => ({
+        storeName: this.dataName,
+        key: id,
+      })),
+    ])
   }
 
   // 定时 put 下载状态
@@ -489,25 +603,20 @@ class Resume {
   }
 
   private async clearData(ev: string) {
+    // 即使初次保存尚未取得 taskId，也必须先取消本标签页所有排队/进行中的保存。
+    this.persistenceGeneration++
     if (!this.taskId) {
       return
     }
     const meta = (await this.IDB.get(this.metaName, this.taskId)) as TaskMeta
-
     if (!meta) {
+      this.invalidateTaskOwnership(this.taskId)
       return
     }
 
-    this.persistenceGeneration++
     const taskId = this.taskId
     this.invalidateTaskOwnership(taskId)
-    this.IDB.delete(this.metaName, taskId)
-    this.IDB.delete(this.statesName, taskId)
-
-    const dataIdList = this.createIdList(taskId, meta.part)
-    for (const id of dataIdList) {
-      this.IDB.delete(this.dataName, id)
-    }
+    await this.deleteTaskRecords(meta)
 
     // 当因为停止下载而清除保存的抓取结果时，显示提示，让用户知道这个机制
     if (ev === EVT.list.downloadStop) {
@@ -540,15 +649,9 @@ class Resume {
       if (item) {
         const data = item.value as TaskMeta
         if (nowTime - data.id > expiryTime) {
-          // 先释放内存 ownership，避免后续进度 checkpoint 复活已过期元数据。
+          // 先释放内存 ownership，再以一个跨表事务删除完整任务。
           this.invalidateTaskOwnership(data.id)
-          this.IDB.delete(this.metaName, data.id)
-          this.IDB.delete(this.statesName, data.id)
-
-          const dataIdList = this.createIdList(data.id, data.part)
-          for (const id of dataIdList) {
-            this.IDB.delete(this.dataName, id)
-          }
+          void this.deleteTaskRecords(data)
         }
         item.continue()
       }
@@ -610,11 +713,12 @@ class Resume {
     this.needPutStates = false
     this.taskId = 0
     this.legacySummaryCache.clear()
-    await Promise.all([
-      this.IDB.clear(this.metaName),
-      this.IDB.clear(this.dataName),
-      this.IDB.clear(this.statesName),
-    ])
+    await this.IDB.incrementFieldAndClear(
+      this.controlName,
+      this.controlKey,
+      'generation',
+      [this.metaName, this.dataName, this.statesName]
+    )
     toast.success(lang.transl('_数据清除完毕'))
   }
 }

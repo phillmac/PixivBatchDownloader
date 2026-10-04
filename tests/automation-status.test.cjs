@@ -402,6 +402,7 @@ function createResumeHarness(options = {}) {
   const statesById = new Map(
     Object.entries(options.statesById || {}).map(([k, v]) => [Number(k), v])
   )
+  const controlById = new Map([['shared', { id: 'shared', generation: 0 }]])
   class IndexedDB {
     async open() {}
     async get(storeName, key, index) {
@@ -419,6 +420,7 @@ function createResumeHarness(options = {}) {
         const value = statesById.get(key)
         return typeof value === 'function' ? value() : value || null
       }
+      if (storeName === 'resumeControl') return controlById.get(key) || null
       return null
     }
     async put(storeName, value) {
@@ -426,6 +428,7 @@ function createResumeHarness(options = {}) {
       if (storeName === 'taskMeta') metaByUrl.set(value.url, value)
       if (storeName === 'taskStates') statesById.set(value.id, value)
       if (storeName === 'taskData') dataById.set(value.id, value)
+      if (storeName === 'resumeControl') controlById.set(value.id, value)
     }
     async putMany(entries) {
       putManyCalls.push(entries)
@@ -439,10 +442,52 @@ function createResumeHarness(options = {}) {
       await this.putMany(entries)
       return true
     }
+    async getMany(entries) {
+      return Promise.all(
+        entries.map(({ storeName, key }) => this.get(storeName, key))
+      )
+    }
+    async deleteMany(entries) {
+      for (const { storeName, key } of entries)
+        await this.delete(storeName, key)
+    }
+    async clearMany(storeNames) {
+      for (const storeName of new Set(storeNames)) await this.clear(storeName)
+    }
+    async putManyIfFieldEquals(
+      entries,
+      guardStoreName,
+      guardKey,
+      field,
+      expected
+    ) {
+      const guard = await this.get(guardStoreName, guardKey)
+      if (!guard || guard[field] !== expected) return false
+      await this.putMany(entries)
+      return true
+    }
+    async incrementFieldAndClear(
+      guardStoreName,
+      guardKey,
+      field,
+      clearStoreNames
+    ) {
+      const current = (await this.get(guardStoreName, guardKey)) || {
+        id: guardKey,
+      }
+      const next = Number(current[field] || 0) + 1
+      await this.put(guardStoreName, { ...current, [field]: next })
+      await this.clearMany(clearStoreNames)
+      return next
+    }
     async add(storeName, value) {
       if (storeName === 'taskMeta') metaByUrl.set(value.url, value)
       if (storeName === 'taskStates') statesById.set(value.id, value)
       if (storeName === 'taskData') dataById.set(value.id, value)
+      if (storeName === 'resumeControl') {
+        if (controlById.has(value.id)) throw new Error('ConstraintError')
+        controlById.set(value.id, value)
+      }
     }
     async delete(storeName, key) {
       if (storeName === 'taskMeta') {
@@ -452,11 +497,13 @@ function createResumeHarness(options = {}) {
       }
       if (storeName === 'taskStates') statesById.delete(key)
       if (storeName === 'taskData') dataById.delete(key)
+      if (storeName === 'resumeControl') controlById.delete(key)
     }
     async clear(storeName) {
       if (storeName === 'taskMeta') metaByUrl.clear()
       if (storeName === 'taskStates') statesById.clear()
       if (storeName === 'taskData') dataById.clear()
+      if (storeName === 'resumeControl') controlById.clear()
     }
     openCursor() {}
   }
@@ -569,6 +616,7 @@ function createResumeHarness(options = {}) {
     metaByUrl,
     dataById,
     statesById,
+    controlById,
     fire(name) {
       for (const callback of listeners.get(name) || []) callback()
     },
@@ -967,18 +1015,14 @@ test('queued Resume save persists an immutable queue snapshot', async () => {
   h.store.URLWhenCrawlStart = urlA
   h.store.crawlCompleteTime = new Date('2026-10-03T01:00:00Z')
   h.downloadStates.states = [-1]
-  let release
-  h.resume.saveDataChain = new Promise((resolve) => {
-    release = resolve
-  })
   const pending = h.resume.saveData(urlA)
+  await new Promise((resolve) => setImmediate(resolve))
 
   h.window.location.href = urlB
   h.store.URLWhenCrawlStart = urlB
   h.store.result = [{ id: 'B1' }, { id: 'B2' }]
   h.store.crawlCompleteTime = new Date('2026-10-03T02:00:00Z')
   h.downloadStates.states = [1, 1]
-  release()
   await pending
 
   const meta = h.metaByUrl.get(urlA)
@@ -1106,13 +1150,8 @@ test('expired Resume task cannot land after deletion while restore reads are in 
   assert.equal(h.fired.includes('resume'), false)
 })
 
-
-test('cross-tab expiry deletion prevents an in-flight restore from landing', async () => {
+test('restore rejects a partial three-store task snapshot even while metadata survives', async () => {
   const url = 'https://www.pixiv.net/en/users/1'
-  let resolveChunk
-  const chunk = new Promise((resolve) => {
-    resolveChunk = resolve
-  })
   const h = createResumeHarness({
     url,
     initialResults: [{ id: 'live' }],
@@ -1126,24 +1165,140 @@ test('cross-tab expiry deletion prevents an in-flight restore from landing', asy
         stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
       },
     },
-    dataById: { 7030: () => chunk },
     statesById: { 703: { id: 703, states: [-1] } },
+    // Simulate the old cross-tab expiry race: taskMeta is still visible while
+    // taskData has already been removed by a separate-store deletion.
+    dataById: {},
   })
   await h.resume.ready
-  const pendingRestore = h.resume.restoreData()
-  await new Promise((resolve) => setImmediate(resolve))
-
-  // Simulate another tab expiring this shared IndexedDB task; no local tombstone is set.
-  await h.resume.IDB.delete('taskMeta', 703)
-  await h.resume.IDB.delete('taskStates', 703)
-  await h.resume.IDB.delete('taskData', 7030)
-  resolveChunk({ id: 7030, data: [{ id: 'expired' }] })
-  await pendingRestore
+  await h.resume.restoreData()
 
   assert.equal(h.store.result[0].id, 'live')
   assert.equal(h.resume.taskId || 0, 0)
   assert.equal(h.resume.currentMeta, null)
   assert.equal(h.fired.includes('resume'), false)
+})
+
+test('shared clear generation cancels an in-flight save from another tab', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const h = createResumeHarness({ url, initialResults: [{ id: 'queued' }] })
+  await h.resume.ready
+  h.store.URLWhenCrawlStart = url
+  h.store.crawlCompleteTime = new Date('2026-10-04T00:00:00Z')
+  h.downloadStates.states = [-1]
+
+  const originalAdd = h.resume.IDB.add.bind(h.resume.IDB)
+  let releaseChunk
+  let chunkStarted
+  const chunkStartedPromise = new Promise((resolve) => {
+    chunkStarted = resolve
+  })
+  h.resume.IDB.add = async (storeName, value) => {
+    if (storeName === 'taskData') {
+      chunkStarted()
+      await new Promise((resolve) => {
+        releaseChunk = resolve
+      })
+    }
+    return originalAdd(storeName, value)
+  }
+
+  const pending = h.resume.saveData(url)
+  await chunkStartedPromise
+  // Another tab atomically publishes a clear generation and clears durable stores.
+  h.controlById.set('shared', { id: 'shared', generation: 1 })
+  h.metaByUrl.clear()
+  h.statesById.clear()
+  h.dataById.clear()
+  releaseChunk()
+  await pending
+
+  assert.equal(h.metaByUrl.has(url), false)
+  assert.equal(h.statesById.size, 0)
+  assert.equal(h.dataById.size, 0)
+  assert.equal(h.resume.taskId || 0, 0)
+})
+
+test('repeated result changes retain at most one pending large save', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const h = createResumeHarness({ url, initialResults: [{ id: 'initial' }] })
+  await h.resume.ready
+  h.store.URLWhenCrawlStart = url
+  h.store.crawlCompleteTime = new Date('2026-10-04T00:00:00Z')
+  h.downloadStates.states = [-1]
+
+  const originalAdd = h.resume.IDB.add.bind(h.resume.IDB)
+  let releaseChunk
+  let chunkStarted
+  const chunkStartedPromise = new Promise((resolve) => {
+    chunkStarted = resolve
+  })
+  let blocked = false
+  h.resume.IDB.add = async (storeName, value) => {
+    if (storeName === 'taskData' && !blocked) {
+      blocked = true
+      chunkStarted()
+      await new Promise((resolve) => {
+        releaseChunk = resolve
+      })
+    }
+    return originalAdd(storeName, value)
+  }
+
+  const first = h.resume.saveData(url)
+  await chunkStartedPromise
+  const queued = []
+  for (let i = 0; i < 25; i++) {
+    h.store.result = [{ id: `latest-${i}` }]
+    h.downloadStates.states = [-1]
+    queued.push(h.resume.saveData(url))
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.resume.pendingSaveRequests.length, 1)
+  assert.equal(h.resume.pendingSaveRequests[0].waiters.length, 25)
+
+  releaseChunk()
+  await Promise.all([first, ...queued])
+  assert.equal(h.resume.pendingSaveRequests.length, 0)
+  assert.equal(h.resume.saveDataDraining, false)
+})
+
+test('download completion cancels the initial save before taskId ownership exists', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const h = createResumeHarness({ url, initialResults: [{ id: 'queued' }] })
+  await h.resume.ready
+  h.store.URLWhenCrawlStart = url
+  h.store.crawlCompleteTime = new Date('2026-10-04T00:00:00Z')
+  h.downloadStates.states = [-1]
+
+  const originalAdd = h.resume.IDB.add.bind(h.resume.IDB)
+  let releaseChunk
+  let chunkStarted
+  const chunkStartedPromise = new Promise((resolve) => {
+    chunkStarted = resolve
+  })
+  h.resume.IDB.add = async (storeName, value) => {
+    if (storeName === 'taskData') {
+      chunkStarted()
+      await new Promise((resolve) => {
+        releaseChunk = resolve
+      })
+    }
+    return originalAdd(storeName, value)
+  }
+
+  const pending = h.resume.saveData(url)
+  await chunkStartedPromise
+  assert.equal(h.resume.taskId || 0, 0)
+  h.fire('downloadComplete')
+  await new Promise((resolve) => setImmediate(resolve))
+  releaseChunk()
+  await pending
+
+  assert.equal(h.metaByUrl.has(url), false)
+  assert.equal(h.statesById.size, 0)
+  assert.equal(h.dataById.size, 0)
+  assert.equal(h.resume.taskId || 0, 0)
 })
 
 test('checkpoint does not recreate metadata deleted by another tab', async () => {
