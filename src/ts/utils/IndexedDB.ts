@@ -72,6 +72,44 @@ class IndexedDB {
     })
   }
 
+  /** Atomically put records only while the guard key still exists in the shared database. */
+  public async putManyIfPresent(
+    entries: Array<{ storeName: string; data: object }>,
+    guardStoreName: string,
+    guardKey: IDBValidKey
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve, reject) => {
+      if (this.db === undefined) {
+        reject('Database is not defined')
+        return
+      }
+      const stores = [
+        ...new Set([
+          guardStoreName,
+          ...entries.map((entry) => entry.storeName),
+        ]),
+      ]
+      const transaction = this.db.transaction(stores, 'readwrite')
+      let present = false
+      transaction.oncomplete = () => resolve(present)
+      transaction.onerror = (ev) => {
+        console.error('putManyIfPresent failed')
+        console.trace()
+        reject(ev)
+      }
+      transaction.onabort = (ev) => reject(ev)
+      const guard = transaction.objectStore(guardStoreName).get(guardKey)
+      guard.onsuccess = () => {
+        if (!guard.result) return
+        present = true
+        for (const entry of entries) {
+          transaction.objectStore(entry.storeName).put(entry.data)
+        }
+      }
+      guard.onerror = (ev) => reject(ev)
+    })
+  }
+
   /** Atomically put records spanning one or more object stores. */
   public async putMany(
     entries: Array<{ storeName: string; data: object }>

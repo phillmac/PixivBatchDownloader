@@ -433,6 +433,12 @@ function createResumeHarness(options = {}) {
         await this.put(storeName, data)
       }
     }
+    async putManyIfPresent(entries, guardStoreName, guardKey) {
+      const guard = await this.get(guardStoreName, guardKey)
+      if (!guard) return false
+      await this.putMany(entries)
+      return true
+    }
     async add(storeName, value) {
       if (storeName === 'taskMeta') metaByUrl.set(value.url, value)
       if (storeName === 'taskStates') statesById.set(value.id, value)
@@ -1007,6 +1013,7 @@ test('Resume checkpoints state array and scalar summary through one atomic write
     date: new Date(0),
     stateSummary: { total: 3, pending: 3, inProgress: 0, completed: 0 },
   }
+  h.metaByUrl.set(url, h.resume.currentMeta)
   h.downloadStates.states = [-1, 0, 1]
   h.resume.needPutStates = true
   assert.ok(h.intervalCallbacks.length > 0)
@@ -1097,4 +1104,77 @@ test('expired Resume task cannot land after deletion while restore reads are in 
   assert.equal(h.resume.taskId || 0, 0)
   assert.equal(h.resume.currentMeta, null)
   assert.equal(h.fired.includes('resume'), false)
+})
+
+
+test('cross-tab expiry deletion prevents an in-flight restore from landing', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  let resolveChunk
+  const chunk = new Promise((resolve) => {
+    resolveChunk = resolve
+  })
+  const h = createResumeHarness({
+    url,
+    initialResults: [{ id: 'live' }],
+    metaByUrl: {
+      [url]: {
+        id: 703,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
+        date: new Date(0),
+        stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
+      },
+    },
+    dataById: { 7030: () => chunk },
+    statesById: { 703: { id: 703, states: [-1] } },
+  })
+  await h.resume.ready
+  const pendingRestore = h.resume.restoreData()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // Simulate another tab expiring this shared IndexedDB task; no local tombstone is set.
+  await h.resume.IDB.delete('taskMeta', 703)
+  await h.resume.IDB.delete('taskStates', 703)
+  await h.resume.IDB.delete('taskData', 7030)
+  resolveChunk({ id: 7030, data: [{ id: 'expired' }] })
+  await pendingRestore
+
+  assert.equal(h.store.result[0].id, 'live')
+  assert.equal(h.resume.taskId || 0, 0)
+  assert.equal(h.resume.currentMeta, null)
+  assert.equal(h.fired.includes('resume'), false)
+})
+
+test('checkpoint does not recreate metadata deleted by another tab', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const meta = {
+    id: 704,
+    url,
+    URLWhenCrawlStart: url,
+    part: 1,
+    date: new Date(0),
+    stateSummary: { total: 2, pending: 2, inProgress: 0, completed: 0 },
+  }
+  const h = createResumeHarness({
+    url,
+    metaByUrl: { [url]: meta },
+    statesById: { 704: { id: 704, states: [-1, -1] } },
+  })
+  await h.resume.ready
+  h.resume.taskId = 704
+  h.resume.currentMeta = meta
+  h.downloadStates.states = [1, -1]
+  h.resume.needPutStates = true
+
+  // Another tab commits expiry deletion before this tab's progress checkpoint transaction.
+  await h.resume.IDB.delete('taskMeta', 704)
+  await h.resume.IDB.delete('taskStates', 704)
+  h.intervalCallbacks[0]()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(h.metaByUrl.has(url), false)
+  assert.equal(h.resume.taskId, 0)
+  assert.equal(h.resume.currentMeta, null)
+  assert.equal(h.putManyCalls.length, 0)
 })

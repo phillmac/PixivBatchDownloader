@@ -265,10 +265,16 @@ class Resume {
     ])
 
     await states.waitSettingInitialized()
+    const sharedMeta = (await this.IDB.get(
+      this.metaName,
+      meta.id
+    )) as TaskMeta | null
     if (
       generation !== this.restoreGeneration ||
       this.getURL() !== restoreUrl ||
-      this.invalidatedRestoreTaskIds.has(meta.id)
+      this.invalidatedRestoreTaskIds.has(meta.id) ||
+      !sharedMeta ||
+      sharedMeta.url !== meta.url
     ) {
       return
     }
@@ -451,11 +457,17 @@ class Resume {
           stateSummary: downloadStates.summary(),
         }
         this.needPutStates = false
-        void this.IDB.putMany([
-          { storeName: this.statesName, data: statesData },
-          { storeName: this.metaName, data: updatedMeta },
-        ]).then(() => {
-          if (this.currentMeta?.id === updatedMeta.id) {
+        void this.IDB.putManyIfPresent(
+          [
+            { storeName: this.statesName, data: statesData },
+            { storeName: this.metaName, data: updatedMeta },
+          ],
+          this.metaName,
+          updatedMeta.id
+        ).then((persisted) => {
+          if (!persisted) {
+            this.invalidateTaskOwnership(updatedMeta.id)
+          } else if (this.currentMeta?.id === updatedMeta.id) {
             this.currentMeta = updatedMeta
           }
         })
