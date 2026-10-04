@@ -69,6 +69,8 @@ class Resume {
   private currentMeta: TaskMeta | null = null
   /** 每次恢复尝试递增；用于阻止旧 SPA 路由的异步恢复落地。 */
   private restoreGeneration = 0
+  /** Tombstones deleted task ids so async reads issued before deletion cannot reclaim ownership. */
+  private readonly invalidatedRestoreTaskIds = new Set<number>()
   /** 表示恢复因 busy 被跳过或中途打断，下一次 idle 时必须重试。 */
   private restorePending = false
   /** 清除持久化数据时递增；使已排队/进行中的保存请求失效。 */
@@ -248,7 +250,7 @@ class Resume {
       restoreUrl,
       'url'
     )) as TaskMeta | null
-    if (!meta) {
+    if (!meta || this.invalidatedRestoreTaskIds.has(meta.id)) {
       return
     }
 
@@ -263,7 +265,11 @@ class Resume {
     ])
 
     await states.waitSettingInitialized()
-    if (generation !== this.restoreGeneration || this.getURL() !== restoreUrl) {
+    if (
+      generation !== this.restoreGeneration ||
+      this.getURL() !== restoreUrl ||
+      this.invalidatedRestoreTaskIds.has(meta.id)
+    ) {
       return
     }
     if (states.busy) {
@@ -459,6 +465,7 @@ class Resume {
 
   /** 清除指定持久化任务在内存中的 checkpoint 所有权和旧版摘要缓存。 */
   private invalidateTaskOwnership(taskId: number) {
+    this.invalidatedRestoreTaskIds.add(taskId)
     this.legacySummaryCache.delete(taskId)
     if (this.currentMeta?.id === taskId) {
       this.currentMeta = null

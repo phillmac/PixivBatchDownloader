@@ -1057,3 +1057,44 @@ test('expired Resume task invalidates matching checkpoint ownership before delet
   assert.equal(h.resume.needPutStates, false)
   assert.equal(h.resume.legacySummaryCache.has(701), false)
 })
+
+test('expired Resume task cannot land after deletion while restore reads are in flight', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  let resolveChunk
+  const chunk = new Promise((resolve) => {
+    resolveChunk = resolve
+  })
+  const h = createResumeHarness({
+    url,
+    initialResults: [{ id: 'live' }],
+    metaByUrl: {
+      [url]: {
+        id: 702,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
+        date: new Date(0),
+        stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
+      },
+    },
+    dataById: { 7020: () => chunk },
+    statesById: { 702: { id: 702, states: [-1] } },
+  })
+  await h.resume.ready
+  const pendingRestore = h.resume.restoreData()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // clearExired() uses this invalidation path before deleting the expired task.
+  h.resume.invalidateTaskOwnership(702)
+  await h.resume.IDB.delete('taskMeta', 702)
+  await h.resume.IDB.delete('taskStates', 702)
+  await h.resume.IDB.delete('taskData', 7020)
+
+  resolveChunk({ id: 7020, data: [{ id: 'expired' }] })
+  await pendingRestore
+
+  assert.equal(h.store.result[0].id, 'live')
+  assert.equal(h.resume.taskId || 0, 0)
+  assert.equal(h.resume.currentMeta, null)
+  assert.equal(h.fired.includes('resume'), false)
+})
