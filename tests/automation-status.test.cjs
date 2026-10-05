@@ -26,9 +26,14 @@ function harness(controller, durable) {
       )
     },
   }
+  const discardCalls = []
   const resume = {
     async getSavedTaskStatus() {
       return typeof durable === 'function' ? durable() : durable
+    },
+    async discardSavedTask(url) {
+      discardCalls.push(url)
+      return { discarded: true, url, taskId: 123 }
     },
   }
   const listeners = new Map()
@@ -81,6 +86,7 @@ function harness(controller, durable) {
     store,
     states,
     controller,
+    discardCalls,
     fire(name) {
       for (const callback of listeners.get(name) || []) callback()
     },
@@ -350,6 +356,38 @@ test('crawl ID gate rejects novel series when expanded size is unknown', () => {
   )
 })
 
+test('manual crawl stop is exposed as URL-scoped lifecycle state', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 3,
+    },
+    null
+  )
+  h.fire('crawlStart')
+  h.fire('stopCrawl')
+  let status = await h.exports.getAutomationStatus()
+  assert.equal(
+    status.lifecycle.crawlStopped.url,
+    'https://www.pixiv.net/en/users/1'
+  )
+  assert.ok(status.lifecycle.crawlStopped.at)
+
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1#works'
+  status = await h.exports.getAutomationStatus()
+  assert.equal(
+    status.lifecycle.crawlStopped.url,
+    'https://www.pixiv.net/en/users/1'
+  )
+
+  h.fire('crawlStart')
+  status = await h.exports.getAutomationStatus()
+  assert.equal(status.lifecycle.crawlStopped, null)
+})
+
 test('late ID completion after manual crawl stop discards the gate without leaking export state', () => {
   const h = harness(
     {
@@ -610,8 +648,19 @@ test('isolated world exposes read-only automation function', async () => {
   assert.equal(typeof h.context.__PBD_AUTOMATION_STATUS__, 'function')
   assert.equal(typeof h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__, 'function')
   assert.equal(typeof h.context.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__, 'function')
+  assert.equal(
+    typeof h.context.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__,
+    'function'
+  )
   assert.equal((await h.context.__PBD_AUTOMATION_STATUS__()).phase, 'IDLE')
   assert.equal(h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__(), null)
+  const discarded = await h.context.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__()
+  assert.deepEqual(JSON.parse(JSON.stringify(discarded)), {
+    discarded: true,
+    url: 'https://www.pixiv.net/en/users/1',
+    taskId: 123,
+  })
+  assert.deepEqual(h.discardCalls, ['https://www.pixiv.net/en/users/1'])
 })
 
 test('Resume status lookup skips IndexedDB when Resume is disabled off Pixiv', async () => {
@@ -776,6 +825,7 @@ function createResumeHarness(options = {}) {
     list: {
       pageSwitch: 'pageSwitch',
       settingInitialized: 'settingInitialized',
+      crawlStart: 'crawlStart',
       crawlComplete: 'crawlComplete',
       resultChange: 'resultChange',
       downloadSuccess: 'downloadSuccess',
@@ -888,6 +938,75 @@ function createResumeHarness(options = {}) {
     },
   }
 }
+
+test('Resume discard removes only the selected URL task', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const otherUrl = 'https://www.pixiv.net/en/users/2'
+  const h = createResumeHarness({
+    url,
+    metaByUrl: {
+      [url]: {
+        id: 101,
+        url,
+        URLWhenCrawlStart: url,
+        part: 2,
+        date: new Date('2026-10-03T00:00:00Z'),
+        stateSummary: { total: 2, pending: 2, inProgress: 0, completed: 0 },
+      },
+      [otherUrl]: {
+        id: 202,
+        url: otherUrl,
+        URLWhenCrawlStart: otherUrl,
+        part: 1,
+        date: new Date('2026-10-03T00:00:00Z'),
+        stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
+      },
+    },
+    dataById: {
+      1010: { id: 1010, data: [{ id: 'a' }] },
+      1011: { id: 1011, data: [{ id: 'b' }] },
+      2020: { id: 2020, data: [{ id: 'c' }] },
+    },
+    statesById: {
+      101: { id: 101, states: [-1, -1] },
+      202: { id: 202, states: [-1] },
+    },
+  })
+
+  const result = await h.resume.discardSavedTask(url + '#fragment')
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    discarded: true,
+    url,
+    taskId: 101,
+  })
+  assert.equal(h.metaByUrl.has(url), false)
+  assert.equal(h.statesById.has(101), false)
+  assert.equal(h.dataById.has(1010), false)
+  assert.equal(h.dataById.has(1011), false)
+  assert.equal(h.metaByUrl.has(otherUrl), true)
+  assert.equal(h.statesById.has(202), true)
+  assert.equal(h.dataById.has(2020), true)
+
+  // Late metadata callbacks after stop must not recreate the discarded queue.
+  h.store.URLWhenCrawlStart = url
+  h.store.result = [{ id: 'late' }]
+  h.downloadStates.states = [-1]
+  h.fire('resultChange')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.metaByUrl.has(url), false)
+
+  // A real new crawl re-enables persistence for this URL.
+  h.fire('crawlStart')
+  h.fire('resultChange')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.metaByUrl.has(url), true)
+
+  const second = await h.resume.discardSavedTask(url)
+  assert.equal(second.discarded, true)
+  assert.equal(second.url, url)
+  assert.equal(typeof second.taskId, 'number')
+  assert.equal(h.metaByUrl.has(url), false)
+})
 
 test('Resume status uses metadata summary without cloning taskStates', async () => {
   const url = 'https://www.pixiv.net/en/users/1'

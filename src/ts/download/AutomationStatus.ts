@@ -49,6 +49,7 @@ type CrawlIdListSnapshot = LifecycleObservation & {
 const lifecycle = {
   crawlStarted: null as LifecycleObservation | null,
   crawlCompleted: null as LifecycleObservation | null,
+  crawlStopped: null as LifecycleObservation | null,
   crawlEmpty: null as LifecycleObservation | null,
   downloadStarted: null as LifecycleObservation | null,
   downloadCompleted: null as LifecycleObservation | null,
@@ -180,6 +181,7 @@ window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe(window.location.href)
   crawlIdListSnapshot = null
   lifecycle.crawlCompleted = null
+  lifecycle.crawlStopped = null
   lifecycle.crawlEmpty = null
   resetDownloadLifecycle()
   lifecycle.resumed = null
@@ -197,6 +199,7 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
 })
 window.addEventListener(EVT.list.getIdListFinished, captureCrawlIdList)
 window.addEventListener(EVT.list.stopCrawl, () => {
+  lifecycle.crawlStopped = observe(crawlTaskUrl())
   // 只复位由自动化门限持有的临时状态，避免干扰其他功能。
   if (ownsTransientExportIdList) {
     states.exportIDList = false
@@ -299,6 +302,11 @@ export async function getAutomationStatus() {
   }
 }
 
+/** 删除当前页面 URL 对应的单个 Resume 任务，不影响其他页面保存的队列。 */
+export async function discardAutomationCurrentResume() {
+  return resume.discardSavedTask(normalizeUrl(window.location.href))
+}
+
 /** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
 export function getAutomationCrawlIdList() {
   const currentUrl = normalizeUrl(window.location.href)
@@ -320,7 +328,10 @@ const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
+  __PBD_AUTOMATION_DISCARD_CURRENT_RESUME__?: typeof discardAutomationCurrentResume
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
+automationGlobal.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__ =
+  discardAutomationCurrentResume

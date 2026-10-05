@@ -87,6 +87,8 @@ class Resume {
   private restorePending = false
   /** 清除持久化数据时递增；使已排队/进行中的保存请求失效。 */
   private persistenceGeneration = 0
+  /** 自动化放弃部分抓取后，禁止同 URL 的迟到 resultChange 重新保存，直到下一次 crawlStart。 */
+  private readonly suppressedSaveUrls = new Set<string>()
   /** 旧版无摘要任务的进程内标量缓存，避免状态轮询反复读取大数组。 */
   private readonly legacySummaryCache = new Map<number, DLStateSummary>()
 
@@ -105,6 +107,43 @@ class Resume {
 
     this.regularPutStates()
     this.clearExired()
+  }
+
+  /** 仅删除指定 URL 的持久化未完成任务，供外部自动化安全放弃部分抓取结果。 */
+  public async discardSavedTask(url = this.getURL()) {
+    await this.ready
+    const normalizedUrl = this.normalizeURL(url)
+    if (!Utils.isPixiv()) {
+      return { discarded: false, url: normalizedUrl, taskId: null }
+    }
+
+    // 先抑制这个 URL 的后续保存并使已经排队/进行中的旧快照失效，
+    // 避免停止抓取后的迟到 resultChange 在删除后又复活部分任务。
+    this.suppressedSaveUrls.add(normalizedUrl)
+    this.restoreGeneration++
+    this.persistenceGeneration++
+    this.restorePending = false
+    if (this.currentMeta?.url === normalizedUrl) {
+      this.invalidateTaskOwnership(this.currentMeta.id)
+    }
+
+    // 等正在执行的保存请求退出；旧代数请求会在写入前自行放弃。
+    while (this.saveDataDraining) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+    }
+
+    const meta = (await this.IDB.get(
+      this.metaName,
+      normalizedUrl,
+      'url'
+    )) as TaskMeta | null
+    if (!meta) {
+      return { discarded: false, url: normalizedUrl, taskId: null }
+    }
+
+    this.invalidateTaskOwnership(meta.id)
+    await this.deleteTaskRecords(meta)
+    return { discarded: true, url: normalizedUrl, taskId: meta.id }
   }
 
   /** 返回当前 URL 对应的持久化未完成任务摘要。 */
@@ -217,6 +256,10 @@ class Resume {
   }
 
   private bindEvents() {
+    window.addEventListener(EVT.list.crawlStart, () => {
+      this.suppressedSaveUrls.delete(this.getURL())
+    })
+
     // 切换页面时，重新检查恢复数据
     const restoreEvt = [EVT.list.pageSwitch, EVT.list.settingInitialized]
     restoreEvt.forEach((evt) => {
@@ -354,6 +397,7 @@ class Resume {
 
   private async saveData(url = this.getURL()) {
     const normalizedUrl = this.normalizeURL(url)
+    if (this.suppressedSaveUrls.has(normalizedUrl)) return
     const generation = this.persistenceGeneration
     const sharedGeneration = await this.getSharedGeneration()
     return new Promise<void>((resolve, reject) => {
