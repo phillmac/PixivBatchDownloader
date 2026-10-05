@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..')
 
 function harness(controller, durable) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
-  const store = { URLWhenCrawlStart: location.href }
+  const store = { URLWhenCrawlStart: location.href, idList: [] }
   const diagnostics = {
     automationSnapshot() {
       return controller
@@ -31,6 +31,7 @@ function harness(controller, durable) {
       crawlStart: 'crawlStart',
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
+      getIdListFinished: 'getIdListFinished',
       resultChange: 'resultChange',
       downloadStart: 'downloadStart',
       downloadComplete: 'downloadComplete',
@@ -213,6 +214,72 @@ test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async 
   )
 })
 
+test('pre-metadata ID list boundary exposes lightweight count and detached IDs', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '101', type: 'illusts', title: 'ignored' },
+    { id: '202', type: 'novelSeries', downloadIndexes: [0, 2] },
+  ]
+  h.fire('getIdListFinished')
+
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.phase, 'CRAWLING')
+  assert.equal(status.crawlIdList.count, 2)
+  assert.equal(status.crawlIdList.url, 'https://www.pixiv.net/en/users/1')
+  assert.equal('items' in status.crawlIdList, false)
+
+  const first = h.exports.getAutomationCrawlIdList()
+  assert.equal(first.schemaVersion, 1)
+  assert.equal(first.count, 2)
+  assert.deepEqual(JSON.parse(JSON.stringify(first.items)), [
+    { id: '101', type: 'illusts' },
+    { id: '202', type: 'novelSeries' },
+  ])
+
+  h.store.idList[0].id = 'mutated-store'
+  first.items[1].id = 'mutated-return-value'
+  const second = h.exports.getAutomationCrawlIdList()
+  assert.equal(second.items[0].id, '101')
+  assert.equal(second.items[1].id, '202')
+})
+
+test('harvested ID list is URL scoped and cleared by the next crawl start', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '303', type: 'manga' }]
+  h.fire('getIdListFinished')
+  assert.equal(h.exports.getAutomationCrawlIdList().count, 1)
+
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1/manga'
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+  assert.equal((await h.exports.getAutomationStatus()).crawlIdList, null)
+
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1'
+  assert.equal(h.exports.getAutomationCrawlIdList().count, 1)
+  h.fire('crawlStart')
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+  assert.equal((await h.exports.getAutomationStatus()).crawlIdList, null)
+})
+
 test('durable task stays RESTORING until the current URL resumes', async () => {
   const h = harness(
     {
@@ -346,7 +413,9 @@ test('isolated world exposes read-only automation function', async () => {
     null
   )
   assert.equal(typeof h.context.__PBD_AUTOMATION_STATUS__, 'function')
+  assert.equal(typeof h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__, 'function')
   assert.equal((await h.context.__PBD_AUTOMATION_STATUS__()).phase, 'IDLE')
+  assert.equal(h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__(), null)
 })
 
 test('Resume status lookup skips IndexedDB when Resume is disabled off Pixiv', async () => {

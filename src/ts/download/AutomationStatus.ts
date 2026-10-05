@@ -2,6 +2,7 @@ import { downloadDiagnostics } from './DownloadDiagnostics'
 import { resume } from './Resume'
 import { EVT } from '../EVT'
 import { store } from '../store/Store'
+import { IDTypeString } from '../store/StoreType'
 
 /** 自动化客户端可观察的下载器生命周期阶段。 */
 export type AutomationPhase =
@@ -18,6 +19,15 @@ export type AutomationPhase =
 /** 单个真实下载器事件的观察记录。 */
 type LifecycleObservation = { at: string; url: string }
 
+/** 自动化客户端读取的精简作品 ID 条目。 */
+type AutomationIdEntry = { id: string; type: IDTypeString }
+
+/** 在详细作品数据抓取开始前捕获的作品 ID 列表。 */
+type CrawlIdListSnapshot = LifecycleObservation & {
+  count: number
+  items: AutomationIdEntry[]
+}
+
 /** 当前内容脚本生命周期内观察到的真实下载器事件。 */
 const lifecycle = {
   crawlStarted: null as LifecycleObservation | null,
@@ -29,6 +39,9 @@ const lifecycle = {
   downloadStopped: null as LifecycleObservation | null,
   resumed: null as LifecycleObservation | null,
 }
+
+/** 当前内容脚本生命周期内最近一次抓取到的预元数据作品 ID 列表。 */
+let crawlIdListSnapshot: CrawlIdListSnapshot | null = null
 
 /** 生成带 URL 的事件观察，避免 Pixiv SPA 切页后串用旧状态。 */
 function normalizeUrl(url: string) {
@@ -68,9 +81,23 @@ function crawlTaskUrl() {
   return normalizeUrl(store.URLWhenCrawlStart || window.location.href)
 }
 
+/** 在 ID 列表过滤完成、详细作品数据抓取开始前保存一个独立快照。 */
+function captureCrawlIdList() {
+  const items = store.idList.map((item) => ({
+    id: item.id,
+    type: item.type,
+  }))
+  crawlIdListSnapshot = {
+    ...observe(crawlTaskUrl()),
+    count: items.length,
+    items,
+  }
+}
+
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
 window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe(window.location.href)
+  crawlIdListSnapshot = null
   lifecycle.crawlCompleted = null
   lifecycle.crawlEmpty = null
   resetDownloadLifecycle()
@@ -87,6 +114,7 @@ window.addEventListener(EVT.list.resultChange, () => {
 window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe(crawlTaskUrl())
 })
+window.addEventListener(EVT.list.getIdListFinished, captureCrawlIdList)
 window.addEventListener(EVT.list.downloadStart, () => {
   activeDownloadUrl = normalizeUrl(
     store.URLWhenCrawlStart || window.location.href
@@ -138,6 +166,14 @@ export async function getAutomationStatus() {
   const liveResultsBoundToCurrent = crawlObservedForCurrent || resumedForCurrent
   const stoppedForCurrent =
     stop && lifecycle.downloadStopped?.url === currentUrl
+  const crawlIdList =
+    crawlIdListSnapshot?.url === currentUrl
+      ? {
+          capturedAt: crawlIdListSnapshot.at,
+          url: crawlIdListSnapshot.url,
+          count: crawlIdListSnapshot.count,
+        }
+      : null
 
   let phase: AutomationPhase = 'IDLE'
   if (downloading) phase = 'DOWNLOADING'
@@ -161,6 +197,7 @@ export async function getAutomationStatus() {
     phase,
     page: { url: currentUrl },
     controller,
+    crawlIdList,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [
         key,
@@ -171,8 +208,25 @@ export async function getAutomationStatus() {
   }
 }
 
-/** 在隔离世界暴露只读自动化状态查询函数。 */
+/** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
+export function getAutomationCrawlIdList() {
+  const currentUrl = normalizeUrl(window.location.href)
+  if (!crawlIdListSnapshot || crawlIdListSnapshot.url !== currentUrl) {
+    return null
+  }
+  return {
+    schemaVersion: 1,
+    capturedAt: crawlIdListSnapshot.at,
+    url: crawlIdListSnapshot.url,
+    count: crawlIdListSnapshot.count,
+    items: crawlIdListSnapshot.items.map((item) => ({ ...item })),
+  }
+}
+
+/** 在隔离世界暴露只读自动化查询函数。 */
 const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
+  __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
+automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
