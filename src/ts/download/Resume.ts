@@ -325,7 +325,10 @@ class Resume {
 
     const restored: Result[] = []
     for (const taskData of chunks) {
-      restored.push(...taskData!.data)
+      // 单个持久化分块最多可有 150000 项，不能通过 spread 作为函数参数一次性追加。
+      for (const data of taskData!.data) {
+        restored.push(data)
+      }
     }
     store.result = restored
     store.resetDownloadCount()

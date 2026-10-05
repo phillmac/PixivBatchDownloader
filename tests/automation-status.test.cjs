@@ -1179,6 +1179,41 @@ test('restore rejects a partial three-store task snapshot even while metadata su
   assert.equal(h.fired.includes('resume'), false)
 })
 
+test('Resume restores a maximum-size persisted chunk without argument spreading', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const count = 150000
+  const h = createResumeHarness({
+    url,
+    initialResults: [{ id: 'live' }],
+    metaByUrl: {
+      [url]: {
+        id: 705,
+        url,
+        URLWhenCrawlStart: url,
+        part: 1,
+        date: new Date(0),
+        stateSummary: {
+          total: count,
+          pending: count,
+          inProgress: 0,
+          completed: 0,
+        },
+      },
+    },
+    dataById: {
+      7050: { id: 7050, data: new Array(count).fill({ id: 'restored' }) },
+    },
+    statesById: { 705: { id: 705, states: [-1] } },
+  })
+  await h.resume.ready
+  await h.resume.restoreData()
+
+  assert.equal(h.store.result.length, count)
+  assert.equal(h.store.result[0].id, 'restored')
+  assert.equal(h.store.result[count - 1].id, 'restored')
+  assert.equal(h.fired.includes('resume'), true)
+})
+
 test('shared clear generation cancels an in-flight save from another tab', async () => {
   const url = 'https://www.pixiv.net/en/users/1'
   const h = createResumeHarness({ url, initialResults: [{ id: 'queued' }] })
