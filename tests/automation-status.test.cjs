@@ -10,7 +10,12 @@ const root = path.resolve(__dirname, '..')
 function harness(controller, durable) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
   const store = { URLWhenCrawlStart: location.href, idList: [] }
-  const states = { busy: false, bookmarkMode: false, exportIDList: false }
+  const states = {
+    busy: false,
+    bookmarkMode: false,
+    exportIDList: false,
+    stopCrawl: false,
+  }
   const diagnostics = {
     automationSnapshot() {
       return controller
@@ -284,10 +289,11 @@ test('pre-armed ID gate rejects oversized crawls synchronously before metadata',
   assert.deepEqual(JSON.parse(JSON.stringify(status.crawlIdList.gate)), {
     maxCount: 1,
     decision: 'rejected',
+    reason: 'count-exceeded',
   })
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.exports.getAutomationCrawlIdList().gate)),
-    { maxCount: 1, decision: 'rejected' }
+    { maxCount: 1, decision: 'rejected', reason: 'count-exceeded' }
   )
 
   h.fire('stopCrawl')
@@ -313,8 +319,74 @@ test('pre-armed ID gate accepts within-limit crawls without arming early stop', 
   assert.equal(h.states.exportIDList, false)
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.exports.getAutomationCrawlIdList().gate)),
-    { maxCount: 2, decision: 'accepted' }
+    { maxCount: 2, decision: 'accepted', reason: null }
   )
+})
+
+test('crawl ID gate rejects novel series when expanded size is unknown', () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.exports.setAutomationCrawlIdGate(100)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '777', type: 'novelSeries' }]
+  h.fire('getIdListFinished')
+
+  assert.equal(h.states.exportIDList, true)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.exports.getAutomationCrawlIdList().gate)),
+    {
+      maxCount: 100,
+      decision: 'rejected',
+      reason: 'novel-series-size-unknown',
+    }
+  )
+})
+
+test('late ID completion after manual crawl stop discards the gate without leaking export state', () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.exports.setAutomationCrawlIdGate(1)
+  h.fire('crawlStart')
+
+  // StopCrawl fires the event before it flips states.stopCrawl. Simulate an ID filter
+  // finishing afterwards; that late completion must not re-arm the transient stop flag.
+  h.fire('stopCrawl')
+  h.states.stopCrawl = true
+  h.store.idList = [
+    { id: '801', type: 'illusts' },
+    { id: '802', type: 'illusts' },
+  ]
+  h.fire('getIdListFinished')
+
+  assert.equal(h.states.exportIDList, false)
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+
+  h.states.stopCrawl = false
+  h.states.busy = false
+  h.exports.setAutomationCrawlIdGate(1)
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '803', type: 'illusts' },
+    { id: '804', type: 'illusts' },
+  ]
+  h.fire('getIdListFinished')
+  assert.equal(h.states.exportIDList, true)
 })
 
 test('bookmark-only ID completion neither consumes the gate nor creates a crawl snapshot', async () => {
@@ -347,6 +419,7 @@ test('bookmark-only ID completion neither consumes the gate nor creates a crawl 
   h.fire('getIdListFinished')
   assert.equal(h.states.exportIDList, true)
   assert.equal(h.exports.getAutomationCrawlIdList().gate.decision, 'rejected')
+  assert.equal(h.exports.getAutomationCrawlIdList().gate.reason, 'count-exceeded')
 })
 
 test('crawl ID gate validates configuration and refuses mid-task mutation', () => {

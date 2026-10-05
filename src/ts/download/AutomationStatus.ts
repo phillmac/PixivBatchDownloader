@@ -25,6 +25,9 @@ type AutomationIdEntry = { id: string; type: IDTypeString }
 
 /** 自动化 ID 数量门限的同步判定结果。 */
 type CrawlIdGateDecision = 'accepted' | 'rejected'
+type CrawlIdGateRejectReason =
+  | 'count-exceeded'
+  | 'novel-series-size-unknown'
 
 /** 自动化客户端在抓取开始前预设的一次性 ID 数量门限。 */
 type CrawlIdGate = { maxCount: number }
@@ -33,7 +36,13 @@ type CrawlIdGate = { maxCount: number }
 type CrawlIdListSnapshot = LifecycleObservation & {
   count: number
   items: AutomationIdEntry[]
-  gate: { maxCount: number; decision: CrawlIdGateDecision } | null
+  gate:
+    | {
+        maxCount: number
+        decision: CrawlIdGateDecision
+        reason: CrawlIdGateRejectReason | null
+      }
+    | null
 }
 
 /** 当前内容脚本生命周期内观察到的真实下载器事件。 */
@@ -103,14 +112,33 @@ function captureCrawlIdList() {
     return
   }
 
+  // 用户可能在 ID 过滤仍在等待时停止抓取。stopCrawl 事件先于 states.stopCrawl=true，
+  // 所以迟到的 getIdListFinished 必须在这里丢弃门限，不能重新武装临时 exportIDList。
+  if (states.stopCrawl) {
+    crawlIdGate = null
+    if (ownsTransientExportIdList) {
+      states.exportIDList = false
+      ownsTransientExportIdList = false
+    }
+    return
+  }
+
   const items = store.idList.map((item) => ({
     id: item.id,
     type: item.type,
   }))
   const gate = crawlIdGate
   crawlIdGate = null
+  const containsNovelSeries = items.some((item) => item.type === 'novelSeries')
+  const rejectReason: CrawlIdGateRejectReason | null = gate
+    ? containsNovelSeries
+      ? 'novel-series-size-unknown'
+      : items.length > gate.maxCount
+      ? 'count-exceeded'
+      : null
+    : null
   const decision: CrawlIdGateDecision | null = gate
-    ? items.length > gate.maxCount
+    ? rejectReason
       ? 'rejected'
       : 'accepted'
     : null
@@ -125,7 +153,9 @@ function captureCrawlIdList() {
     ...observe(taskUrl),
     count: items.length,
     items,
-    gate: gate ? { maxCount: gate.maxCount, decision: decision! } : null,
+    gate: gate
+      ? { maxCount: gate.maxCount, decision: decision!, reason: rejectReason }
+      : null,
   }
 }
 
