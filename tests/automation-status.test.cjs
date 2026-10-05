@@ -9,7 +9,13 @@ const root = path.resolve(__dirname, '..')
 
 function harness(controller, durable) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
-  const store = { URLWhenCrawlStart: location.href }
+  const store = { URLWhenCrawlStart: location.href, idList: [] }
+  const states = {
+    busy: false,
+    bookmarkMode: false,
+    exportIDList: false,
+    stopCrawl: false,
+  }
   const diagnostics = {
     automationSnapshot() {
       return controller
@@ -31,6 +37,8 @@ function harness(controller, durable) {
       crawlStart: 'crawlStart',
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
+      stopCrawl: 'stopCrawl',
+      getIdListFinished: 'getIdListFinished',
       resultChange: 'resultChange',
       downloadStart: 'downloadStart',
       downloadComplete: 'downloadComplete',
@@ -64,12 +72,14 @@ function harness(controller, durable) {
     if (name === './Resume') return { resume }
     if (name === '../EVT') return { EVT }
     if (name === '../store/Store') return { store }
+    if (name === '../store/States') return { states }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   return {
     exports,
     context,
     store,
+    states,
     controller,
     fire(name) {
       for (const callback of listeners.get(name) || []) callback()
@@ -213,6 +223,258 @@ test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async 
   )
 })
 
+test('pre-metadata ID list boundary exposes lightweight count and detached IDs', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '101', type: 'illusts', title: 'ignored' },
+    { id: '202', type: 'novelSeries', downloadIndexes: [0, 2] },
+  ]
+  h.fire('getIdListFinished')
+
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.phase, 'CRAWLING')
+  assert.equal(status.crawlIdList.count, 2)
+  assert.equal(status.crawlIdList.url, 'https://www.pixiv.net/en/users/1')
+  assert.equal('items' in status.crawlIdList, false)
+
+  const first = h.exports.getAutomationCrawlIdList()
+  assert.equal(first.schemaVersion, 1)
+  assert.equal(first.count, 2)
+  assert.deepEqual(JSON.parse(JSON.stringify(first.items)), [
+    { id: '101', type: 'illusts' },
+    { id: '202', type: 'novelSeries' },
+  ])
+
+  h.store.idList[0].id = 'mutated-store'
+  first.items[1].id = 'mutated-return-value'
+  const second = h.exports.getAutomationCrawlIdList()
+  assert.equal(second.items[0].id, '101')
+  assert.equal(second.items[1].id, '202')
+})
+
+test('pre-armed ID gate rejects oversized crawls synchronously before metadata', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.exports.setAutomationCrawlIdGate(1))),
+    { armed: true, maxCount: 1 }
+  )
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '401', type: 'illusts' },
+    { id: '402', type: 'manga' },
+  ]
+  h.fire('getIdListFinished')
+
+  assert.equal(h.states.exportIDList, true)
+  const status = await h.exports.getAutomationStatus()
+  assert.deepEqual(JSON.parse(JSON.stringify(status.crawlIdList.gate)), {
+    maxCount: 1,
+    decision: 'rejected',
+    reason: 'count-exceeded',
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.exports.getAutomationCrawlIdList().gate)),
+    { maxCount: 1, decision: 'rejected', reason: 'count-exceeded' }
+  )
+
+  h.fire('stopCrawl')
+  assert.equal(h.states.exportIDList, false)
+})
+
+test('pre-armed ID gate accepts within-limit crawls without arming early stop', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.exports.setAutomationCrawlIdGate(2)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '501', type: 'novels' }]
+  h.fire('getIdListFinished')
+
+  assert.equal(h.states.exportIDList, false)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.exports.getAutomationCrawlIdList().gate)),
+    { maxCount: 2, decision: 'accepted', reason: null }
+  )
+})
+
+test('crawl ID gate rejects novel series when expanded size is unknown', () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.exports.setAutomationCrawlIdGate(100)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '777', type: 'novelSeries' }]
+  h.fire('getIdListFinished')
+
+  assert.equal(h.states.exportIDList, true)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.exports.getAutomationCrawlIdList().gate)),
+    {
+      maxCount: 100,
+      decision: 'rejected',
+      reason: 'novel-series-size-unknown',
+    }
+  )
+})
+
+test('late ID completion after manual crawl stop discards the gate without leaking export state', () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.exports.setAutomationCrawlIdGate(1)
+  h.fire('crawlStart')
+
+  // StopCrawl fires the event before it flips states.stopCrawl. Simulate an ID filter
+  // finishing afterwards; that late completion must not re-arm the transient stop flag.
+  h.fire('stopCrawl')
+  h.states.stopCrawl = true
+  h.store.idList = [
+    { id: '801', type: 'illusts' },
+    { id: '802', type: 'illusts' },
+  ]
+  h.fire('getIdListFinished')
+
+  assert.equal(h.states.exportIDList, false)
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+
+  h.states.stopCrawl = false
+  h.states.busy = false
+  h.exports.setAutomationCrawlIdGate(1)
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '803', type: 'illusts' },
+    { id: '804', type: 'illusts' },
+  ]
+  h.fire('getIdListFinished')
+  assert.equal(h.states.exportIDList, true)
+})
+
+test('bookmark-only ID completion neither consumes the gate nor creates a crawl snapshot', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.exports.setAutomationCrawlIdGate(1)
+  h.states.bookmarkMode = true
+  h.store.idList = [
+    { id: '601', type: 'illusts' },
+    { id: '602', type: 'illusts' },
+  ]
+  h.fire('getIdListFinished')
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+  assert.equal(h.states.exportIDList, false)
+
+  h.states.bookmarkMode = false
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '603', type: 'illusts' },
+    { id: '604', type: 'illusts' },
+  ]
+  h.fire('getIdListFinished')
+  assert.equal(h.states.exportIDList, true)
+  assert.equal(h.exports.getAutomationCrawlIdList().gate.decision, 'rejected')
+  assert.equal(h.exports.getAutomationCrawlIdList().gate.reason, 'count-exceeded')
+})
+
+test('crawl ID gate validates configuration and refuses mid-task mutation', () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  assert.throws(
+    () => h.exports.setAutomationCrawlIdGate(-1),
+    /maxCount must be a non-negative safe integer or null/
+  )
+  assert.throws(
+    () => h.exports.setAutomationCrawlIdGate(1.5),
+    /maxCount must be a non-negative safe integer or null/
+  )
+  h.states.busy = true
+  assert.throws(
+    () => h.exports.setAutomationCrawlIdGate(10),
+    /cannot configure crawl ID gate while downloader is busy/
+  )
+})
+
+test('harvested ID list is URL scoped and cleared by the next crawl start', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '303', type: 'manga' }]
+  h.fire('getIdListFinished')
+  assert.equal(h.exports.getAutomationCrawlIdList().count, 1)
+
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1/manga'
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+  assert.equal((await h.exports.getAutomationStatus()).crawlIdList, null)
+
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/1'
+  assert.equal(h.exports.getAutomationCrawlIdList().count, 1)
+  h.fire('crawlStart')
+  assert.equal(h.exports.getAutomationCrawlIdList(), null)
+  assert.equal((await h.exports.getAutomationStatus()).crawlIdList, null)
+})
+
 test('durable task stays RESTORING until the current URL resumes', async () => {
   const h = harness(
     {
@@ -346,7 +608,10 @@ test('isolated world exposes read-only automation function', async () => {
     null
   )
   assert.equal(typeof h.context.__PBD_AUTOMATION_STATUS__, 'function')
+  assert.equal(typeof h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__, 'function')
+  assert.equal(typeof h.context.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__, 'function')
   assert.equal((await h.context.__PBD_AUTOMATION_STATUS__()).phase, 'IDLE')
+  assert.equal(h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__(), null)
 })
 
 test('Resume status lookup skips IndexedDB when Resume is disabled off Pixiv', async () => {
@@ -595,6 +860,7 @@ function createResumeHarness(options = {}) {
     if (name === '../Language') return { lang: { transl: (value) => value } }
     if (name === '../store/Store') return { store }
     if (name === '../store/States') return { states }
+    if (name === '../store/States') return { states }
     if (name === './DownloadStates') return { downloadStates }
     if (name === '../utils/IndexedDB') return { IndexedDB }
     if (name === '../utils/Utils') return { Utils: { isPixiv: () => true } }
@@ -710,6 +976,7 @@ test('DownloadStates maintains scalar counts incrementally', () => {
   })((name) => {
     if (name === '../EVT') return { EVT }
     if (name === '../store/Store') return { store }
+    if (name === '../store/States') return { states }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   const ds = exports.downloadStates
@@ -781,6 +1048,7 @@ test('imported results bind the queue to the current page URL', async () => {
       return { Utils: { loadJSONFile: async () => [imported] } }
     if (name === '../store/States') return { states: { busy: false } }
     if (name === '../store/Store') return { store }
+    if (name === '../store/States') return { states }
     if (name === '../Toast') return { toast: { error() {} } }
     if (name === '../MsgBox')
       return { msgBox: { error() {}, warning() {}, success() {} } }

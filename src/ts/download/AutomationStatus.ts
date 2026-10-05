@@ -2,6 +2,8 @@ import { downloadDiagnostics } from './DownloadDiagnostics'
 import { resume } from './Resume'
 import { EVT } from '../EVT'
 import { store } from '../store/Store'
+import { states } from '../store/States'
+import { IDTypeString } from '../store/StoreType'
 
 /** 自动化客户端可观察的下载器生命周期阶段。 */
 export type AutomationPhase =
@@ -18,6 +20,31 @@ export type AutomationPhase =
 /** 单个真实下载器事件的观察记录。 */
 type LifecycleObservation = { at: string; url: string }
 
+/** 自动化客户端读取的精简作品 ID 条目。 */
+type AutomationIdEntry = { id: string; type: IDTypeString }
+
+/** 自动化 ID 数量门限的同步判定结果。 */
+type CrawlIdGateDecision = 'accepted' | 'rejected'
+type CrawlIdGateRejectReason =
+  | 'count-exceeded'
+  | 'novel-series-size-unknown'
+
+/** 自动化客户端在抓取开始前预设的一次性 ID 数量门限。 */
+type CrawlIdGate = { maxCount: number }
+
+/** 在详细作品数据抓取开始前捕获的作品 ID 列表。 */
+type CrawlIdListSnapshot = LifecycleObservation & {
+  count: number
+  items: AutomationIdEntry[]
+  gate:
+    | {
+        maxCount: number
+        decision: CrawlIdGateDecision
+        reason: CrawlIdGateRejectReason | null
+      }
+    | null
+}
+
 /** 当前内容脚本生命周期内观察到的真实下载器事件。 */
 const lifecycle = {
   crawlStarted: null as LifecycleObservation | null,
@@ -29,6 +56,15 @@ const lifecycle = {
   downloadStopped: null as LifecycleObservation | null,
   resumed: null as LifecycleObservation | null,
 }
+
+/** 当前内容脚本生命周期内最近一次抓取到的预元数据作品 ID 列表。 */
+let crawlIdListSnapshot: CrawlIdListSnapshot | null = null
+
+/** 仅应用于下一次正常抓取的自动化 ID 数量门限。 */
+let crawlIdGate: CrawlIdGate | null = null
+
+/** 记录 transient exportIDList 是否由自动化门限设置，避免复位其他功能的状态。 */
+let ownsTransientExportIdList = false
 
 /** 生成带 URL 的事件观察，避免 Pixiv SPA 切页后串用旧状态。 */
 function normalizeUrl(url: string) {
@@ -68,9 +104,81 @@ function crawlTaskUrl() {
   return normalizeUrl(store.URLWhenCrawlStart || window.location.href)
 }
 
+/** 在 ID 列表过滤完成、详细作品数据抓取开始前保存快照并同步执行自动化门限。 */
+function captureCrawlIdList() {
+  // 批量收藏也会触发 getIdListFinished，但它不是抓取任务，不能消费自动化门限或污染抓取快照。
+  const taskUrl = lifecycle.crawlStarted?.url
+  if (states.bookmarkMode || !taskUrl) {
+    return
+  }
+
+  // 用户可能在 ID 过滤仍在等待时停止抓取。stopCrawl 事件先于 states.stopCrawl=true，
+  // 所以迟到的 getIdListFinished 必须在这里丢弃门限，不能重新武装临时 exportIDList。
+  if (states.stopCrawl) {
+    crawlIdGate = null
+    if (ownsTransientExportIdList) {
+      states.exportIDList = false
+      ownsTransientExportIdList = false
+    }
+    return
+  }
+
+  const items = store.idList.map((item) => ({
+    id: item.id,
+    type: item.type,
+  }))
+  const gate = crawlIdGate
+  crawlIdGate = null
+  const containsNovelSeries = items.some((item) => item.type === 'novelSeries')
+  const rejectReason: CrawlIdGateRejectReason | null = gate
+    ? containsNovelSeries
+      ? 'novel-series-size-unknown'
+      : items.length > gate.maxCount
+      ? 'count-exceeded'
+      : null
+    : null
+  const decision: CrawlIdGateDecision | null = gate
+    ? rejectReason
+      ? 'rejected'
+      : 'accepted'
+    : null
+
+  // 复用下载器现有的生产级“获取 ID 列表后停止”路径；不启用持久设置，因此不会导出 JSON 文件。
+  if (decision === 'rejected') {
+    states.exportIDList = true
+    ownsTransientExportIdList = true
+  }
+
+  crawlIdListSnapshot = {
+    ...observe(taskUrl),
+    count: items.length,
+    items,
+    gate: gate
+      ? { maxCount: gate.maxCount, decision: decision!, reason: rejectReason }
+      : null,
+  }
+}
+
+/** 预设下一次正常抓取的作品 ID 数量门限；超过门限时会在元数据请求前停止。 */
+export function setAutomationCrawlIdGate(maxCount: number | null) {
+  if (states.busy) {
+    throw new Error('cannot configure crawl ID gate while downloader is busy')
+  }
+  if (maxCount === null) {
+    crawlIdGate = null
+    return { armed: false, maxCount: null }
+  }
+  if (!Number.isSafeInteger(maxCount) || maxCount < 0) {
+    throw new RangeError('maxCount must be a non-negative safe integer or null')
+  }
+  crawlIdGate = { maxCount }
+  return { armed: true, maxCount }
+}
+
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
 window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe(window.location.href)
+  crawlIdListSnapshot = null
   lifecycle.crawlCompleted = null
   lifecycle.crawlEmpty = null
   resetDownloadLifecycle()
@@ -86,6 +194,14 @@ window.addEventListener(EVT.list.resultChange, () => {
 })
 window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe(crawlTaskUrl())
+})
+window.addEventListener(EVT.list.getIdListFinished, captureCrawlIdList)
+window.addEventListener(EVT.list.stopCrawl, () => {
+  // 只复位由自动化门限持有的临时状态，避免干扰其他功能。
+  if (ownsTransientExportIdList) {
+    states.exportIDList = false
+    ownsTransientExportIdList = false
+  }
 })
 window.addEventListener(EVT.list.downloadStart, () => {
   activeDownloadUrl = normalizeUrl(
@@ -138,6 +254,17 @@ export async function getAutomationStatus() {
   const liveResultsBoundToCurrent = crawlObservedForCurrent || resumedForCurrent
   const stoppedForCurrent =
     stop && lifecycle.downloadStopped?.url === currentUrl
+  const crawlIdList =
+    crawlIdListSnapshot?.url === currentUrl
+      ? {
+          capturedAt: crawlIdListSnapshot.at,
+          url: crawlIdListSnapshot.url,
+          count: crawlIdListSnapshot.count,
+          gate: crawlIdListSnapshot.gate
+            ? { ...crawlIdListSnapshot.gate }
+            : null,
+        }
+      : null
 
   let phase: AutomationPhase = 'IDLE'
   if (downloading) phase = 'DOWNLOADING'
@@ -161,6 +288,7 @@ export async function getAutomationStatus() {
     phase,
     page: { url: currentUrl },
     controller,
+    crawlIdList,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [
         key,
@@ -171,8 +299,28 @@ export async function getAutomationStatus() {
   }
 }
 
-/** 在隔离世界暴露只读自动化状态查询函数。 */
+/** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
+export function getAutomationCrawlIdList() {
+  const currentUrl = normalizeUrl(window.location.href)
+  if (!crawlIdListSnapshot || crawlIdListSnapshot.url !== currentUrl) {
+    return null
+  }
+  return {
+    schemaVersion: 1,
+    capturedAt: crawlIdListSnapshot.at,
+    url: crawlIdListSnapshot.url,
+    count: crawlIdListSnapshot.count,
+    gate: crawlIdListSnapshot.gate ? { ...crawlIdListSnapshot.gate } : null,
+    items: crawlIdListSnapshot.items.map((item) => ({ ...item })),
+  }
+}
+
+/** 在隔离世界暴露只读自动化查询函数。 */
 const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
+  __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
+  __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
+automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
+automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
