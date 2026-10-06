@@ -1,3 +1,6 @@
+import { CrawlRateClient } from '../crawl/CrawlRateClient'
+import { store } from '../store/Store'
+import { Tools } from '../Tools'
 import { API } from '../API'
 import { ppdTask } from '../PPDTask'
 import { Utils } from '../utils/Utils'
@@ -109,11 +112,22 @@ class WorkPublishTime {
       id = min_novel
     }
 
-    while (id < end) {
-      const data = await this.crawlWork(id, type)
-      result.push(data)
-      // 使用下一个接近 10000 倍数的 id 进行下一次抓取
-      id = (Math.floor(data[0] / this.gap) + 1) * this.gap
+    if (id < end) {
+      const client = new CrawlRateClient(
+        `work-publish-time:${crypto.randomUUID()}`,
+        store.loggedUserID || Tools.getLoggedUserID(),
+        Math.max(1, Math.ceil((end - id) / this.gap))
+      )
+      try {
+        while (id < end) {
+          const data = await this.crawlWork(id, type, client)
+          result.push(data)
+          // 使用下一个接近 10000 倍数的 id 进行下一次抓取
+          id = (Math.floor(data[0] / this.gap) + 1) * this.gap
+        }
+      } finally {
+        client.finish()
+      }
     }
 
     console.log(result)
@@ -136,31 +150,33 @@ class WorkPublishTime {
     return result
   }
 
-  // 获取指定作品的发布时间
-  // 如果抓取出错（如 404 错误），则顺延到下一个作品 id 重试抓取
+  /** 获取指定作品的发布时间；404 时顺延 ID，重试仍需共用会话许可。 */
   private async crawlWork(
     id: number,
-    type: 'illusts' | 'novels' = 'illusts'
+    type: 'illusts' | 'novels',
+    client: CrawlRateClient
   ): Promise<number[]> {
     // 为了避免出现 429 错误，每次抓取之间设置了间隔时间
     await Utils.sleep(1600)
     try {
+      if (!(await client.permit(() => true)))
+        throw new Error('Metadata session closed')
       const data = await API[
         type === 'illusts' ? 'getArtworkData' : 'getNovelData'
       ](id.toString())
       if (data.error === false) {
         const dateStr = data.body.createDate
         if (!dateStr) {
-          return this.crawlWork(++id, type)
+          return this.crawlWork(++id, type, client)
         }
         // 正常获取到数据，返回作品 id 和发布时间的时间戳
         const time = new Date(dateStr).getTime()
         return [id, time]
       } else {
-        return this.crawlWork(++id, type)
+        return this.crawlWork(++id, type, client)
       }
     } catch (error) {
-      return this.crawlWork(++id, type)
+      return this.crawlWork(++id, type, client)
     }
   }
 }

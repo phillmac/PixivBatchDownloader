@@ -1,3 +1,4 @@
+import { CrawlRateClient } from '../crawl/CrawlRateClient'
 import { API } from '../API'
 import { lang } from '../Language'
 import { BookmarkResult } from '../crawl/CrawlResult'
@@ -143,43 +144,56 @@ class BookmarkAllWorks {
     this.complete()
   }
 
-  // 获取每个作品的 tag 数据
+  /** 获取每个作品的标签；整个批次共用一个账号会话。 */
   private async getTagData() {
-    for (const id of this.idList) {
-      this.textSpan.textContent = `Get data ${this.bookmarKData.length} / ${this.idList.length}`
-      const noTagData = {
-        type: id.type,
-        id: id.id,
-        tags: [],
-        restrict: false,
-      }
-      try {
-        // 如果下载器的收藏按钮设置为“不添加标签”，就不需要请求作品的数据
-        if (!settings.widthTagBoolean) {
-          this.bookmarKData.push(noTagData)
-          continue
-        }
-
-        // 如果作品数量大于一定数量，则启用慢速抓取，以免在获取作品数据时发生 429 错误
-        const delay = this.idList.length >= 120 ? settings.slowCrawlDealy : 0
-        await Utils.sleep(delay)
-        let data
-        if (id.type === 'novels') {
-          data = await API.getNovelData(id.id)
-        } else {
-          data = await API.getArtworkData(id.id)
-        }
-
-        this.bookmarKData.push({
+    const client =
+      settings.widthTagBoolean && this.idList.length
+        ? new CrawlRateClient(
+            `bookmark-all:${crypto.randomUUID()}`,
+            store.loggedUserID || Tools.getLoggedUserID(),
+            this.idList.length
+          )
+        : undefined
+    try {
+      for (const id of this.idList) {
+        this.textSpan.textContent = `Get data ${this.bookmarKData.length} / ${this.idList.length}`
+        const noTagData = {
           type: id.type,
-          id: data.body.id,
-          tags: Tools.extractTags(data),
+          id: id.id,
+          tags: [],
           restrict: false,
-        })
-      } catch (error) {
-        // 出现错误时，添加没有 tags 的数据。因为对于添加收藏的任务来说，附带 tags 不是必须的
-        this.bookmarKData.push(noTagData)
+        }
+        try {
+          // 如果下载器的收藏按钮设置为“不添加标签”，就不需要请求作品的数据
+          if (!settings.widthTagBoolean) {
+            this.bookmarKData.push(noTagData)
+            continue
+          }
+
+          // 如果作品数量大于一定数量，则启用慢速抓取，以免在获取作品数据时发生 429 错误
+          const delay = this.idList.length >= 120 ? settings.slowCrawlDealy : 0
+          await Utils.sleep(delay)
+          if (!client || !(await client.permit(() => true))) return
+          let data
+          if (id.type === 'novels') {
+            data = await API.getNovelData(id.id)
+          } else {
+            data = await API.getArtworkData(id.id)
+          }
+
+          this.bookmarKData.push({
+            type: id.type,
+            id: data.body.id,
+            tags: Tools.extractTags(data),
+            restrict: false,
+          })
+        } catch (error) {
+          // 出现错误时，添加没有 tags 的数据。因为对于添加收藏的任务来说，附带 tags 不是必须的
+          this.bookmarKData.push(noTagData)
+        }
       }
+    } finally {
+      client?.finish()
     }
   }
 

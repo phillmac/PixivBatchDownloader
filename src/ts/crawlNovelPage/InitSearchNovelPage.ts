@@ -16,7 +16,6 @@ import { msgBox } from '../MsgBox'
 import { crawlTagList } from '../crawlMixedPage/CrawlTagList'
 import { states } from '../store/States'
 import { Config } from '../Config'
-import { vipSearchOptimize } from '../crawl/VipSearchOptimize'
 import { settings } from '../setting/Settings'
 import { pageType } from '../PageType'
 import '../filter/FilterSearchResults'
@@ -452,8 +451,8 @@ class InitSearchNovelPage extends InitPageBase {
         // 如果是系列小说，则不进行检查（虽然系列小说的数据里含有最后一篇小说的 id，但不能用于这项检查）
         const novelId = this.getNovelId(lastWork)
         if (novelId) {
-          const check = await vipSearchOptimize.checkWork(novelId, 'novels')
-          if (!ownsCrawl(generation)) return
+          const check = await this.checkVipWork(novelId, 'novels', generation)
+          if (!ownsCrawl(generation) || states.stopCrawl) return
           if (check) {
             log.log(lang.transl('_后续作品低于最低收藏数量要求跳过后续作品'))
             log.log(lang.transl('_列表页抓取完成'))

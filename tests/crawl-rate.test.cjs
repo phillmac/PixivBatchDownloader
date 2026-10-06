@@ -410,6 +410,16 @@ test('expired client re-registers paced and closed client cannot resume', async 
     messages.filter((m) => m.action === 'register').map((m) => m.workCount),
     [40, 51]
   )
+  client.updateWorkCount(45)
+  await client.permit(() => true)
+  assert.equal(messages.filter((m) => m.action === 'register').length, 2)
+  client.addWorkCount(1)
+  await client.permit(() => true)
+  assert.equal(
+    messages.filter((m) => m.action === 'register').at(-1).workCount,
+    52
+  )
+  assert.equal(new Set(messages.map((m) => m.id)).size, 1)
   client.finish()
   const count = permits
   assert.equal(await client.permit(() => true), false)
@@ -539,6 +549,7 @@ test('direct metadata worker entry creates one rate session before imported work
             this.finished = 0
             clients.push(this)
           }
+          updateWorkCount() {}
           finish() {
             this.finished++
           }

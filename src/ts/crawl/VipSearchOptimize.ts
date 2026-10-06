@@ -1,3 +1,4 @@
+import { CrawlMetadataPermit } from './CrawlRateClient'
 import { EVT } from '../EVT'
 import { pageType } from '../PageType'
 import { settings } from '../setting/Settings'
@@ -63,12 +64,15 @@ class VipSearchOptimize {
    */
   public async checkWork(
     id: string,
-    workType: WorkTypeString
+    workType: WorkTypeString,
+    permit: CrawlMetadataPermit
   ): Promise<boolean> {
     // 如果未启用会员搜索优化，或者没有设置收藏数量要求，则不停止抓取
     if (!this.vipSearchOptimize || !settings.BMKNumSwitch) {
       return false
     }
+
+    if (!(await permit.acquire()) || !permit.valid()) return false
 
     let bmk = 99999999
     if (workType === 'novels') {
@@ -79,6 +83,7 @@ class VipSearchOptimize {
       bmk = data.body.bookmarkCount
     }
 
+    if (!permit.valid()) return false
     const check = bmk >= settings.BMKNumMin
     if (!check) {
       console.log('抽查的作品收藏数量低于最低要求，停止抓取')
