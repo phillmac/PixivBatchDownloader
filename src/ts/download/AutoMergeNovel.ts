@@ -1,4 +1,5 @@
 import { EVT } from '../EVT'
+import { CrawlGeneration, ownsCrawl } from '../crawl/CrawlGeneration'
 import { lang } from '../Language'
 import { log } from '../Log'
 import { settings } from '../setting/Settings'
@@ -46,8 +47,9 @@ class AutoMergeNovel {
   }
 
   /** 获取下一个系列 id 进行处理。这个 id 依然存在于 pendingQueue 里，等到合并完成后才会移除它 */
-  private async next(): Promise<string> {
+  private async next(generation?: CrawlGeneration): Promise<string> {
     while (true) {
+      if (generation !== undefined && !ownsCrawl(generation)) return ''
       if (
         this.pendingQueue.length > 0 &&
         this.pendingQueue[0] !== this.workingId
@@ -59,9 +61,16 @@ class AutoMergeNovel {
   }
 
   /** 如果某个系列 id 已经存在于等待队列里，则等待这个系列合并完成（等待它从等待队列里移除） */
-  private async waitMergeComplete(seriesId: string) {
+  private async waitMergeComplete(
+    seriesId: string,
+    generation?: CrawlGeneration
+  ) {
     while (true) {
-      if (this.stop || !this.pendingQueue.includes(seriesId)) {
+      if (
+        this.stop ||
+        (generation !== undefined && !ownsCrawl(generation)) ||
+        !this.pendingQueue.includes(seriesId)
+      ) {
         return
       }
       await Utils.sleep(500)
@@ -72,8 +81,10 @@ class AutoMergeNovel {
   public async merge(
     seriesId: string,
     seriesTitle?: string,
-    forceStart = false
+    forceStart = false,
+    generation?: CrawlGeneration
   ) {
+    if (generation !== undefined && !ownsCrawl(generation)) return
     if (!seriesId) {
       toast.error('seriesId is undefined')
       return
@@ -95,12 +106,11 @@ class AutoMergeNovel {
       // 尤其是当作品数量不满足“减慢抓取速度”的条件时，getWorksData 的抓取速度很快
       // 这样两个模块会同时发送请求，会增加用户被 Pixiv 警告的风险
       // 所以如果 absent 为 false，则等待这个系列合并完成（这会让 getWorksData 也保持等待），避免两个模块同时发送请求
-      await this.waitMergeComplete(seriesId)
+      await this.waitMergeComplete(seriesId, generation)
       return
     }
 
-    if (this.stop) {
-      // console.log('auto merge stopped')
+    if (this.stop || (generation !== undefined && !ownsCrawl(generation))) {
       return
     }
 
@@ -108,16 +118,17 @@ class AutoMergeNovel {
 
     this.showTip()
 
-    this.workingId = await this.next()
+    this.workingId = await this.next(generation)
+    if (!this.workingId) return
     const seriesTitleLog = this.idTitleMap[this.workingId]
     const novelTotal = await new MergeNovel().merge(
       this.workingId,
       seriesTitleLog,
-      true
+      true,
+      generation
     )
 
-    if (this.stop) {
-      // console.log('auto merge stopped')
+    if (this.stop || (generation !== undefined && !ownsCrawl(generation))) {
       return
     }
 
@@ -157,6 +168,9 @@ class AutoMergeNovel {
     })
 
     window.addEventListener(EVT.list.crawlStart, () => {
+      // A new crawl owns a fresh queue; callbacks from the old generation cannot
+      // repopulate it because they carry the revoked generation.
+      this.reset()
       this.stop = false
     })
   }

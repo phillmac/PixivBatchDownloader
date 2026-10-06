@@ -566,7 +566,7 @@ abstract class InitPageBase {
         if (canMerge) {
           const seriseTitle = data.body.seriesNavData?.title
           this.mergedNovelCount++
-          await autoMergeNovel.merge(seriesId, seriseTitle)
+          await autoMergeNovel.merge(seriesId, seriseTitle, false, generation)
           if (!ownsCrawl(generation)) return
         }
         // 如果这个小说不会被合并，或者即使合并也不跳过它，则保存到抓取结果里
@@ -578,7 +578,7 @@ abstract class InitPageBase {
       } else if (idData.type === 'novelSeries') {
         // 合并系列小说
         this.mergedNovelCount++
-        await new MergeNovel().merge(id, idData.title, true)
+        await new MergeNovel().merge(id, idData.title, true, generation)
         if (!ownsCrawl(generation)) return
         this.afterGetWorksData(undefined, generation)
       } else {

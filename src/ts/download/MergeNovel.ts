@@ -1,4 +1,5 @@
 import { EVT } from '../EVT'
+import { CrawlGeneration, ownsCrawl } from '../crawl/CrawlGeneration'
 import { Utils } from '../utils/Utils'
 import { settings } from '../setting/Settings'
 import { lang } from '../Language'
@@ -88,6 +89,14 @@ class MergeNovel {
   private readonly limit = 30
   private last = 0
   private slowMode = false
+  /** Parent crawl lease. Direct/manual merges do not carry one. */
+  private crawlGeneration?: CrawlGeneration
+  /** A revoked parent crawl may finish network I/O but cannot publish side effects. */
+  private isCancelled = () =>
+    this.crawlGeneration !== undefined && !ownsCrawl(this.crawlGeneration)
+  /** Asset download cancellation combines normal download stop and crawl revocation. */
+  private assetCancelled = () =>
+    downloadNovelEmbeddedImage.stop || this.isCancelled()
 
   private readonly CRLF = '\n' // 小说的换行符
   private readonly CRLF2 = '\n\n'
@@ -117,41 +126,47 @@ class MergeNovel {
   public async merge(
     seriesId: string | number,
     seriesTitle?: string,
-    slowMode: boolean = false
+    slowMode: boolean = false,
+    generation?: CrawlGeneration
   ): Promise<number> {
     if (!seriesId) {
       toast.error(`seriesId is undefined`)
       return 0
     }
 
+    this.crawlGeneration = generation
+    if (this.isCancelled()) return 0
+
     const link = this.initMergeContext(seriesId, seriesTitle, slowMode)
     const canMerge = await this.checkCanMergeSeries(seriesTitle, link)
-    if (!canMerge) {
-      return 0
-    }
+    if (this.isCancelled() || !canMerge) return 0
 
     this.logMergeStart(link)
     this.closeSettingsPanelOnSeriesPage()
 
     const gotNovelIds = await this.tryGetNovelIds(link)
-    if (!gotNovelIds) {
-      return 0
-    }
+    if (this.isCancelled() || !gotNovelIds) return 0
 
     this.enableSlowModeIfNeeded()
     await this.getAllNovelData()
+    if (this.isCancelled()) return 0
     await this.loadGlossaryData(seriesId)
+    if (this.isCancelled()) return 0
     const body = await this.loadSeriesData()
+    if (this.isCancelled() || !body) return 0
 
     this.novelName = mergeNovelFileName.getName(
       this.seriesData!,
       this.seriesBookmarkCount
     )
     await this.mergeByFormat(body)
+    if (this.isCancelled()) return 0
     await this.downloadSeriesCoverFile(body.cover.urls.original)
+    if (this.isCancelled()) return 0
 
     this.logMergeFinished(link)
     await this.saveMergedNovelDownloadRecords()
+    if (this.isCancelled()) return 0
     this.scheduleReset()
     return this.allNovelData.length
   }
@@ -230,7 +245,9 @@ class MergeNovel {
     // 因为最常见的错误是 404, 如果遇到 404, 这一步就可以检查出来，不必向下执行了
     try {
       await this.sleep(this.crawlInterval)
+      if (this.isCancelled()) return false
       await this.getNovelIds()
+      if (this.isCancelled()) return false
     } catch (error) {
       log.error(`❌${lang.transl('_发生错误取消合并这个系列小说')} ${link}`)
       return false
@@ -268,6 +285,7 @@ class MergeNovel {
       this.seriesId,
       this.crawlInterval
     )
+    if (this.isCancelled()) return
 
     // 获取设定资料里的图片的数据
     for (const categorie of data.result) {
@@ -290,8 +308,10 @@ class MergeNovel {
   private async loadSeriesData() {
     // 获取这个系列本身的详细数据
     await this.sleep(this.crawlInterval)
+    if (this.isCancelled()) return null
     log.log(lang.transl('_获取系列数据'))
     this.seriesData = await API.getNovelSeriesData(this.seriesId)
+    if (this.isCancelled()) return null
     const body = this.seriesData.body
     this.userName = Tools.replaceEPUBText(Utils.replaceUnsafeStr(body.userName))
     this.seriesTitle = Tools.replaceEPUBTitle(
@@ -305,6 +325,7 @@ class MergeNovel {
 
   /** 根据用户选择的保存格式进入 TXT 或 EPUB 合并流程。 */
   private async mergeByFormat(body: NovelSeriesData['body']) {
+    if (this.isCancelled()) return
     if (settings.novelSaveAs === 'txt') {
       await this.mergeTXT()
     } else {
@@ -315,7 +336,7 @@ class MergeNovel {
   /** 把系列封面单独保存为图像文件。 */
   private async downloadSeriesCoverFile(coverUrl: string) {
     // 下载系列小说的封面图片，保存为单独的图像文件
-    if (!settings.downloadNovelCoverImage || !coverUrl) {
+    if (this.isCancelled() || !settings.downloadNovelCoverImage || !coverUrl) {
       return
     }
 
@@ -324,11 +345,12 @@ class MergeNovel {
     // 只有当保存格式为 txt 时，才需要在这里再下载一次封面图片
     if (settings.novelSaveAs === 'txt') {
       await this.sleep(this.downloadInterval)
+      if (this.isCancelled()) return
     }
     await downloadNovelCover.download(
       coverUrl,
       this.novelName,
-      () => downloadNovelEmbeddedImage.stop
+      this.assetCancelled
     )
   }
 
@@ -351,6 +373,7 @@ class MergeNovel {
     // 当用户下载单篇小说，并启用了“不下载重复文件”时，使用宽松策略可以排除它（不再下载），使用严格策略则会再次下载它（因为文件名不同）。这是符合预期的。
     // 如果用户以后单独下载了它，下载记录里的 n 会被覆盖为实际的名字
     for (const data of this.allNovelData) {
+      if (this.isCancelled()) return
       const record: DownloadRecordType = {
         id: data.id,
         n: `${data.id}-${data.title}.${settings.novelSaveAs}`,
@@ -358,6 +381,7 @@ class MergeNovel {
       }
       // console.log('add download record',data.no, record)
       await downloadRecord.addRecordFromRecord(record)
+      if (this.isCancelled()) return
     }
   }
 
@@ -371,7 +395,9 @@ class MergeNovel {
 
   /** 合并系列小说并生成 TXT 文件。 */
   private async mergeTXT() {
+    if (this.isCancelled()) return
     await this.downloadTXTAssets()
+    if (this.isCancelled()) return
 
     const text: string[] = []
     const seriesMeta = this.buildTXTSeriesMeta()
@@ -380,12 +406,15 @@ class MergeNovel {
     }
 
     for (const data of this.allNovelData) {
+      if (this.isCancelled()) return
       text.push(await this.buildTXTNovelSection(data))
+      if (this.isCancelled()) return
     }
 
     const blob = new Blob(text, {
       type: 'text/plain',
     })
+    if (this.isCancelled()) return
     await SendDownload.noReply(
       blob,
       this.novelName,
@@ -398,18 +427,22 @@ class MergeNovel {
   private async downloadTXTAssets() {
     // 保存为 txt 格式时，在这里下载小说内嵌的图片
     for (const data of this.allNovelData) {
+      if (this.isCancelled()) return
       await downloadNovelEmbeddedImage.TXT(
         data.id,
         data.title,
         data.content,
         data.embeddedImages,
         this.novelName,
-        'merge novel'
+        'merge novel',
+        this.isCancelled
       )
+      if (this.isCancelled()) return
     }
 
     // 保存设定资料里的图片
     for (const item of this.glossaryImages) {
+      if (this.isCancelled()) return
       if (item) {
         this.logDownloadGlossaryImage(item)
         await downloadNovelGlossaryImage.download(
@@ -417,8 +450,9 @@ class MergeNovel {
           this.novelName,
           item.novelImageId,
           this.seriesId,
-          () => downloadNovelEmbeddedImage.stop
+          this.assetCancelled
         )
+        if (this.isCancelled()) return
       }
     }
   }
@@ -548,9 +582,11 @@ class MergeNovel {
 
       // 实际下载设定资料里的图片
       await this.addGlossaryImagesToEPUB(jepub, needSaveGlossaryImages)
+      if (this.isCancelled()) return
 
       // 添加系列封面图片
       await this.addSeriesCoverToEPUB(jepub, body.cover.urls.original)
+      if (this.isCancelled()) return
 
       const episodeCovers: EpisodeCoverRecord[] = []
 
@@ -559,17 +595,20 @@ class MergeNovel {
         const data = this.allNovelData[index]
         const novelId = data.id
         // 添加这篇小说的封面图片、元数据、正文内容
+        if (this.isCancelled()) return
         const coverHtml = await this.buildEpisodeCoverHtml(
           data,
           episodeCovers,
           jepub
         )
+        if (this.isCancelled()) return
         const metaHtml = this.buildEpisodeMetaHtml(data)
         let content = await this.buildEPUBChapterContent(
           data,
           coverHtml,
           metaHtml
         )
+        if (this.isCancelled()) return
 
         // 添加小说里的图片
         const value = await downloadNovelEmbeddedImage.EPUB(
@@ -578,8 +617,10 @@ class MergeNovel {
           content,
           data.embeddedImages,
           jepub,
-          'merge novel'
+          'merge novel',
+          this.isCancelled
         )
+        if (this.isCancelled()) return
         content = value.content
 
         // 添加正文，这会在 EPUB 里生成一个新的章节
@@ -588,13 +629,16 @@ class MergeNovel {
         jepub.add(`${this.chapterNo(data.no)} ${title}`, content)
 
         if (index === this.allNovelData.length - 1) {
+          if (this.isCancelled()) return
           await this.saveEPUBFile(jepub, true)
           return
         }
 
         this.addEPUBContentSize(content, value.size)
         if (this.checkSizeLimit()) {
+          if (this.isCancelled()) return
           await this.saveEPUBFile(jepub)
+          if (this.isCancelled()) return
           index++
           return generateEPUB()
         }
@@ -731,8 +775,9 @@ class MergeNovel {
         const image = await downloadNovelGlossaryImage.getImage(
           item.urls,
           'arrayBuffer',
-          () => downloadNovelEmbeddedImage.stop
+          this.assetCancelled
         )
+        if (this.isCancelled()) return
         if (image) {
           this.addSize(image.byteLength)
           const imageId = `glossaryImage-${item.novelImageId}`
@@ -753,12 +798,14 @@ class MergeNovel {
     }
 
     await this.sleep(this.downloadInterval)
+    if (this.isCancelled()) return
     this.logDownloadSeriesCover()
     const cover = await downloadNovelCover.getCover(
       seriesCoverUrl,
       'arrayBuffer',
-      () => downloadNovelEmbeddedImage.stop
+      this.assetCancelled
     )
+    if (this.isCancelled()) return
     if (cover) {
       this.addSize(cover.byteLength)
       jepub.cover(Config.isFirefox ? Utils.copyArrayBuffer(cover) : cover)
@@ -792,11 +839,13 @@ class MergeNovel {
 
     // 没有保存过，下载并添加这个章节的封面图
     await this.sleep(this.downloadInterval)
+    if (this.isCancelled()) return coverHtml
     const cover = await downloadNovelCover.getCover(
       coverUrl,
       'arrayBuffer',
-      () => downloadNovelEmbeddedImage.stop
+      this.assetCancelled
     )
+    if (this.isCancelled()) return coverHtml
     if (!cover) {
       return coverHtml
     }
@@ -877,6 +926,7 @@ class MergeNovel {
       this.last,
       'asc'
     )
+    if (this.isCancelled()) return
 
     let list = seriesContents.body.page.seriesContents
     const thisPageIdNumber = list.length
@@ -923,6 +973,7 @@ class MergeNovel {
         createDate: item.createDate,
         IDTypeString: 'novels',
       })
+      if (this.isCancelled()) return
       if (check) {
         this.novelIdListFiltered.push(item.id)
       } else {
@@ -967,6 +1018,7 @@ class MergeNovel {
     let count = 0
 
     for (const id of this.novelIdList) {
+      if (this.isCancelled()) return
       // 自动合并系列小说时，可能会连续不断的合并多个系列，这些系列可能包含非常多的小说，所以需要添加等待时间，以减小出现 429 错误的概率
       // 另外获取设定资料时也有可能需要发送多个请求，但并不总是需要多次请求，所以获取设定资料时没有添加等待时间
       count++
@@ -976,11 +1028,13 @@ class MergeNovel {
       )
 
       const data = await this.fetchNovelData(id)
+      if (this.isCancelled()) return
       if (!data) {
         continue
       }
 
       const novelData = await this.createNovelSummary(data)
+      if (this.isCancelled()) return
       if (novelData) {
         this.allNovelData.push(novelData)
       }
@@ -1011,7 +1065,9 @@ class MergeNovel {
       // 自动合并系列小说时，可能会连续不断的合并多个系列，这些系列可能包含非常多的小说，所以需要添加等待时间，以减小出现 429 错误的概率
       // 另外获取设定资料时也有可能需要发送多个请求，但并不总是需要多次请求，所以获取设定资料时没有添加等待时间
       await this.sleep(this.crawlInterval)
+      if (this.isCancelled()) return null
       data = await API.getNovelData(id)
+      if (this.isCancelled()) return null
       cacheWorkData.set(data)
       return data
     } catch (error: Error | any) {
@@ -1163,6 +1219,7 @@ class MergeNovel {
     // 保存合并的系列小说的文件时，如果已存在同名文件，不覆盖它而是添加序号。
     // 这是因为系列小说有更新的需要，例如第一次下载时，这个系列里有 10 篇小说；过段时间再次下载时，由于作者又更新了 10 篇小说，所以里面保存的可能是第 1 - 20 篇小说，也可能是第 11 - 20 篇小说（如果用户启用了“不抓取下载过的作品”）。所以这两次下载的文件的内容是不同的，不应该直接覆盖
     const blob = await jepub.generate('blob', (metadata: any) => {})
+    if (this.isCancelled()) return
     await SendDownload.noReply(
       blob,
       name,
@@ -1232,6 +1289,7 @@ class MergeNovel {
     this.seriesId = ''
     this.seriesTitle = ''
     this.novelName = ''
+    this.crawlGeneration = undefined
   }
 }
 

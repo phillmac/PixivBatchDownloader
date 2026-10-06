@@ -44,7 +44,7 @@ class DownloadNovelGlossaryImage {
     }
 
     const blob = await this.getImage(urls, 'blob', cancelled)
-    if (blob === null) {
+    if (blob === null || cancelled()) {
       return
     }
 

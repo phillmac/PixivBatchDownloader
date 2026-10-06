@@ -15,7 +15,7 @@ class DownloadNovelCover {
     cancelled: () => boolean = () => false
   ) {
     const blob = await this.getCover(coverURL, 'blob', cancelled)
-    if (blob === null) {
+    if (blob === null || cancelled()) {
       return
     }
 

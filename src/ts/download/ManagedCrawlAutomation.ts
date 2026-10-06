@@ -152,6 +152,7 @@ window.addEventListener(EVT.list.crawlStart, () => {
     armed &&
     armed.url === normalizeUrl(window.location.href) &&
     !states.bookmarkMode &&
+    !states.crawlTagList &&
     generation !== null
   ) {
     operation = armed
@@ -159,7 +160,12 @@ window.addEventListener(EVT.list.crawlStart, () => {
     operation.state = 'crawling'
     operation.startedAt = new Date().toISOString()
     armed = null
-  } else operation = null
+  } else {
+    // Any real crawl that does not consume this exact reservation expires it.
+    // This prevents a later user crawl from inheriting stale automation ownership.
+    operation = null
+    armed = null
+  }
 })
 /** 完成事件仅能完成仍持有权限的操作。 */
 function markCompleted() {
@@ -185,11 +191,19 @@ window.addEventListener(EVT.list.stopCrawl, () => {
     states.stopCrawl = true
   }
 })
-window.addEventListener(EVT.list.importResultLoaded, () => {
+/** A trusted replacement queue supersedes a revoked managed result for the same URL. */
+function releaseReplacedQueueOwnership() {
   if (
-    operation?.generation !== null &&
     operation &&
-    !ownsCrawl(operation.generation)
-  )
+    operation.generation !== null &&
+    !ownsCrawl(operation.generation) &&
+    operation.url === taskUrl()
+  ) {
     operation = null
-})
+  }
+}
+window.addEventListener(
+  EVT.list.importResultLoaded,
+  releaseReplacedQueueOwnership
+)
+window.addEventListener(EVT.list.resume, releaseReplacedQueueOwnership)

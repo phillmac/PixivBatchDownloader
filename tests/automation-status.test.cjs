@@ -1990,6 +1990,109 @@ test('not-started abort cancels the arm and owned abort suppresses before Stop C
   assert.equal(h.states.stopCrawl, true)
 })
 
+test('managed arm is consumed only by a normal crawl, not crawl-tag-list work', async () => {
+  const h = harness({ busy: false }, null)
+  const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    h.context.window.location.href
+  )
+  h.states.crawlTagList = true
+  h.fire('crawlStart')
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.managedOperation, null)
+  assert.equal(status.managedArm, null)
+  assert.equal(
+    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(arm.operationId, arm.url))
+      .outcome,
+    'ownership-mismatch'
+  )
+})
+
+test('Resume replacement releases only the revoked managed queue for its task URL', async () => {
+  const h = harness({ busy: false, resultLength: 2 }, null)
+  const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    h.context.window.location.href
+  )
+  h.fire('crawlStart')
+  await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(arm.operationId, arm.url)
+  assert.equal(h.managed.managedCrawlBlocksDownload(), true)
+  h.fire('resume')
+  assert.equal(h.managed.getManagedCrawl(), null)
+  assert.equal(h.managed.managedCrawlBlocksDownload(), false)
+})
+
+test('MergeNovel stops publishing crawl-owned files after generation revocation', async () => {
+  let activeGeneration = 1
+  const sends = []
+  const entered = deferred()
+  const release = deferred()
+  const callable = () => {}
+  const generic = new Proxy(callable, {
+    get(_target, key) {
+      if (key === 'then') return undefined
+      return generic
+    },
+  })
+  const context = vm.createContext({
+    console,
+    Date,
+    Blob,
+    window: { setTimeout },
+  })
+  const file = path.join(root, 'src/ts/download/MergeNovel.ts')
+  const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const exports = {}
+  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
+    filename: file,
+  })((name) => {
+    if (name === '../crawl/CrawlGeneration')
+      return { ownsCrawl: (generation) => generation === activeGeneration }
+    if (name === './SendDownload')
+      return { SendDownload: { noReply: async (...args) => sends.push(args) } }
+    if (name === './DownloadNovelEmbeddedImage')
+      return { downloadNovelEmbeddedImage: { stop: false } }
+    if (name === '../setting/Settings')
+      return {
+        settings: {
+          novelSaveAs: 'txt',
+          rememberTheLastSaveLocation: false,
+        },
+      }
+    if (name === '../Tools')
+      return { Tools: { chooseDownloadMethod: () => 'browser' } }
+    return new Proxy(
+      {},
+      {
+        get() {
+          return generic
+        },
+      }
+    )
+  }, exports)
+
+  const merge = new exports.MergeNovel()
+  merge.crawlGeneration = 1
+  merge.downloadTXTAssets = async () => {
+    entered.resolve()
+    await release.promise
+  }
+  merge.buildTXTSeriesMeta = () => ''
+  merge.buildTXTNovelSection = async () => 'chapter'
+  merge.allNovelData = [{ id: '1' }]
+  merge.novelName = 'series.txt'
+
+  const pending = merge.mergeTXT()
+  await entered.promise
+  activeGeneration = 2
+  release.resolve()
+  await pending
+  assert.deepEqual(sends, [])
+})
+
 function deferred() {
   let resolve, reject
   const promise = new Promise((a, b) => {
