@@ -257,12 +257,20 @@ class Resume {
   }
 
   private bindEvents() {
-    window.addEventListener(EVT.list.crawlStart, () => {
-      // 新抓取使旧清理失效，避免异步删除下一次同 URL 的有效队列。
+    const releaseSuppressionForCurrentUrl = () => {
+      // A genuine new result owner invalidates the old cleanup generation.
       if (this.suppressedSaveUrls.delete(this.getURL())) {
         this.persistenceGeneration++
       }
-    })
+    }
+    window.addEventListener(
+      EVT.list.crawlStart,
+      releaseSuppressionForCurrentUrl
+    )
+    window.addEventListener(
+      EVT.list.importResultLoaded,
+      releaseSuppressionForCurrentUrl
+    )
 
     // 切换页面时，重新检查恢复数据
     const restoreEvt = [EVT.list.pageSwitch, EVT.list.settingInitialized]

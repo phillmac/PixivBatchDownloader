@@ -246,9 +246,15 @@ abstract class InitPageBase {
       return
     }
 
+    // Clear only a stale stop from the previous crawl. A stop requested after
+    // crawlStart belongs to this new crawl and must survive async setup.
+    states.stopCrawl = false
     EVT.fire('crawlStart')
 
     await mute.getMuteSettings()
+    if (states.stopCrawl) {
+      return
+    }
 
     this.getWantPage()
 
@@ -259,8 +265,6 @@ abstract class InitPageBase {
     this.finishedRequest = 0
 
     this.crawlFinishBecauseStopCrawl = false
-
-    states.stopCrawl = false
 
     // 进入第一个抓取流程
     this.nextStep()
@@ -320,15 +324,19 @@ abstract class InitPageBase {
         return
       }
 
+      // Clear only a stale stop before this crawl becomes observable. A stop
+      // requested after crawlStart must survive the async mute lookup.
+      states.stopCrawl = false
       EVT.fire('crawlStart')
 
       await mute.getMuteSettings()
+      if (states.stopCrawl) {
+        return
+      }
 
       this.finishedRequest = 0
 
       this.crawlFinishBecauseStopCrawl = false
-
-      states.stopCrawl = false
 
       // 传递 id 列表下载时，不显示下载面板
       states.quickCrawl = true
@@ -797,3 +805,5 @@ abstract class InitPageBase {
 }
 
 export { InitPageBase }
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

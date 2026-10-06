@@ -27,6 +27,8 @@ class EVENT {
     /** 当抓取开始时触发 */
     crawlStart: 'crawlStart',
     stopCrawl: 'stopCrawl',
+    /** 托管抓取的原子放弃清理已完成。 */
+    managedCrawlAbortComplete: 'managedCrawlAbortComplete',
     /** 让下载器抓取特定的 tag，而不是自动获取当前页面的 tag（仅在 tag 搜索页面有效） */
     crawlTag: 'crawlTag',
     /** 当检查到错误的设置时触发 */
@@ -126,6 +128,8 @@ class EVENT {
     exportResult: 'exportResult',
     /** 当需要导入抓取结果时触发 */
     importResult: 'importResult',
+    /** 有效导入结果已替换当前结果集。 */
+    importResultLoaded: 'importResultLoaded',
     /** 当需要保存用户头像时触发 */
     saveAvatarImage: 'saveAvatarImage',
     /** 当需要保存用户头像为图标时触发 */
@@ -227,6 +231,7 @@ class EVENT {
     type:
       | 'crawlStart'
       | 'stopCrawl'
+      | 'managedCrawlAbortComplete'
       | 'wrongSetting'
       | 'getIdListFinished'
       | 'crawlComplete'
@@ -263,6 +268,7 @@ class EVENT {
       | 'exportCSV'
       | 'exportResult'
       | 'importResult'
+      | 'importResultLoaded'
       | 'saveAvatarImage'
       | 'saveAvatarIcon'
       | 'saveUserCover'
@@ -300,9 +306,7 @@ class EVENT {
 
   public fire(
     type:
-      | 'pageSwitchedTypeChange'
-      | 'pageSwitchedTypeNotChange'
-      | 'convertChange',
+      'pageSwitchedTypeChange' | 'pageSwitchedTypeNotChange' | 'convertChange',
     data: number
   ): void
 
@@ -367,3 +371,5 @@ class EVENT {
 const EVT = new EVENT()
 
 export { EVT }
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

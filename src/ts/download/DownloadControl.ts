@@ -318,6 +318,7 @@ class DownloadControl {
     const checkWaitingIdListEvents = [
       EVT.list.downloadComplete,
       EVT.list.crawlEmpty,
+      EVT.list.managedCrawlAbortComplete,
     ]
     checkWaitingIdListEvents.forEach((evt) => {
       window.addEventListener(evt, () => {

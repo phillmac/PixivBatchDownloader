@@ -88,6 +88,9 @@ class ImportResult {
       store.addResult(r)
     }
 
+    // A valid imported result set is new ownership, not a late callback from
+    // the abandoned crawl. Release Resume suppression before persistence runs.
+    EVT.fire('importResultLoaded')
     // 发送通知
     EVT.fire('crawlComplete')
 
@@ -96,3 +99,5 @@ class ImportResult {
 }
 
 new ImportResult()
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

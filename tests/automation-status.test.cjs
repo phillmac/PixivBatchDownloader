@@ -46,6 +46,7 @@ function harness(controller, durable) {
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
       stopCrawl: 'stopCrawl',
+      managedCrawlAbortComplete: 'managedCrawlAbortComplete',
       getIdListFinished: 'getIdListFinished',
       resultChange: 'resultChange',
       downloadStart: 'downloadStart',
@@ -864,6 +865,7 @@ function createResumeHarness(options = {}) {
       pageSwitch: 'pageSwitch',
       settingInitialized: 'settingInitialized',
       crawlStart: 'crawlStart',
+      importResultLoaded: 'importResultLoaded',
       crawlComplete: 'crawlComplete',
       resultChange: 'resultChange',
       downloadSuccess: 'downloadSuccess',
@@ -1761,6 +1763,23 @@ test('download completion cancels the initial save before taskId ownership exist
   assert.equal(h.resume.taskId || 0, 0)
 })
 
+test('successful imported result set releases local discard suppression', async () => {
+  const url = 'https://www.pixiv.net/en/users/1'
+  const h = createResumeHarness({ url })
+  await h.resume.ready
+  await h.resume.discardSavedTask(url)
+  h.store.URLWhenCrawlStart = url
+  h.store.result = [{ id: 'imported' }]
+  h.downloadStates.states = [-1]
+
+  h.fire('importResultLoaded')
+  h.fire('crawlComplete')
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(h.metaByUrl.has(url), true)
+})
+
 test('checkpoint does not recreate metadata deleted by another tab', async () => {
   const url = 'https://www.pixiv.net/en/users/1'
   const meta = {
@@ -1796,6 +1815,10 @@ test('checkpoint does not recreate metadata deleted by another tab', async () =>
 
 test('managed manual stop wins over late completion and result changes', async () => {
   const h = harness({ busy: false, resultLength: 3 }, null)
+  let abortComplete = 0
+  h.context.window.addEventListener('managedCrawlAbortComplete', () => {
+    abortComplete++
+  })
   const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
     h.context.window.location.href
   )
@@ -1806,6 +1829,7 @@ test('managed manual stop wins over late completion and result changes', async (
   await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(arm.operationId, arm.url)
   assert.equal((await h.exports.getAutomationStatus()).phase, 'STOPPED')
   assert.deepEqual(h.discardCalls, [arm.url])
+  assert.equal(abortComplete, 1)
   const next = h.context.__PBD_AUTOMATION_ARM_CRAWL__(arm.url)
   h.fire('crawlStart')
   h.fire('crawlComplete')
@@ -1879,30 +1903,27 @@ test('download controller blocks ready UI and direct start for aborted managed r
   controller.startDownload()
 })
 
-test('only matching crawl consumes an arm and owned abort suppresses before Stop Crawl', async () => {
+test('not-started abort cancels the arm and owned abort suppresses before Stop Crawl', async () => {
   const h = harness({ busy: false }, null)
   const url = h.context.window.location.href
 
   const stale = h.context.__PBD_AUTOMATION_ARM_CRAWL__(url + '#fragment')
-  assert.equal(
-    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(stale.operationId, url))
-      .outcome,
-    'not-started'
+  const notStarted = await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
+    stale.operationId,
+    url
   )
-  h.context.window.location.href = url + '?other'
-  h.store.URLWhenCrawlStart = h.context.window.location.href
+  assert.equal(notStarted.outcome, 'not-started')
+  assert.equal(notStarted.operationId, stale.operationId)
+  assert.equal((await h.exports.getAutomationStatus()).managedArm, null)
+
+  // A later manual crawl on that URL is not silently claimed by the stale arm.
   h.fire('crawlStart')
   assert.equal((await h.exports.getAutomationStatus()).managedOperation, null)
-  assert.equal(
-    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(stale.operationId, url))
-      .outcome,
-    'not-started'
-  )
+  h.fire('stopCrawl')
+  assert.equal(h.discardCalls.length, 0)
 
-  h.context.window.location.href = url
+  const owned = h.context.__PBD_AUTOMATION_ARM_CRAWL__(url)
   h.store.URLWhenCrawlStart = url
-  const owned = stale
-  assert.equal((await h.exports.getAutomationStatus()).managedArm.operationId, stale.operationId)
   h.fire('crawlStart')
   h.context.window.addEventListener('stopCrawl', () => {
     assert.deepEqual(h.discardCalls, [url])

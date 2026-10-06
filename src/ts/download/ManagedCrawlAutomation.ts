@@ -115,6 +115,7 @@ async function finishAbort(owned: ManagedOperation) {
     if (owned.state === 'aborting') {
       owned.state = 'aborted'
       owned.abortedAt = new Date().toISOString()
+      EVT.fire('managedCrawlAbortComplete')
     }
   } catch (error) {
     if (operation === owned) {
@@ -148,7 +149,14 @@ export async function abortManagedCrawl(
     return { outcome: 'already-completed' as const }
   }
   if (owned.state === 'armed') {
-    return { outcome: 'not-started' as const }
+    if (armed === owned) {
+      armed = null
+    }
+    return {
+      outcome: 'not-started' as const,
+      operationId: owned.operationId,
+      url: owned.url,
+    }
   }
   if (owned.state === 'aborted') {
     return {
