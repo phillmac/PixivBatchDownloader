@@ -87,8 +87,6 @@ class Resume {
   private restorePending = false
   /** 清除持久化数据时递增；使已排队/进行中的保存请求失效。 */
   private persistenceGeneration = 0
-  /** 自动化放弃部分抓取后，禁止同 URL 的迟到 resultChange 重新保存，直到下一次 crawlStart。 */
-  private readonly suppressedSaveUrls = new Set<string>()
   /** 旧版无摘要任务的进程内标量缓存，避免状态轮询反复读取大数组。 */
   private readonly legacySummaryCache = new Map<number, DLStateSummary>()
 
@@ -109,41 +107,6 @@ class Resume {
     this.clearExired()
   }
 
-  /** 仅删除指定 URL 的持久化未完成任务，供外部自动化安全放弃部分抓取结果。 */
-  public async discardSavedTask(url: string) {
-    const normalizedUrl = this.normalizeURL(url)
-    // 在 await 前抑制保存和恢复，保证 stopCrawl 的同步监听器不能复活队列。
-    this.suppressedSaveUrls.add(normalizedUrl)
-    const generation = ++this.persistenceGeneration
-    this.restoreGeneration++
-    this.restorePending = false
-    if (this.currentMeta?.url === normalizedUrl) {
-      this.invalidateTaskOwnership(this.currentMeta.id)
-    }
-    await this.ready
-    if (!Utils.isPixiv()) {
-      return { discarded: false, url: normalizedUrl, taskId: null }
-    }
-
-    // 等正在执行的保存请求退出；旧代数请求会在写入前自行放弃。
-    while (this.saveDataDraining) {
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
-    }
-
-    const meta = (await this.IDB.get(
-      this.metaName,
-      normalizedUrl,
-      'url'
-    )) as TaskMeta | null
-    if (!meta || generation !== this.persistenceGeneration) {
-      return { discarded: false, url: normalizedUrl, taskId: null }
-    }
-
-    this.invalidateTaskOwnership(meta.id)
-    await this.deleteTaskRecords(meta)
-    return { discarded: true, url: normalizedUrl, taskId: meta.id }
-  }
-
   /** 返回当前 URL 对应的持久化未完成任务摘要。 */
   public async getSavedTaskStatus(url = this.getURL()) {
     await this.ready
@@ -151,9 +114,6 @@ class Resume {
       return null
     }
     const normalizedUrl = this.normalizeURL(url)
-    if (this.suppressedSaveUrls.has(normalizedUrl)) {
-      return null
-    }
     const meta = (await this.IDB.get(
       this.metaName,
       normalizedUrl,
@@ -257,21 +217,6 @@ class Resume {
   }
 
   private bindEvents() {
-    const releaseSuppressionForCurrentUrl = () => {
-      // A genuine new result owner invalidates the old cleanup generation.
-      if (this.suppressedSaveUrls.delete(this.getURL())) {
-        this.persistenceGeneration++
-      }
-    }
-    window.addEventListener(
-      EVT.list.crawlStart,
-      releaseSuppressionForCurrentUrl
-    )
-    window.addEventListener(
-      EVT.list.importResultLoaded,
-      releaseSuppressionForCurrentUrl
-    )
-
     // 切换页面时，重新检查恢复数据
     const restoreEvt = [EVT.list.pageSwitch, EVT.list.settingInitialized]
     restoreEvt.forEach((evt) => {
@@ -302,6 +247,8 @@ class Resume {
     const evs = [EVT.list.crawlComplete, EVT.list.resultChange]
     for (const ev of evs) {
       window.addEventListener(ev, async () => {
+        // 抓取中不保存部分队列；完成后和导入后的空闲编辑仍可续传。
+        if (ev === EVT.list.resultChange && states.busy) return
         this.saveData(store.URLWhenCrawlStart || this.getURL())
       })
     }
@@ -332,7 +279,6 @@ class Resume {
   private async restoreData() {
     const generation = ++this.restoreGeneration
     const restoreUrl = this.getURL()
-    if (this.suppressedSaveUrls.has(restoreUrl)) return
 
     // 如果下载器在抓取或者在下载，则记住待恢复状态，在下一次 idle 事件后重试。
     if (states.busy) {
@@ -410,7 +356,6 @@ class Resume {
 
   private async saveData(url = this.getURL()) {
     const normalizedUrl = this.normalizeURL(url)
-    if (this.suppressedSaveUrls.has(normalizedUrl)) return
     const generation = this.persistenceGeneration
     const sharedGeneration = await this.getSharedGeneration()
     return new Promise<void>((resolve, reject) => {
@@ -786,5 +731,3 @@ class Resume {
 /** 断点续传模块单例。 */
 const resume = new Resume()
 export { resume }
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

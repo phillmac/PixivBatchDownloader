@@ -1,3 +1,4 @@
+import { beginCrawl, ownsCrawl } from '../crawl/CrawlGeneration'
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
 import { API } from '../API'
@@ -41,6 +42,7 @@ class InitUserRequestPage extends InitPageBase {
     this.addCancelTimedCrawlBtn()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected addAnyElement() {
     this.addInitPageBtn(
       'otherBtns',
@@ -88,6 +90,8 @@ class InitUserRequestPage extends InitPageBase {
 
       // 获取该用户在约稿页面里所有作品的 id 列表
       // 模拟了抓取流程，以获取相同的 id 列表
+      // 批量收藏复用 ID 抓取流程，也需要独立的 ID 写入所有权。
+      this.generation = beginCrawl()
       EVT.fire('bookmarkModeStart')
       this.crawlNumber = -1 // 抓取所有约稿作品
       this.getIdList()
@@ -110,7 +114,11 @@ class InitUserRequestPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     log.log(lang.transl('_正在抓取'))
 
     // 先获取约稿 ID 列表
@@ -124,8 +132,9 @@ class InitUserRequestPage extends InitPageBase {
 
     const userId = Tools.getCurrentPageUserId()
     const checkUser = await this.checkUserId(userId)
+    if (!ownsCrawl(generation)) return
     if (!checkUser) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let requetIds: string[] = []
@@ -136,12 +145,14 @@ class InitUserRequestPage extends InitPageBase {
         worksType,
         this.crawlNumber
       )
+      if (!ownsCrawl(generation)) return
     } else {
       requetIds = await API.getUserRequestIds(
         userId,
         worksType,
         this.crawlNumber
       )
+      if (!ownsCrawl(generation)) return
     }
 
     // 然后根据约稿 ID 获得作品 ID 列表
@@ -149,11 +160,12 @@ class InitUserRequestPage extends InitPageBase {
     const splitIds = Utils.splitArray(requetIds, 50)
     for (const ids of splitIds) {
       const idList = await API.getRequestWorksIdList(ids)
+      if (!ownsCrawl(generation)) return
       if (states.stopCrawl) break
       store.idList = store.idList.concat(idList)
     }
 
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 
   protected sortResult() {

@@ -1,3 +1,5 @@
+import { beginCrawl, CrawlGeneration, ownsCrawl } from './CrawlGeneration'
+import { skipManagedCrawl } from '../download/ManagedCrawlAutomation'
 // 初始化所有页面抓取流程的基类
 import { lang } from '../Language'
 import { Colors } from '../Colors'
@@ -36,6 +38,8 @@ import { MergeNovel } from '../download/MergeNovel'
 import { ppdTask } from '../PPDTask'
 
 abstract class InitPageBase {
+  /** 当前实例的抓取所有权；异步任务必须捕获后传递。 */
+  protected generation!: CrawlGeneration
   /**要抓取的个数/页数 */
   protected crawlNumber = 0
   /**当前页面类型最多有多少个页面/作品 */
@@ -212,7 +216,7 @@ abstract class InitPageBase {
     return true
   }
 
-  // 准备正常进行抓取，执行一些检查
+  /** 准备正常进行抓取，执行一些检查；使用本轮抓取所有权。 */
   protected async readyCrawl() {
     // 检查是否可以开始抓取
     // states.busy 表示下载器正在抓取或正在下载
@@ -249,10 +253,11 @@ abstract class InitPageBase {
     // Clear only a stale stop from the previous crawl. A stop requested after
     // crawlStart belongs to this new crawl and must survive async setup.
     states.stopCrawl = false
+    const generation = (this.generation = beginCrawl())
     EVT.fire('crawlStart')
 
     await mute.getMuteSettings()
-    if (states.stopCrawl) {
+    if (!ownsCrawl(generation) || states.stopCrawl) {
       return
     }
 
@@ -272,7 +277,7 @@ abstract class InitPageBase {
 
   // 基于传递的 id 列表直接开始抓取
   // 这个方法是为了让其他模块可以传递 id 列表，直接进行下载。
-  // 这个类的子类没有必要使用这个方法。当子类需要直接指定 id 列表时，修改自己的 getIdList 方法即可。
+  /** 这个类的子类没有必要使用这个方法。当子类需要直接指定 id 列表时，修改自己的 getIdList 方法即可。；使用本轮抓取所有权。 */
   protected async crawlIdList(idList: IDData[]) {
     // 对 idList 进行去重
     // 这是因为有些用户可能会连续、快速的重复建立下载（比如在预览时迅速的连续按两次 C 键）
@@ -327,10 +332,11 @@ abstract class InitPageBase {
       // Clear only a stale stop before this crawl becomes observable. A stop
       // requested after crawlStart must survive the async mute lookup.
       states.stopCrawl = false
+      const generation = (this.generation = beginCrawl())
       EVT.fire('crawlStart')
 
       await mute.getMuteSettings()
-      if (states.stopCrawl) {
+      if (!ownsCrawl(generation) || states.stopCrawl) {
         return
       }
 
@@ -343,7 +349,7 @@ abstract class InitPageBase {
 
       store.idList = _idList
 
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
     }
   }
 
@@ -362,8 +368,11 @@ abstract class InitPageBase {
     })
   }
 
-  // id 列表获取完毕，开始抓取作品内容页
-  protected async getIdListFinished(): Promise<void> {
+  /** id 列表获取完毕，开始抓取作品内容页；使用本轮抓取所有权。 */
+  protected async getIdListFinished(
+    generation = this.generation
+  ): Promise<void> {
+    if (!ownsCrawl(generation)) return
     log.persistentRefresh(this.getIdListLogKey)
     states.slowCrawlMode = false
     this.resetGetIdListStatus()
@@ -383,6 +392,7 @@ abstract class InitPageBase {
         IDTypeString: idData.type,
         workType: Tools.getWorkTypeVague(idData.type),
       })
+      if (!ownsCrawl(generation)) return
 
       if (check) {
         filteredIDList.push(idData)
@@ -391,12 +401,12 @@ abstract class InitPageBase {
     store.idList = filteredIDList
 
     EVT.fire('getIdListFinished')
-    if (states.stopCrawl || states.bookmarkMode) {
+    if (!ownsCrawl(generation) || states.stopCrawl || states.bookmarkMode) {
       return
     }
 
     if (store.idList.length === 0) {
-      return this.noResult()
+      return this.noResult(generation)
     }
 
     // 如果要抓取的作品数量超过指定数量（目前为 100 页），则显示使用小号抓取的提示
@@ -408,10 +418,13 @@ abstract class InitPageBase {
 
     // 导出 ID 列表，并停止抓取
     if ((settings.exportIDList || states.exportIDList) && Utils.isPixiv()) {
+      // 导出使用本轮快照，不再读写共享抓取队列。
+      const exportedIds = [...store.idList]
+      skipManagedCrawl('skipped-id-list')
       EVT.fire('stopCrawl')
 
       if (settings.exportIDList) {
-        const resultList = await Utils.json2BlobSafe(store.idList)
+        const resultList = await Utils.json2BlobSafe(exportedIds)
         for (const result of resultList) {
           Utils.downloadFile(
             result.url,
@@ -432,6 +445,7 @@ abstract class InitPageBase {
     // 如果启用了这个标记，则重置任务状态，不继续抓取作品的详情了
     if (this.onlyCrawlIdList) {
       log.warning('onlyCrawlIdList: On，停止抓取')
+      skipManagedCrawl('skipped-id-list')
       EVT.fire('stopCrawl')
       return
     }
@@ -470,17 +484,19 @@ abstract class InitPageBase {
       const data = cacheWorkData.get(idData.id, 'artwork')
       if (data) {
         store.idList = []
-        await saveArtworkData.save(data, idData.downloadIndexes)
-        return this.crawlFinished()
+        await saveArtworkData.save(generation, data, idData.downloadIndexes)
+        if (!ownsCrawl(generation)) return
+        return this.crawlFinished(generation)
       }
     }
 
     // 进入抓取流程
-    this.startGetWorksData()
+    this.startGetWorksData(generation)
   }
 
   /** 并发调用 getWorksData 方法 */
-  protected startGetWorksData() {
+  protected startGetWorksData(generation = this.generation) {
+    if (!ownsCrawl(generation)) return
     // 如果 idList 里有系列小说，就把抓取线程设置为 1, 避免同时合并多个系列小说
     // 这是因为合并每个系列小说时都需要发送多个请求，如果同时合并多个，容易触发 429 限制
     if (store.idList.some((idData) => idData.type === 'novelSeries')) {
@@ -492,7 +508,9 @@ abstract class InitPageBase {
     // 开始并发抓取
     for (let i = 0; i < this.ajaxThread; i++) {
       window.setTimeout(() => {
-        store.idList.length > 0 ? this.getWorksData() : this.afterGetWorksData()
+        store.idList.length > 0
+          ? this.getWorksData(undefined, generation)
+          : this.afterGetWorksData(undefined, generation)
       }, 0)
     }
   }
@@ -500,15 +518,19 @@ abstract class InitPageBase {
   // 重设抓取作品列表时使用的变量或标记
   protected resetGetIdListStatus() {}
 
-  // 获取作品的数据
-  protected async getWorksData(idData?: IDData): Promise<void> {
+  /** 获取作品的数据；使用本轮抓取所有权。 */
+  protected async getWorksData(
+    idData?: IDData,
+    generation = this.generation
+  ): Promise<void> {
+    if (!ownsCrawl(generation)) return
     if (states.stopCrawl) {
-      return this.crawlFinished()
+      return this.crawlFinished(generation)
     }
 
     idData = idData ?? store.idList.shift()
     if (!idData) {
-      return this.afterGetWorksData()
+      return this.afterGetWorksData(undefined, generation)
     }
     const id = idData.id
 
@@ -524,8 +546,9 @@ abstract class InitPageBase {
       IDTypeString: idData.type,
       workType: Tools.getWorkTypeVague(idData.type),
     })
+    if (!ownsCrawl(generation)) return
     if (!check) {
-      return this.afterGetWorksData()
+      return this.afterGetWorksData(undefined, generation)
     }
 
     try {
@@ -536,6 +559,7 @@ abstract class InitPageBase {
         // 使用缓存有负面影响：作品的某些数据（如收藏数量）在它被缓存之后可能已经发生变化
         // 但通常问题不大
         const data = await cacheWorkData.getWorkDataAsync(id, 'novel', unlisted)
+        if (!ownsCrawl(generation)) return
         // 自动合并系列小说
         const seriesId = data.body.seriesNavData?.seriesId
         const canMerge = seriesId && settings.autoMergeNovel
@@ -543,30 +567,36 @@ abstract class InitPageBase {
           const seriseTitle = data.body.seriesNavData?.title
           this.mergedNovelCount++
           await autoMergeNovel.merge(seriesId, seriseTitle)
+          if (!ownsCrawl(generation)) return
         }
         // 如果这个小说不会被合并，或者即使合并也不跳过它，则保存到抓取结果里
         if (!canMerge || !settings.skipNovelsInSeriesWhenAutoMerge) {
-          await saveNovelData.save(data)
+          await saveNovelData.save(generation, data)
+          if (!ownsCrawl(generation)) return
         }
-        this.afterGetWorksData(data)
+        this.afterGetWorksData(data, generation)
       } else if (idData.type === 'novelSeries') {
         // 合并系列小说
         this.mergedNovelCount++
         await new MergeNovel().merge(id, idData.title, true)
-        this.afterGetWorksData()
+        if (!ownsCrawl(generation)) return
+        this.afterGetWorksData(undefined, generation)
       } else {
         // 获取图像作品时，不使用缓存的数据，因为目前在一次抓取里不会重复请求同一个图像作品
         const data = await API.getArtworkData(id, unlisted)
-        await saveArtworkData.save(data, idData.downloadIndexes)
-        this.afterGetWorksData(data)
+        if (!ownsCrawl(generation)) return
+        await saveArtworkData.save(generation, data, idData.downloadIndexes)
+        if (!ownsCrawl(generation)) return
+        this.afterGetWorksData(data, generation)
       }
     } catch (error: Error | any) {
+      if (!ownsCrawl(generation)) return
       if (error?.status) {
         // 请求成功，但状态码不正常
         // 不重试
         const link = Tools.createWorkLinkByIDData(idData)
         log.error(lang.transl('_因为网络错误跳过这个作品', link))
-        this.afterGetWorksData()
+        this.afterGetWorksData(undefined, generation)
       } else {
         // 请求失败，一般是
         // TypeError: Failed to fetch
@@ -577,28 +607,34 @@ abstract class InitPageBase {
 
         // 再次发送这个请求
         await Utils.sleep(2000)
-        this.getWorksData(idData)
+        if (!ownsCrawl(generation)) return
+        this.getWorksData(idData, generation)
       }
     }
   }
 
-  // 每当获取完一个作品的信息
+  /** 每当获取完一个作品的信息；使用本轮抓取所有权。 */
   private async afterGetWorksData(
-    data?: NovelData | ArtworkData
+    data?: NovelData | ArtworkData,
+    generation = this.generation
   ): Promise<void> {
+    if (!ownsCrawl(generation)) return
     this.logResultNumber()
 
     // 抓取可能中途停止，此时保留抓取结果
     if (states.stopCrawl) {
-      return this.crawlFinished()
+      return this.crawlFinished(generation)
     }
 
     // 如果会员搜索优化策略指示停止抓取，则立即进入完成状态
-    if (data && (await vipSearchOptimize.checkBookmarkCount(data))) {
+    const stopForBookmarkCount =
+      data && (await vipSearchOptimize.checkBookmarkCount(data))
+    if (!ownsCrawl(generation)) return
+    if (stopForBookmarkCount) {
       log.log(lang.transl('_后续作品低于最低收藏数量要求跳过后续作品'))
       // 指示抓取已停止
       states.stopCrawl = true
-      return this.crawlFinished()
+      return this.crawlFinished(generation)
     }
 
     // 在进行下一次抓取前，预先检查这个 id 是否符合过滤条件
@@ -611,9 +647,10 @@ abstract class InitPageBase {
         IDTypeString: nextIDData.type,
         workType: Tools.getWorkTypeVague(nextIDData.type),
       })
+      if (!ownsCrawl(generation)) return
       if (!check) {
         store.idList.shift()
-        return this.getWorksData()
+        return this.getWorksData(undefined, generation)
       }
     }
 
@@ -625,27 +662,29 @@ abstract class InitPageBase {
       if (nextIDData && nextIDData.type === 'novels') {
         const cache = cacheWorkData.get(nextIDData.id, 'novel')
         if (cache) {
-          return this.getWorksData()
+          return this.getWorksData(undefined, generation)
         }
       }
 
       // 如果要实际发送请求，则根据慢速抓取设置，决定是否添加间隔时间
       if (states.slowCrawlMode) {
         await Utils.sleep(settings.slowCrawlDealy)
+        if (!ownsCrawl(generation)) return
       }
-      this.getWorksData()
+      this.getWorksData(undefined, generation)
     } else {
       // 没有剩余作品，统计此后有多少个完成的请求
       this.finishedRequest++
       // 所有请求都执行完毕
       if (this.finishedRequest === this.ajaxThread) {
-        this.crawlFinished()
+        this.crawlFinished(generation)
       }
     }
   }
 
-  // 抓取完毕
-  protected crawlFinished() {
+  /** 抓取完毕；使用本轮抓取所有权。 */
+  protected crawlFinished(generation = this.generation) {
+    if (!ownsCrawl(generation)) return
     log.persistentRefresh('getWorksProgress')
     // 当下载器没有处于慢速抓取模式时，会使用并发请求（例如同时发送 3 个请求）
     // 此时如果第一个请求触发了停止抓取 states.stopCrawl，这些并发请求都会进入这里
@@ -659,7 +698,7 @@ abstract class InitPageBase {
     }
 
     if (store.result.length === 0) {
-      return this.noResult()
+      return this.noResult(generation)
     }
 
     store.crawlCompleteTime = new Date()
@@ -726,7 +765,8 @@ abstract class InitPageBase {
   }
 
   /** 抓取结果为 0 时显示提示 */
-  protected noResult() {
+  protected noResult(generation = this.generation) {
+    if (!ownsCrawl(generation)) return
     // 先触发 crawlComplete，后触发 crawlEmpty。这样便于其他模块处理 crawlEmpty 这个例外情况
     // 如果触发顺序反过来，那么最后执行的都是 crawlComplete，可能会覆盖对 crawlEmpty 的处理
     EVT.fire('crawlComplete')
@@ -805,5 +845,3 @@ abstract class InitPageBase {
 }
 
 export { InitPageBase }
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

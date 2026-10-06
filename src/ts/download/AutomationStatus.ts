@@ -1,4 +1,5 @@
 import {
+  skipManagedCrawl,
   armManagedCrawl,
   abortManagedCrawl,
   getManagedCrawl,
@@ -161,6 +162,10 @@ function captureCrawlIdList() {
       ? { maxCount: gate.maxCount, decision: decision!, reason: rejectReason }
       : null,
   }
+  if (decision === 'rejected' && skipManagedCrawl('skipped-work-count')) {
+    states.stopCrawl = true
+    EVT.fire('stopCrawl')
+  }
 }
 
 /** 预设下一次正常抓取的作品 ID 数量门限；超过门限时会在元数据请求前停止。 */
@@ -194,6 +199,7 @@ window.addEventListener(EVT.list.crawlComplete, () => {
   resetDownloadLifecycle()
 })
 window.addEventListener(EVT.list.resultChange, () => {
+  if (states.busy) return
   lifecycle.crawlCompleted = observe(crawlTaskUrl())
   resetDownloadLifecycle()
 })
@@ -339,7 +345,4 @@ automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
 automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl
-automationGlobal.__PBD_AUTOMATION_ABORT_CRAWL__ = (operationId, url) =>
-  abortManagedCrawl(operationId, url)
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]
+automationGlobal.__PBD_AUTOMATION_ABORT_CRAWL__ = abortManagedCrawl

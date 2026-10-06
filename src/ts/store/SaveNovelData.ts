@@ -1,3 +1,4 @@
+import { CrawlGeneration, ownsCrawl } from '../crawl/CrawlGeneration'
 import { filter, FilterOption } from '../filter/Filter'
 import { NovelData } from '../crawl/CrawlResult'
 import { store } from './Store'
@@ -7,7 +8,8 @@ import { Utils } from '../utils/Utils'
 
 // 保存单个小说作品的数据
 class SaveNovelData {
-  public async save(data: NovelData) {
+  /** 保存前验证抓取写入所有权。 */
+  public async save(generation: CrawlGeneration, data: NovelData) {
     // 小说没有 illustType 属性， 把小说的 illustType 设置为 3，这是为了方便检查
     const illustType = 3
 
@@ -55,6 +57,7 @@ class SaveNovelData {
 
     // 检查通过
     if (await filter.check(filterOpt)) {
+      if (!ownsCrawl(generation)) return
       const id = body.id
       const idNum = parseInt(id)
       const title = body.title
@@ -86,7 +89,7 @@ class SaveNovelData {
       const embeddedImages = Tools.extractEmbeddedImages(data)
 
       // 保存作品信息
-      store.addResult({
+      store.addResult(generation, {
         aiType,
         id: id,
         idNum: idNum,

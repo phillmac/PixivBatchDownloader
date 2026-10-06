@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化插画/漫画的系列作品页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { API } from '../API'
@@ -51,18 +52,23 @@ class InitArtworkSeriesPage extends InitPageBase {
     this.getIdList()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let p = this.startpageNo + this.listPageFinished
 
     const data = await API.getSeriesData(this.seriesId, p)
+    if (!ownsCrawl(generation)) return
     this.listPageFinished++
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     // 保存本页面的作品的 id 列表
@@ -98,7 +104,9 @@ class InitArtworkSeriesPage extends InitPageBase {
       }
 
       // 因为这个 api 的 illust 数据可能是插画也可能是漫画，所以 type 是 unknown
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         store.idList.push({
           type: 'illusts',
           id: work.id,
@@ -116,7 +124,7 @@ class InitArtworkSeriesPage extends InitPageBase {
       this.listPageFinished === this.crawlNumber
     ) {
       log.log(lang.transl('_列表页抓取完成'))
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
     } else {
       // 继续抓取
       log.log(

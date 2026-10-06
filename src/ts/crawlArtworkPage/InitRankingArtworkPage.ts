@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化 artwork 排行榜页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { API } from '../API'
@@ -118,25 +119,31 @@ class InitRankingArtworkPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     // 发起请求，获取作品列表
     let data: RankingImageWorkData
     try {
       data = await API.getRankingDataImageWork(this.option)
+      if (!ownsCrawl(generation)) return
     } catch (error: Error | any) {
+      if (!ownsCrawl(generation)) return
       if (error.status === 404) {
         // 如果发生了404错误，可能确实没有这一页了，也就是说数据已经获取完毕了
         console.log('404错误，直接下载已有部分')
       }
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     this.listPageFinished++
@@ -164,7 +171,9 @@ class InitRankingArtworkPage extends InitPageBase {
         userId: work.user_id.toString(),
       }
 
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         store.setRankList(work.illust_id.toString(), work.rank)
 
         store.idList.push({
@@ -175,13 +184,13 @@ class InitRankingArtworkPage extends InitPageBase {
 
       this.checkTotal++
       if (this.checkTotal >= this.crawlNumber) {
-        return this.getIdListFinished()
+        return this.getIdListFinished(generation)
       }
     }
 
     // 抓取完毕
     if (store.idList.length >= this.crawlNumber || !data.next) {
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
     } else {
       // 继续抓取
       this.option.p = data.next

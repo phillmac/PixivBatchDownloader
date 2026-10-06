@@ -38,10 +38,12 @@ function harness(controller, durable) {
   }
   const listeners = new Map()
   const EVT = {
-    fire(name) {
-      for (const callback of listeners.get(name) || []) callback()
+    fire(name, data) {
+      for (const callback of listeners.get(name) || [])
+        callback({ type: name, detail: { data } })
     },
     list: {
+      importResultLoaded: 'importResultLoaded',
       crawlStart: 'crawlStart',
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
@@ -64,7 +66,7 @@ function harness(controller, durable) {
       listeners.set(name, callbacks)
     },
   }
-  const context = vm.createContext({ console, Date, window })
+  const context = vm.createContext({ console, Date, window, queueMicrotask })
   const file = path.join(root, 'src/ts/download/AutomationStatus.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: {
@@ -72,6 +74,20 @@ function harness(controller, durable) {
       target: ts.ScriptTarget.ES2022,
     },
   }).outputText
+  const generation = {}
+  const generationCode = ts.transpileModule(
+    fs.readFileSync(path.join(root, 'src/ts/crawl/CrawlGeneration.ts'), 'utf8'),
+    {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+      },
+    }
+  ).outputText
+  vm.runInContext(
+    '(function(exports) {' + generationCode + '\n})',
+    context
+  )(generation)
   const managed = {}
   const managedFile = path.join(
     root,
@@ -85,6 +101,7 @@ function harness(controller, durable) {
   }).outputText
   vm.runInContext(`(function(require, exports) {${managedCode}\n})`, context)(
     (name) => {
+      if (name === '../crawl/CrawlGeneration') return generation
       if (name === './Resume') return { resume }
       if (name === '../EVT') return { EVT }
       if (name === '../store/Store') return { store }
@@ -109,12 +126,15 @@ function harness(controller, durable) {
   return {
     exports,
     managed,
+    generation,
+    EVT,
     context,
     store,
     states,
     controller,
     discardCalls,
-    fire(name) {
+    fire(name, begin = true) {
+      if (name === 'crawlStart' && begin) generation.beginCrawl()
       for (const callback of listeners.get(name) || []) callback()
     },
   }
@@ -695,7 +715,7 @@ test('isolated world exposes read-only automation function', async () => {
     armed.url
   )
   assert.equal(result.outcome, 'aborted')
-  assert.deepEqual(h.discardCalls, [armed.url])
+  assert.deepEqual(h.discardCalls, [])
   assert.equal(
     (await h.exports.getAutomationStatus()).managedOperation.state,
     'aborted'
@@ -979,75 +999,6 @@ function createResumeHarness(options = {}) {
   }
 }
 
-test('Resume discard removes only the selected URL task', async () => {
-  const url = 'https://www.pixiv.net/en/users/1'
-  const otherUrl = 'https://www.pixiv.net/en/users/2'
-  const h = createResumeHarness({
-    url,
-    metaByUrl: {
-      [url]: {
-        id: 101,
-        url,
-        URLWhenCrawlStart: url,
-        part: 2,
-        date: new Date('2026-10-03T00:00:00Z'),
-        stateSummary: { total: 2, pending: 2, inProgress: 0, completed: 0 },
-      },
-      [otherUrl]: {
-        id: 202,
-        url: otherUrl,
-        URLWhenCrawlStart: otherUrl,
-        part: 1,
-        date: new Date('2026-10-03T00:00:00Z'),
-        stateSummary: { total: 1, pending: 1, inProgress: 0, completed: 0 },
-      },
-    },
-    dataById: {
-      1010: { id: 1010, data: [{ id: 'a' }] },
-      1011: { id: 1011, data: [{ id: 'b' }] },
-      2020: { id: 2020, data: [{ id: 'c' }] },
-    },
-    statesById: {
-      101: { id: 101, states: [-1, -1] },
-      202: { id: 202, states: [-1] },
-    },
-  })
-
-  const result = await h.resume.discardSavedTask(url + '#fragment')
-  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
-    discarded: true,
-    url,
-    taskId: 101,
-  })
-  assert.equal(h.metaByUrl.has(url), false)
-  assert.equal(h.statesById.has(101), false)
-  assert.equal(h.dataById.has(1010), false)
-  assert.equal(h.dataById.has(1011), false)
-  assert.equal(h.metaByUrl.has(otherUrl), true)
-  assert.equal(h.statesById.has(202), true)
-  assert.equal(h.dataById.has(2020), true)
-
-  // Late metadata callbacks after stop must not recreate the discarded queue.
-  h.store.URLWhenCrawlStart = url
-  h.store.result = [{ id: 'late' }]
-  h.downloadStates.states = [-1]
-  h.fire('resultChange')
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(h.metaByUrl.has(url), false)
-
-  // A real new crawl re-enables persistence for this URL.
-  h.fire('crawlStart')
-  h.fire('resultChange')
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(h.metaByUrl.has(url), true)
-
-  const second = await h.resume.discardSavedTask(url)
-  assert.equal(second.discarded, true)
-  assert.equal(second.url, url)
-  assert.equal(typeof second.taskId, 'number')
-  assert.equal(h.metaByUrl.has(url), false)
-})
-
 test('Resume status uses metadata summary without cloning taskStates', async () => {
   const url = 'https://www.pixiv.net/en/users/1'
   const h = createResumeHarness({
@@ -1176,7 +1127,7 @@ test('imported results bind the queue to the current page URL', async () => {
     reset() {
       this.result = []
     },
-    addResult(value) {
+    addResult(owner, value) {
       this.result.push(value)
     },
   }
@@ -1206,6 +1157,8 @@ test('imported results bind the queue to the current page URL', async () => {
     if (name === '../utils/Utils')
       return { Utils: { loadJSONFile: async () => [imported] } }
     if (name === '../store/States') return { states: { busy: false } }
+    if (name === '../crawl/CrawlGeneration')
+      return { replacementOwner: 'replacement' }
     if (name === '../store/Store') return { store }
     if (name === '../store/States') return { states }
     if (name === '../Toast') return { toast: { error() {} } }
@@ -1763,23 +1716,6 @@ test('download completion cancels the initial save before taskId ownership exist
   assert.equal(h.resume.taskId || 0, 0)
 })
 
-test('successful imported result set releases local discard suppression', async () => {
-  const url = 'https://www.pixiv.net/en/users/1'
-  const h = createResumeHarness({ url })
-  await h.resume.ready
-  await h.resume.discardSavedTask(url)
-  h.store.URLWhenCrawlStart = url
-  h.store.result = [{ id: 'imported' }]
-  h.downloadStates.states = [-1]
-
-  h.fire('importResultLoaded')
-  h.fire('crawlComplete')
-  await new Promise((resolve) => setImmediate(resolve))
-  await new Promise((resolve) => setImmediate(resolve))
-
-  assert.equal(h.metaByUrl.has(url), true)
-})
-
 test('checkpoint does not recreate metadata deleted by another tab', async () => {
   const url = 'https://www.pixiv.net/en/users/1'
   const meta = {
@@ -1828,7 +1764,7 @@ test('managed manual stop wins over late completion and result changes', async (
   h.fire('resultChange')
   await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(arm.operationId, arm.url)
   assert.equal((await h.exports.getAutomationStatus()).phase, 'STOPPED')
-  assert.deepEqual(h.discardCalls, [arm.url])
+  assert.deepEqual(h.discardCalls, [])
   assert.equal(abortComplete, 1)
   const next = h.context.__PBD_AUTOMATION_ARM_CRAWL__(arm.url)
   h.fire('crawlStart')
@@ -1839,7 +1775,7 @@ test('managed manual stop wins over late completion and result changes', async (
     'already-completed'
   )
   assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
-  assert.equal(h.discardCalls.length, 1)
+  assert.equal(h.discardCalls.length, 0)
 })
 
 test('managed abort fails closed for wrong token, URL and unmatched crawl', async () => {
@@ -1926,8 +1862,12 @@ test('not-started abort cancels the arm and owned abort suppresses before Stop C
   h.store.URLWhenCrawlStart = url
   h.fire('crawlStart')
   h.context.window.addEventListener('stopCrawl', () => {
-    assert.deepEqual(h.discardCalls, [url])
-    assert.equal(h.managed.getManagedCrawl().state, 'aborting')
+    assert.deepEqual(h.discardCalls, [])
+    assert.equal(h.managed.getManagedCrawl().state, 'aborted')
+    assert.equal(
+      h.generation.ownsCrawl(h.managed.getManagedCrawl().generation),
+      false
+    )
   })
   const result = await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
     owned.operationId,
@@ -1937,4 +1877,526 @@ test('not-started abort cancels the arm and owned abort suppresses before Stop C
   assert.equal(h.states.stopCrawl, true)
 })
 
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]
+function deferred() {
+  let resolve, reject
+  const promise = new Promise((a, b) => {
+    resolve = a
+    reject = b
+  })
+  return { promise, resolve, reject }
+}
+
+// Execute the production base worker, Store and save modules with deferred API/filter responses.
+function crawlHarness() {
+  const h = harness({ busy: false, resultLength: 0 }, null)
+  h.context.window.setTimeout = setTimeout
+  h.context.window.clearTimeout = clearTimeout
+  h.context.location = { pathname: '/en/users/1/requests' }
+  h.EVT.list = new Proxy(h.EVT.list, { get: (obj, key) => obj[key] || key })
+  h.EVT.bindOnce = () => {}
+  const noop = () => {}
+  const settings = { setFileDownloadOrder: false, exportIDList: false }
+  const filter = { check: async () => true, showTip: () => false }
+  const API = {}
+  const Tools = new Proxy(
+    {
+      getWorkTypeVague: () => 0,
+      extractTags: () => [],
+      getAIGeneratedMark: () => '',
+      getCurrentPageUserId: () => '1',
+    },
+    { get: (obj, key) => obj[key] || (() => '') }
+  )
+  const Utils = {
+    isPixiv: () => true,
+    htmlDecode: (x) => x,
+    htmlToText: (x) => x,
+    sleep: async () => {},
+    splitArray: (a) => [a],
+  }
+  const log = new Proxy({}, { get: () => noop })
+  const modules = {
+    '../crawl/CrawlGeneration': h.generation,
+    './CrawlGeneration': h.generation,
+    '../download/ManagedCrawlAutomation': h.managed,
+    '../EVT': { EVT: h.EVT },
+    '../store/Store': { store: h.store },
+    './Store': { store: h.store },
+    '../store/States': { states: h.states },
+    '../filter/Filter': { filter },
+    '../API': { API },
+    '../Tools': { Tools },
+    '../utils/Utils': { Utils },
+    '../Log': { log },
+    '../Language': { lang: { transl: () => '' } },
+    '../setting/Settings': { settings },
+    '../PageType': { pageType: { type: 0, list: {} } },
+    '../store/CacheWorkData': { cacheWorkData: { get: () => null } },
+    './VipSearchOptimize': {
+      vipSearchOptimize: { checkBookmarkCount: async () => false },
+    },
+    '../Colors': { Colors: { bgBlue: 'blue' } },
+    '../Toast': { toast: log },
+    '../MsgBox': { msgBox: log },
+    '../filter/Mute': { mute: { getMuteSettings: async () => {} } },
+    '../ShowOneTimeMsg': { showOneTimeMsg: log },
+    '../crawl/CrawlLatestFewWorks': {},
+    './CrawlLatestFewWorks': { crawlLatestFewWorks: log },
+    '../filter/CheckIndexForMultiImageWork': {
+      checkIndexForMultiImageWork: { check: () => true },
+    },
+  }
+  function load(relative, replacement) {
+    let source = fs.readFileSync(path.join(root, 'src/ts', relative), 'utf8')
+    if (replacement) source = replacement(source)
+    const code = ts.transpileModule(source, {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+      },
+    }).outputText
+    const exports = {}
+    vm.runInContext('(function(require, exports) {' + code + '\n})', h.context)(
+      (name) => modules[name] || {},
+      exports
+    )
+    return exports
+  }
+  // Keep the same Store object captured by automation; install production methods/defaults.
+  const realStore = load('store/Store.ts').store
+  Object.setPrototypeOf(h.store, Object.getPrototypeOf(realStore))
+  Object.assign(h.store, realStore)
+  h.store.bindEvents()
+  h.store.URLWhenCrawlStart = h.context.window.location.href
+  modules['../store/SaveArtworkData'] = load('store/SaveArtworkData.ts')
+  modules['../store/SaveNovelData'] = load('store/SaveNovelData.ts')
+  const Base = load('crawl/InitPageBase.ts').InitPageBase
+  modules['../crawl/InitPageBase'] = { InitPageBase: Base }
+  const worker = new Base()
+  worker.sortResult = noop
+  worker.resetGetIdListStatus = noop
+  let complete = 0
+  h.context.window.addEventListener('crawlComplete', () => {
+    complete++
+  })
+  function start(managed = true) {
+    h.states.stopCrawl = false
+    const arm = managed
+      ? h.managed.armManagedCrawl(h.context.window.location.href)
+      : null
+    h.fire('crawlStart')
+    worker.generation = h.generation.currentCrawl()
+    worker.finishedRequest = 0
+    worker.ajaxThread = 1
+    worker.crawlFinishBecauseStopCrawl = false
+    return { arm, generation: worker.generation }
+  }
+  return {
+    ...h,
+    worker,
+    Utils,
+    API,
+    filter,
+    settings,
+    load,
+    start,
+    complete: () => complete,
+    saveArtwork: modules['../store/SaveArtworkData'].saveArtworkData,
+    saveNovel: modules['../store/SaveNovelData'].saveNovelData,
+  }
+}
+
+function artwork(id = '100', illustType = 0) {
+  return {
+    body: {
+      id,
+      illustType,
+      tags: { tags: [] },
+      title: 'work',
+      description: '',
+      aiType: 0,
+      pageCount: 1,
+      width: 1,
+      height: 1,
+      userId: '1',
+      userName: 'author',
+      urls: {
+        original: 'https://example.invalid/100_p0.jpg',
+        regular: '',
+        small: '',
+        thumb: '',
+      },
+    },
+  }
+}
+
+for (const replacement of ['new crawl', 'import']) {
+  test(`late managed metadata after abort and ${replacement} cannot write, consume IDs or complete`, async () => {
+    const h = crawlHarness()
+    const old = h.start()
+    const response = deferred()
+    const started = deferred()
+    h.API.getArtworkData = () => {
+      started.resolve()
+      return response.promise
+    }
+    h.store.idList = [{ id: '100', type: 'illusts' }]
+    const pending = h.worker.getWorksData(undefined, old.generation)
+    await started.promise
+    await h.managed.abortManagedCrawl(old.arm.operationId, old.arm.url)
+    if (replacement === 'new crawl') h.start()
+    else {
+      h.store.reset()
+      h.store.addResult(h.generation.replacementOwner, {
+        id: '900',
+        idNum: 900,
+        type: 3,
+      })
+      h.fire('importResultLoaded')
+      assert.equal(h.managed.managedCrawlBlocksDownload(), false)
+    }
+    h.store.idList = [{ id: '200', type: 'illusts' }]
+    h.worker.finishedRequest = 7
+    const before = JSON.stringify(h.store.result)
+    response.resolve(artwork())
+    await pending
+    assert.equal(JSON.stringify(h.store.result), before)
+    assert.equal(h.store.idList[0].id, '200')
+    assert.equal(h.worker.finishedRequest, 7)
+    assert.equal(h.complete(), 0)
+  })
+}
+
+for (const filename of [
+  'InitUserPage',
+  'InitBookmarkPage',
+  'InitUserRequestPage',
+]) {
+  test(`${filename} rejects old ID response after abort and same-URL second crawl`, async () => {
+    const h = crawlHarness()
+    const old = h.start()
+    const response = deferred()
+    const started = deferred()
+    const request = () => {
+      started.resolve()
+      return response.promise
+    }
+    h.API.getUserWorksByType = request
+    h.API.getBookmarkData = request
+    h.API.getUserRequestIds = request
+    const Class = h.load('crawlMixedPage/' + filename + '.ts')[filename]
+    const producer = Object.create(Class.prototype)
+    Object.assign(producer, {
+      generation: old.generation,
+      listType: 0,
+      idList: [],
+      offset: 0,
+      filteredNumber: 0,
+      requsetNumber: 10,
+    })
+    const pending = producer.getIdList()
+    await started.promise
+    await h.managed.abortManagedCrawl(old.arm.operationId, old.arm.url)
+    const next = h.start()
+    producer.generation = next.generation
+    h.store.idList = [{ id: 'new', type: 'illusts' }]
+    response.resolve(
+      filename === 'InitBookmarkPage'
+        ? { body: { works: [{ id: 'old' }] } }
+        : [{ id: 'old', type: 'illusts' }]
+    )
+    await pending
+    assert.equal(h.store.idList.length, 1)
+    assert.equal(h.store.idList[0].id, 'new')
+    assert.equal(h.complete(), 0)
+  })
+}
+
+test('save modules reject ownership lost during their filters and ugoira metadata', async () => {
+  for (const kind of ['artwork-filter', 'novel-filter', 'ugoira']) {
+    const h = crawlHarness()
+    const old = h.start()
+    const pause = deferred()
+    if (kind === 'ugoira') h.API.getUgoiraMeta = () => pause.promise
+    else h.filter.check = () => pause.promise
+    const pending =
+      kind === 'novel-filter'
+        ? h.saveNovel.save(old.generation, {
+            body: { id: '100', tags: { tags: [] }, aiType: 0 },
+          })
+        : h.saveArtwork.save(
+            old.generation,
+            artwork('100', kind === 'ugoira' ? 2 : 0)
+          )
+    await Promise.resolve()
+    await h.managed.abortManagedCrawl(old.arm.operationId, old.arm.url)
+    h.start()
+    pause.resolve(
+      kind === 'ugoira'
+        ? { body: { frames: [], mime_type: '', originalSrc: '', src: '' } }
+        : true
+    )
+    await pending
+    assert.equal(h.store.result.length, 0)
+    assert.equal(h.store.resultMeta.length, 0)
+  }
+})
+
+test('managed manual stop revokes synchronously; unmanaged stop preserves partial finalization', async () => {
+  const h = crawlHarness()
+  let task = h.start()
+  h.fire('stopCrawl')
+  assert.equal(h.generation.ownsCrawl(task.generation), false)
+  assert.equal(h.managed.getManagedCrawl().state, 'aborted')
+  task = h.start(false)
+  h.store.addResult(task.generation, { id: '100', idNum: 100, type: 3 })
+  h.fire('stopCrawl')
+  assert.equal(h.generation.ownsCrawl(task.generation), true)
+  // The real Stop button sets this after dispatch; legacy worker finalizes partial results.
+  h.states.stopCrawl = true
+  await h.worker.getWorksData(undefined, task.generation)
+  assert.equal(h.complete(), 1)
+  assert.equal(h.store.result.length, 1)
+})
+
+test('work-count and ID-only managed stops remain distinct from completed', async () => {
+  for (const reason of ['skipped-work-count', 'skipped-id-list']) {
+    const h = crawlHarness()
+    const task = h.start()
+    h.store.idList = [{ id: '100', type: 'illusts' }]
+    if (reason === 'skipped-work-count') {
+      // Arm before start in production; exercise the real synchronous gate listener here.
+      h.states.busy = false
+      h.exports.setAutomationCrawlIdGate(0)
+    } else h.worker.onlyCrawlIdList = true
+    await h.worker.getIdListFinished(task.generation)
+    assert.equal(h.managed.getManagedCrawl().state, reason)
+    assert.equal(h.generation.ownsCrawl(task.generation), false)
+    assert.equal(h.complete(), 0)
+    assert.deepEqual(h.discardCalls, [])
+  }
+})
+
+test('wrong generation and completed late abort do not mutate authority or downloadable results', async () => {
+  const h = crawlHarness()
+  const task = h.start()
+  const wrong = await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
+    task.arm.operationId,
+    task.arm.url,
+    task.generation + 1
+  )
+  assert.equal(wrong.outcome, 'ownership-mismatch')
+  assert.equal(h.generation.ownsCrawl(task.generation), true)
+  h.store.addResult(task.generation, { id: '100', idNum: 100, type: 3 })
+  h.worker.crawlFinished(task.generation)
+  const before = JSON.stringify(h.store.result)
+  assert.equal(
+    (
+      await h.managed.abortManagedCrawl(
+        task.arm.operationId,
+        task.arm.url,
+        task.generation
+      )
+    ).outcome,
+    'already-completed'
+  )
+  assert.equal(h.generation.ownsCrawl(task.generation), true)
+  assert.equal(h.managed.managedCrawlBlocksDownload(), false)
+  assert.equal(JSON.stringify(h.store.result), before)
+})
+
+test('normal unmanaged metadata crawl publishes and completes', async () => {
+  const h = crawlHarness()
+  const task = h.start(false)
+  h.API.getArtworkData = async () => artwork()
+  h.store.idList = [{ id: '100', type: 'illusts' }]
+  await h.worker.getWorksData(undefined, task.generation)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.store.result.length, 1)
+  assert.equal(h.store.resultMeta.length, 1)
+  assert.equal(h.complete(), 1)
+})
+
+test('Resume ignores busy resultChange but persists completed and idle edited/imported queues', async () => {
+  const h = createResumeHarness()
+  await h.resume.ready
+  h.store.result = [{ id: '100' }]
+  h.downloadStates.states = [-1]
+  h.states.busy = true
+  h.fire('resultChange')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.putCalls.length, 0)
+  h.fire('crawlComplete')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(h.metaByUrl.size, 1)
+  h.states.busy = false
+  h.store.result = [{ id: 'imported' }, { id: 'edited' }]
+  h.downloadStates.states = [-1, -1]
+  h.fire('resultChange')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(
+    [...h.dataById.values()].some((chunk) => chunk.data.length === 2),
+    true
+  )
+  assert.equal(typeof h.resume.discardSavedTask, 'undefined')
+})
+
+test('managed terminal event advances the production waiting-ID scheduler after revocation', async () => {
+  const h = crawlHarness()
+  const task = h.start()
+  const oldResponse = deferred()
+  const started = deferred()
+  const nextRequested = deferred()
+  const nextResponse = deferred()
+  const completed = deferred()
+  const nextStarted = deferred()
+  let nextTask
+  h.context.window.addEventListener('crawlComplete', () => completed.resolve())
+  h.API.getArtworkData = (id) => {
+    if (id === '100') {
+      started.resolve()
+      return oldResponse.promise
+    }
+    nextRequested.resolve()
+    return nextResponse.promise
+  }
+  h.store.idList = [{ id: '100', type: 'illusts' }]
+  const pending = h.worker.getWorksData(undefined, task.generation)
+  await started.promise
+  h.store.waitingIdList = [{ id: '200', type: 'illusts' }]
+  const schedulerSource = fs.readFileSync(
+    path.join(root, 'src/ts/download/DownloadControl.ts'),
+    'utf8'
+  )
+  const schedulerAst = ts.createSourceFile(
+    'DownloadControl.ts',
+    schedulerSource,
+    ts.ScriptTarget.Latest,
+    true
+  )
+  const cls = schedulerAst.statements.find(ts.isClassDeclaration)
+  const bind = cls.members.find(
+    (member) => member.name?.getText(schedulerAst) === 'bindEvents'
+  )
+  // Exercise the actual queue listener; other listeners concern downloads and UI.
+  const queueStatement = bind.body.statements.find((statement) =>
+    statement
+      .getText(schedulerAst)
+      .startsWith('checkWaitingIdListEvents.forEach')
+  )
+  const source = `const checkWaitingIdListEvents = [EVT.list.downloadComplete, EVT.list.crawlEmpty, EVT.list.managedCrawlAbortComplete]; ${queueStatement.getText(schedulerAst)}`
+  const code = ts.transpileModule(source, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  h.context.EVT = h.EVT
+  h.context.store = h.store
+  h.context.toast = { success() {} }
+  h.context.lang = { transl: () => '' }
+  h.context.browser = { runtime: { sendMessage() {} } }
+  vm.runInContext(
+    ['(function() {', code, '})'].join(String.fromCharCode(10)),
+    h.context
+  ).call({})
+  const originalFire = h.EVT.fire.bind(h.EVT)
+  h.EVT.fire = (name, data) => {
+    if (name === 'crawlIdList') {
+      h.states.busy = false
+      nextTask = h.worker.crawlIdList(data)
+      nextStarted.resolve()
+    } else originalFire(name)
+  }
+  await h.managed.abortManagedCrawl(task.arm.operationId, task.arm.url)
+  assert.equal(h.generation.ownsCrawl(task.generation), false)
+  await nextStarted.promise
+  await nextTask
+  await nextRequested.promise
+  oldResponse.resolve(artwork('100'))
+  await pending
+  assert.equal(h.store.result.length, 0)
+  nextResponse.resolve(artwork('200'))
+  await completed.promise
+  assert.equal(h.store.waitingIdList.length, 0)
+  assert.equal(h.store.result.length, 1)
+  assert.equal(h.store.result[0].idNum, 200)
+  assert.equal(h.complete(), 1)
+})
+
+test('late retry and afterGetWorksData filter cannot consume new IDs or completion counters', async () => {
+  for (const phase of ['retry', 'after-filter']) {
+    const h = crawlHarness()
+    const task = h.start()
+    const pause = deferred()
+    h.store.idList = [{ id: '200', type: 'illusts' }]
+    let pending
+    if (phase === 'after-filter') {
+      h.filter.check = () => pause.promise
+      pending = h.worker.afterGetWorksData(undefined, task.generation)
+    } else {
+      h.API.getArtworkData = async () => {
+        throw new Error('offline')
+      }
+      // Awaiting filter and failed API leads into the real retry sleep.
+      h.context.console = { ...console, error() {} }
+      const started = deferred()
+      h.Utils.sleep = () => {
+        started.resolve()
+        return pause.promise
+      }
+      pending = h.worker.getWorksData(
+        { id: '100', type: 'illusts' },
+        task.generation
+      )
+      await started.promise
+    }
+    await h.managed.abortManagedCrawl(task.arm.operationId, task.arm.url)
+    h.start(false)
+    h.store.idList = [{ id: '300', type: 'illusts' }]
+    h.worker.finishedRequest = 9
+    pause.resolve(false)
+    await pending
+    assert.equal(h.store.idList[0].id, '300')
+    assert.equal(h.worker.finishedRequest, 9)
+    assert.equal(h.complete(), 0)
+  }
+})
+
+test('a new unmanaged crawl invalidates prior callbacks without any Stop event', async () => {
+  const h = crawlHarness()
+  const old = h.start(false)
+  const response = deferred()
+  const started = deferred()
+  h.API.getArtworkData = () => {
+    started.resolve()
+    return response.promise
+  }
+  const pending = h.worker.getWorksData(
+    { id: '100', type: 'illusts' },
+    old.generation
+  )
+  await started.promise
+  h.start(false)
+  h.store.idList = [{ id: 'new', type: 'illusts' }]
+  response.resolve(artwork())
+  await pending
+  assert.equal(h.store.result.length, 0)
+  assert.equal(h.store.idList[0].id, 'new')
+  assert.equal(h.complete(), 0)
+})
+
+test('managed ID export remains non-destructive and never marks metadata completion', async () => {
+  const h = crawlHarness()
+  const task = h.start()
+  h.settings.exportIDList = true
+  let exported
+  h.Utils.json2BlobSafe = async (ids) => {
+    exported = ids
+    return []
+  }
+  h.store.idList = [{ id: '100', type: 'illusts' }]
+  await h.worker.getIdListFinished(task.generation)
+  assert.equal(exported[0].id, '100')
+  assert.equal(h.store.idList[0].id, '100')
+  assert.equal(h.managed.getManagedCrawl().state, 'skipped-id-list')
+  assert.equal(h.complete(), 0)
+  assert.deepEqual(h.discardCalls, [])
+})

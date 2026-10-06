@@ -314,7 +314,7 @@ class DownloadControl {
       }
     })
 
-    // 当下载完毕，或者抓取结果为空时，检查是否有等待下载的任务
+    // 下载完成、抓取结果为空或托管抓取撤销写入权限后，推进等待任务
     const checkWaitingIdListEvents = [
       EVT.list.downloadComplete,
       EVT.list.crawlEmpty,
@@ -815,5 +815,3 @@ class DownloadControl {
 }
 
 new DownloadControl()
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

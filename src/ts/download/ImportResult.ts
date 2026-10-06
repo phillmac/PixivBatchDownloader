@@ -1,3 +1,4 @@
+import { replacementOwner } from '../crawl/CrawlGeneration'
 import { EVT } from '../EVT'
 import { Result } from '../store/StoreType'
 import { lang } from '../Language'
@@ -85,11 +86,10 @@ class ImportResult {
     store.URLWhenCrawlStart = window.location.href
     store.crawlCompleteTime = new Date()
     for (const r of temp) {
-      store.addResult(r)
+      store.addResult(replacementOwner, r)
     }
 
-    // A valid imported result set is new ownership, not a late callback from
-    // the abandoned crawl. Release Resume suppression before persistence runs.
+    // 有效导入替换内存队列；旧抓取已撤销权限时释放托管下载保护。
     EVT.fire('importResultLoaded')
     // 发送通知
     EVT.fire('crawlComplete')
@@ -99,5 +99,3 @@ class ImportResult {
 }
 
 new ImportResult()
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
 import { Tools } from '../Tools'
@@ -115,14 +116,21 @@ class InitRankingNovelPageOld extends InitPageBase {
     this.getIdList()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     let dom: Document
     try {
       const res = await fetch(this.pageUrlList[this.page - 1])
+      if (!ownsCrawl(generation)) return
       const text = await res.text()
+      if (!ownsCrawl(generation)) return
       const parse = new DOMParser()
       dom = parse.parseFromString(text, 'text/html')
     } catch (error) {
+      if (!ownsCrawl(generation)) return
       this.getIdList()
       return
     }
@@ -187,7 +195,9 @@ class InitRankingNovelPageOld extends InitPageBase {
         )
       }
 
-      if ((await filter.check(filterOpt)) && checkLang) {
+      const passesFilter = (await filter.check(filterOpt)) && checkLang
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         store.setRankList(id.toString(), rank)
 
         store.idList.push({
@@ -198,7 +208,7 @@ class InitRankingNovelPageOld extends InitPageBase {
 
       this.checkTotal++
       if (this.checkTotal >= this.crawlNumber) {
-        return this.getIdListFinished()
+        return this.getIdListFinished(generation)
       }
     }
 
@@ -207,7 +217,7 @@ class InitRankingNovelPageOld extends InitPageBase {
       store.idList.length >= this.crawlNumber ||
       this.listPageFinished === this.pageUrlList.length
     ) {
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
     } else {
       // 继续抓取
       this.getIdList()

@@ -27,7 +27,7 @@ class EVENT {
     /** 当抓取开始时触发 */
     crawlStart: 'crawlStart',
     stopCrawl: 'stopCrawl',
-    /** 托管抓取的原子放弃清理已完成。 */
+    /** 托管抓取已撤销写入权限；通知等待队列继续，不代表网络请求已结束。 */
     managedCrawlAbortComplete: 'managedCrawlAbortComplete',
     /** 让下载器抓取特定的 tag，而不是自动获取当前页面的 tag（仅在 tag 搜索页面有效） */
     crawlTag: 'crawlTag',
@@ -371,5 +371,3 @@ class EVENT {
 const EVT = new EVENT()
 
 export { EVT }
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

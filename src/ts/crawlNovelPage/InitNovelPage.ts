@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 //初始化小说作品页
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -70,12 +71,17 @@ class InitNovelPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     let type: userWorksType[] = ['novels']
     let idList = await API.getUserWorksByType(
       Tools.getCurrentPageUserId(),
       type
     )
+    if (!ownsCrawl(generation)) return
 
     // 储存符合条件的 id
     let nowId = parseInt(Tools.getNovelId(window.location.href))
@@ -103,7 +109,7 @@ class InitNovelPage extends InitPageBase {
       store.idList = store.idList.splice(0, this.crawlNumber)
     }
 
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 
   protected resetGetIdListStatus() {

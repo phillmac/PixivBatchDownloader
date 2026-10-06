@@ -176,5 +176,3 @@ class States {
 
 const states = new States()
 export { states }
-
-[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

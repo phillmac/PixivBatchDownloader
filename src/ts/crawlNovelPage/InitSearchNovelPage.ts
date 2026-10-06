@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化小说搜索页
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -179,7 +180,11 @@ class InitSearchNovelPage extends InitPageBase {
     window.removeEventListener(EVT.list.crawlTag, this.crawlTag)
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async nextStep() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     this.setSlowCrawl()
     this.initFetchURL()
 
@@ -191,7 +196,9 @@ class InitSearchNovelPage extends InitPageBase {
     let data
     try {
       data = await this.getSearchData(1)
+      if (!ownsCrawl(generation)) return
     } catch {
+      if (!ownsCrawl(generation)) return
       EVT.fire('stopCrawl')
       return
     }
@@ -234,7 +241,7 @@ class InitSearchNovelPage extends InitPageBase {
     this.needCrawlPageCount = Math.min(needFetchPage, this.crawlNumber)
 
     if (this.needCrawlPageCount === 0) {
-      return this.noResult()
+      return this.noResult(generation)
     }
 
     this.getIdList()
@@ -322,9 +329,14 @@ class InitSearchNovelPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   private async delayReTry(p: number) {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     log.error(lang.transl('_下载器会在几分钟后重试'))
     await Utils.sleep(Config.retryTime)
+    if (!ownsCrawl(generation)) return
     this.getIdList(p)
   }
 
@@ -349,10 +361,13 @@ class InitSearchNovelPage extends InitPageBase {
     return undefined
   }
 
-  // 仅当出错重试时，才会传递参数 p。此时直接使用传入的 p，而不是继续让 p 增加
+  /** 仅当出错重试时，才会传递参数 p。此时直接使用传入的 p，而不是继续让 p 增加；使用本轮抓取所有权。 */
   protected async getIdList(p?: number): Promise<void> {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     if (p === undefined) {
@@ -364,17 +379,19 @@ class InitSearchNovelPage extends InitPageBase {
     let data
     try {
       data = await this.getSearchData(p)
+      if (!ownsCrawl(generation)) return
       if (data.total === 0) {
         console.log(`page ${p}: total 0`)
         this.tipEmptyResult()
         return this.delayReTry(p)
       }
     } catch {
+      if (!ownsCrawl(generation)) return
       return this.delayReTry(p)
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     const worksData = data.data
@@ -399,7 +416,9 @@ class InitSearchNovelPage extends InitPageBase {
         xRestrict: work.xRestrict,
       }
 
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         // 如果这份数据是单篇小说
         if (novelId) {
           store.idList.push({
@@ -434,10 +453,11 @@ class InitSearchNovelPage extends InitPageBase {
         const novelId = this.getNovelId(lastWork)
         if (novelId) {
           const check = await vipSearchOptimize.checkWork(novelId, 'novels')
+          if (!ownsCrawl(generation)) return
           if (check) {
             log.log(lang.transl('_后续作品低于最低收藏数量要求跳过后续作品'))
             log.log(lang.transl('_列表页抓取完成'))
-            return this.getIdListFinished()
+            return this.getIdListFinished(generation)
           }
         }
       }
@@ -457,6 +477,7 @@ class InitSearchNovelPage extends InitPageBase {
       // 继续发送抓取任务（+1 是因为 sendCrawlTaskCount 从 0 开始）
       if (states.slowCrawlMode) {
         await Utils.sleep(settings.slowCrawlDealy)
+        if (!ownsCrawl(generation)) return
       }
       this.getIdList()
     } else {
@@ -467,7 +488,7 @@ class InitSearchNovelPage extends InitPageBase {
 
         // idListWithPageNo.store(pageType.type)
 
-        this.getIdListFinished()
+        this.getIdListFinished(generation)
       }
     }
   }

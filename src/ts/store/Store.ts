@@ -1,3 +1,8 @@
+import {
+  CrawlGeneration,
+  ownsCrawl,
+  replacementOwner,
+} from '../crawl/CrawlGeneration'
 import { EVT } from '../EVT'
 import { checkIndexForMultiImageWork } from '../filter/CheckIndexForMultiImageWork'
 import { pageType } from '../PageType'
@@ -110,7 +115,12 @@ class Store {
    *
    * 如果一个作品有多张图片，只需要传递第一张图片的数据。后续图片的数据会根据设置自动生成
    */
-  public addResult(data: ResultOptional, requestedIndexList?: number[]) {
+  public addResult(
+    owner: CrawlGeneration | typeof replacementOwner,
+    data: ResultOptional,
+    requestedIndexList?: number[]
+  ) {
+    if (owner !== replacementOwner && !ownsCrawl(owner)) return
     // 检查该作品 id 是否已存在，已存在则不添加
     if (data.idNum !== undefined) {
       const useList = data.type === 3 ? this.novelIDList : this.artworkIDList
@@ -129,6 +139,7 @@ class Store {
     }
     this.resultMeta.push(meta)
     EVT.fire('addResult', meta)
+    if (owner !== replacementOwner && !ownsCrawl(owner)) return
 
     // 添加作品里每个文件的数据
     if (meta.type === 2 || meta.type === 3) {

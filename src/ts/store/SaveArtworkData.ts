@@ -1,3 +1,4 @@
+import { CrawlGeneration, ownsCrawl } from '../crawl/CrawlGeneration'
 import { API } from '../API'
 import { filter, FilterOption } from '../filter/Filter'
 import { settings } from '../setting/Settings'
@@ -9,7 +10,12 @@ import { Utils } from '../utils/Utils'
 
 // 保存图片作品的数据
 class SaveArtworkData {
-  public async save(data: ArtworkData, downloadIndexes?: number[]) {
+  /** 保存前验证抓取写入所有权。 */
+  public async save(
+    generation: CrawlGeneration,
+    data: ArtworkData,
+    downloadIndexes?: number[]
+  ) {
     // 获取需要检查的信息
     const body = data.body
     const fullWidth = body.width // 原图宽度
@@ -72,6 +78,7 @@ class SaveArtworkData {
 
     // 检查通过
     if (await filter.check(filterOpt)) {
+      if (!ownsCrawl(generation)) return
       const idNum = parseInt(body.id)
       const title = body.title // 作品标题
       const userId = body.userId // 用户id
@@ -102,6 +109,7 @@ class SaveArtworkData {
         const ext = tempExt[tempExt.length - 1]
 
         store.addResult(
+          generation,
           {
             aiType,
             id: body.id,
@@ -148,6 +156,7 @@ class SaveArtworkData {
         // 动图
         // 获取动图的信息
         const meta = await API.getUgoiraMeta(body.id)
+        if (!ownsCrawl(generation)) return
         // 动图帧延迟数据
         const ugoiraInfo = {
           frames: meta.body.frames,
@@ -162,7 +171,7 @@ class SaveArtworkData {
           ext = tempExt[tempExt.length - 1]
         }
 
-        store.addResult({
+        store.addResult(generation, {
           aiType,
           id: body.id,
           idNum: idNum,

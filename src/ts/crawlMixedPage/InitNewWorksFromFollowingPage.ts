@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化 关注的用户的新作品页面 和 好P友的新作品页面
 // Premium 会员可以看到第 84 页
 import { InitPageBase } from '../crawl/InitPageBase'
@@ -83,9 +84,13 @@ class InitNewWorksFromFollowingPage extends InitPageBase {
     this.getIdList()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let p = this.startpageNo + this.listPageFinished
@@ -99,16 +104,19 @@ class InitNewWorksFromFollowingPage extends InitPageBase {
           this.tag,
           this.r18
         )
+        if (!ownsCrawl(generation)) return
       } else {
         data = await API.getMyPixivNewWorkData(this.workType, p)
+        if (!ownsCrawl(generation)) return
       }
     } catch (error) {
+      if (!ownsCrawl(generation)) return
       this.getIdList()
       return
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let worksData = data.body.thumbnails[this.workType]
@@ -116,7 +124,7 @@ class InitNewWorksFromFollowingPage extends InitPageBase {
     // 检查数据，如果数据为空，或者和上一页的数据重复，说明已经不需要继续抓取了
     if (worksData.length === 0 || this.firstWorkId === worksData[0].id) {
       log.log(lang.transl('_列表页抓取完成'))
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     } else {
       // 如果数据没有重复，则保存第一个作品的 id
       this.firstWorkId = worksData[0].id
@@ -147,7 +155,9 @@ class InitNewWorksFromFollowingPage extends InitPageBase {
           xRestrict: data.xRestrict,
         }
 
-        if (await filter.check(filterOpt)) {
+        const passesFilter = await filter.check(filterOpt)
+        if (!ownsCrawl(generation)) return
+        if (passesFilter) {
           store.idList.push({
             type: Tools.getWorkTypeString(data.illustType),
             id: data.id,
@@ -169,7 +179,9 @@ class InitNewWorksFromFollowingPage extends InitPageBase {
           userId: data.userId,
         }
 
-        if (await filter.check(filterOpt)) {
+        const passesFilter = await filter.check(filterOpt)
+        if (!ownsCrawl(generation)) return
+        if (passesFilter) {
           store.idList.push({
             type: 'novels',
             id: data.id,
@@ -193,11 +205,12 @@ class InitNewWorksFromFollowingPage extends InitPageBase {
       this.listPageFinished === this.crawlNumber
     ) {
       log.log(lang.transl('_列表页抓取完成'))
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
     } else {
       // 继续抓取
       if (states.slowCrawlMode) {
         await Utils.sleep(settings.slowCrawlDealy)
+        if (!ownsCrawl(generation)) return
       }
       this.getIdList()
     }
