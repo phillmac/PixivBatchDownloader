@@ -247,6 +247,8 @@ class Resume {
     const evs = [EVT.list.crawlComplete, EVT.list.resultChange]
     for (const ev of evs) {
       window.addEventListener(ev, async () => {
+        // 抓取中不保存部分队列；完成后和导入后的空闲编辑仍可续传。
+        if (ev === EVT.list.resultChange && states.busy) return
         this.saveData(store.URLWhenCrawlStart || this.getURL())
       })
     }

@@ -1,3 +1,5 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
+import { replacementOwner } from '../crawl/CrawlGeneration'
 // 初始化 artwork 搜索页
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -306,7 +308,11 @@ class InitSearchArtworkPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async nextStep() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (settings.previewResult && !states.timedCrawlMode) {
       log.warning(
         lang.transl('_提示启用预览搜索页面的筛选结果时不会自动开始下载')
@@ -320,7 +326,9 @@ class InitSearchArtworkPage extends InitPageBase {
     let data
     try {
       data = await this.getSearchData(1)
+      if (!ownsCrawl(generation)) return
     } catch {
+      if (!ownsCrawl(generation)) return
       EVT.fire('stopCrawl')
       return
     }
@@ -363,7 +371,7 @@ class InitSearchArtworkPage extends InitPageBase {
     this.needCrawlPageCount = Math.min(needFetchPage, this.crawlNumber)
 
     if (this.needCrawlPageCount === 0) {
-      return this.noResult()
+      return this.noResult(generation)
     }
 
     this.getIdList()
@@ -521,9 +529,14 @@ class InitSearchArtworkPage extends InitPageBase {
     return result
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   private async delayReTry(p: number) {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     log.error(lang.transl('_下载器会在几分钟后重试'))
     await Utils.sleep(Config.retryTime)
+    if (!ownsCrawl(generation)) return
     this.getIdList(p)
   }
 
@@ -537,8 +550,11 @@ class InitSearchArtworkPage extends InitPageBase {
   /**获取作品 id 列表（列表页数据） */
   // 仅当出错重试时，才会传递参数 p。此时直接使用传入的 p，而不是继续让 p 增加
   protected async getIdList(p?: number): Promise<void> {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     if (p === undefined) {
@@ -550,17 +566,19 @@ class InitSearchArtworkPage extends InitPageBase {
     let data
     try {
       data = await this.getSearchData(p)
+      if (!ownsCrawl(generation)) return
       if (data.total === 0) {
         console.log(`page ${p}: total 0`)
         this.tipEmptyResult()
         return this.delayReTry(p)
       }
     } catch {
+      if (!ownsCrawl(generation)) return
       return this.delayReTry(p)
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     const worksData = data.data
@@ -587,7 +605,9 @@ class InitSearchArtworkPage extends InitPageBase {
         xRestrict: work.xRestrict,
       }
 
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         store.idList.push({
           id: work.id,
           type: Tools.getWorkTypeString(work.illustType),
@@ -617,10 +637,11 @@ class InitSearchArtworkPage extends InitPageBase {
         // )
         const lastWork = data.data[data.data.length - 1]
         const check = await vipSearchOptimize.checkWork(lastWork.id, 'illusts')
+        if (!ownsCrawl(generation)) return
         if (check) {
           log.log(lang.transl('_后续作品低于最低收藏数量要求跳过后续作品'))
           log.log(lang.transl('_列表页抓取完成'))
-          return this.getIdListFinished()
+          return this.getIdListFinished(generation)
         }
       }
     }
@@ -639,6 +660,7 @@ class InitSearchArtworkPage extends InitPageBase {
       // 继续发送抓取任务（+1 是因为 sendCrawlTaskCount 从 0 开始）
       if (states.slowCrawlMode) {
         await Utils.sleep(settings.slowCrawlDealy)
+        if (!ownsCrawl(generation)) return
       }
       this.getIdList()
     } else {
@@ -649,7 +671,7 @@ class InitSearchArtworkPage extends InitPageBase {
 
         // idListWithPageNo.store(pageType.type)
 
-        this.getIdListFinished()
+        this.getIdListFinished(generation)
       }
     }
   }
@@ -1014,7 +1036,7 @@ class InitSearchArtworkPage extends InitPageBase {
 
     // store.addResult 会触发 addResult 事件，让本模块生成对应作品的预览，并显示作品数量
     for (let data of this.resultMeta) {
-      store.addResult(data)
+      store.addResult(replacementOwner, data)
     }
 
     // showCount 依赖 addResult 事件，但如果清空了所有结果，则不会触发 addResult 事件，所以需要手动调用它
@@ -1086,6 +1108,7 @@ class InitSearchArtworkPage extends InitPageBase {
           'illusts',
           data.tags
         )
+
         if (status === 200) {
           // 同步数据
           r.bookmarked = true

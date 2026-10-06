@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化 bookmark_detail 页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -37,12 +38,16 @@ class InitBookmarkDetailPage extends InitPageBase {
     log.warning(lang.transl('_从本页开始抓取x个', this.crawlNumber.toString()))
   }
 
-  // 获取相似的作品列表
+  /** 获取相似的作品列表；使用本轮抓取所有权。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     let data = await API.getRecommenderData(
       Tools.getIllustId(),
       this.crawlNumber
     )
+    if (!ownsCrawl(generation)) return
 
     for (const id of data.recommendations) {
       store.idList.push({
@@ -51,7 +56,7 @@ class InitBookmarkDetailPage extends InitPageBase {
       })
     }
 
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 }
 export { InitBookmarkDetailPage }

@@ -1,3 +1,11 @@
+import {
+  skipManagedCrawl,
+  armManagedCrawl,
+  abortManagedCrawl,
+  getManagedCrawl,
+  getManagedCrawlArm,
+  managedCrawlBlocksDownload,
+} from './ManagedCrawlAutomation'
 import { downloadDiagnostics } from './DownloadDiagnostics'
 import { resume } from './Resume'
 import { EVT } from '../EVT'
@@ -25,9 +33,7 @@ type AutomationIdEntry = { id: string; type: IDTypeString }
 
 /** 自动化 ID 数量门限的同步判定结果。 */
 type CrawlIdGateDecision = 'accepted' | 'rejected'
-type CrawlIdGateRejectReason =
-  | 'count-exceeded'
-  | 'novel-series-size-unknown'
+type CrawlIdGateRejectReason = 'count-exceeded' | 'novel-series-size-unknown'
 
 /** 自动化客户端在抓取开始前预设的一次性 ID 数量门限。 */
 type CrawlIdGate = { maxCount: number }
@@ -36,19 +42,18 @@ type CrawlIdGate = { maxCount: number }
 type CrawlIdListSnapshot = LifecycleObservation & {
   count: number
   items: AutomationIdEntry[]
-  gate:
-    | {
-        maxCount: number
-        decision: CrawlIdGateDecision
-        reason: CrawlIdGateRejectReason | null
-      }
-    | null
+  gate: {
+    maxCount: number
+    decision: CrawlIdGateDecision
+    reason: CrawlIdGateRejectReason | null
+  } | null
 }
 
 /** 当前内容脚本生命周期内观察到的真实下载器事件。 */
 const lifecycle = {
   crawlStarted: null as LifecycleObservation | null,
   crawlCompleted: null as LifecycleObservation | null,
+  crawlStopped: null as LifecycleObservation | null,
   crawlEmpty: null as LifecycleObservation | null,
   downloadStarted: null as LifecycleObservation | null,
   downloadCompleted: null as LifecycleObservation | null,
@@ -134,8 +139,8 @@ function captureCrawlIdList() {
     ? containsNovelSeries
       ? 'novel-series-size-unknown'
       : items.length > gate.maxCount
-      ? 'count-exceeded'
-      : null
+        ? 'count-exceeded'
+        : null
     : null
   const decision: CrawlIdGateDecision | null = gate
     ? rejectReason
@@ -156,6 +161,10 @@ function captureCrawlIdList() {
     gate: gate
       ? { maxCount: gate.maxCount, decision: decision!, reason: rejectReason }
       : null,
+  }
+  if (decision === 'rejected' && skipManagedCrawl('skipped-work-count')) {
+    states.stopCrawl = true
+    EVT.fire('stopCrawl')
   }
 }
 
@@ -180,6 +189,7 @@ window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe(window.location.href)
   crawlIdListSnapshot = null
   lifecycle.crawlCompleted = null
+  lifecycle.crawlStopped = null
   lifecycle.crawlEmpty = null
   resetDownloadLifecycle()
   lifecycle.resumed = null
@@ -189,6 +199,7 @@ window.addEventListener(EVT.list.crawlComplete, () => {
   resetDownloadLifecycle()
 })
 window.addEventListener(EVT.list.resultChange, () => {
+  if (states.busy) return
   lifecycle.crawlCompleted = observe(crawlTaskUrl())
   resetDownloadLifecycle()
 })
@@ -197,6 +208,7 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
 })
 window.addEventListener(EVT.list.getIdListFinished, captureCrawlIdList)
 window.addEventListener(EVT.list.stopCrawl, () => {
+  lifecycle.crawlStopped = observe(crawlTaskUrl())
   // 只复位由自动化门限持有的临时状态，避免干扰其他功能。
   if (ownsTransientExportIdList) {
     states.exportIDList = false
@@ -271,7 +283,11 @@ export async function getAutomationStatus() {
   else if (bookmarkMode) phase = 'BOOKMARKING'
   else if (crawlingForCurrent) phase = 'CRAWLING'
   else if (busy) phase = 'BUSY_OTHER'
-  else if (stoppedForCurrent) phase = 'STOPPED'
+  else if (
+    stoppedForCurrent ||
+    (managedCrawlBlocksDownload() && getManagedCrawl()?.url === currentUrl)
+  )
+    phase = 'STOPPED'
   else if (durable && !liveResultsBoundToCurrent) phase = 'RESTORING'
   else if (pause && durable && liveResultsBoundToCurrent)
     phase = 'PAUSED_RESUMABLE'
@@ -288,6 +304,8 @@ export async function getAutomationStatus() {
     phase,
     page: { url: currentUrl },
     controller,
+    managedOperation: getManagedCrawl(),
+    managedArm: getManagedCrawlArm(),
     crawlIdList,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [
@@ -320,7 +338,11 @@ const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
+  __PBD_AUTOMATION_ARM_CRAWL__?: typeof armManagedCrawl
+  __PBD_AUTOMATION_ABORT_CRAWL__?: typeof abortManagedCrawl
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
+automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl
+automationGlobal.__PBD_AUTOMATION_ABORT_CRAWL__ = abortManagedCrawl

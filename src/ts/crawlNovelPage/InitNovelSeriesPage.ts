@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 //初始化小说系列作品页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { store } from '../store/Store'
@@ -49,11 +50,19 @@ class InitNovelSeriesPage extends InitPageBase {
     })
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async nextStep() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     this.getIdList()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     const seriesId = Tools.getSeriesId()
     const seriesData = await API.getNovelSeriesContent(
       seriesId,
@@ -61,6 +70,7 @@ class InitNovelSeriesPage extends InitPageBase {
       this.last,
       'asc'
     )
+    if (!ownsCrawl(generation)) return
 
     const list = seriesData.body.page.seriesContents
     for (const item of list) {
@@ -76,7 +86,7 @@ class InitNovelSeriesPage extends InitPageBase {
     if (list.length === this.limit) {
       this.getIdList()
     } else {
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
     }
   }
 

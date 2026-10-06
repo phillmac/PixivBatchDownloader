@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化地区排行榜页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { Tools } from '../Tools'
@@ -49,7 +50,11 @@ class InitAreaRankingPage extends InitPageBase {
     })
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     const allPicArea = document.querySelectorAll('.ranking-item>.work_wrapper')
 
     for (const el of allPicArea) {
@@ -76,7 +81,9 @@ class InitAreaRankingPage extends InitPageBase {
         bookmarkData: bookmarked,
       }
 
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         const id = Tools.getIllustId(el.querySelector('a')!.href)
         store.idList.push({
           type: 'illusts',
@@ -85,7 +92,7 @@ class InitAreaRankingPage extends InitPageBase {
       }
     }
 
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 }
 export { InitAreaRankingPage }

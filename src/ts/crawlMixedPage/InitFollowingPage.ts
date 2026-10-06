@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化关注页面、好 P 友页面、粉丝页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -165,8 +166,11 @@ class InitFollowingPage extends InitPageBase {
     }
   }
 
-  // 获取用户列表
+  /** 获取用户列表；使用本轮抓取所有权。 */
   private async getUserList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
       return this.getUserListComplete()
     }
@@ -183,15 +187,19 @@ class InitFollowingPage extends InitPageBase {
             this.tag,
             offset
           )
+          if (!ownsCrawl(generation)) return
           break
         case 'mypixiv':
           res = await API.getMyPixivList(this.crawlUserID, offset)
+          if (!ownsCrawl(generation)) return
           break
         case 'followers':
           res = await API.getFollowersList(this.crawlUserID, offset)
+          if (!ownsCrawl(generation)) return
           break
       }
     } catch {
+      if (!ownsCrawl(generation)) return
       this.getUserList()
       return
     }
@@ -228,40 +236,50 @@ class InitFollowingPage extends InitPageBase {
     this.getUserList()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   private async getUserListComplete() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     log.log(
       lang.transl('_当前有x个用户', this.userList.length.toString()),
       'logUserListLength'
     )
 
     if (this.userList.length === 0) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     this.getIdList()
   }
 
-  // 获取用户 id 列表
+  /** 获取用户 id 列表；使用本轮抓取所有权。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let idList: IDData[] = []
     try {
       const userId = this.userList[this.index]
       const checkUser = await this.checkUserId(userId)
+      if (!ownsCrawl(generation)) return
       if (checkUser) {
         idList = await API.getUserWorksByType(userId)
+        if (!ownsCrawl(generation)) return
         idList = crawlLatestFewWorks.filter(idList)
       }
     } catch {
+      if (!ownsCrawl(generation)) return
       this.getIdList()
       return
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     store.idList = store.idList.concat(idList)
@@ -277,11 +295,12 @@ class InitFollowingPage extends InitPageBase {
     )
 
     if (this.index >= this.userList.length) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     if (states.slowCrawlMode) {
       await Utils.sleep(settings.slowCrawlDealy)
+      if (!ownsCrawl(generation)) return
     }
     this.getIdList()
   }

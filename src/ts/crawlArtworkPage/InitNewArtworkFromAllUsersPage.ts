@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化 本站的最新作品 artwork 页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -79,21 +80,27 @@ class InitNewArtworkFromAllUsersPage extends InitPageBase {
     this.option.r18 = (location.href.includes('_r18.php') || false).toString()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let data: NewIllustData
     try {
       data = await API.getNewIllustData(this.option)
+      if (!ownsCrawl(generation)) return
     } catch (error) {
+      if (!ownsCrawl(generation)) return
       this.getIdList()
       return
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let useData = data.body.illusts
@@ -127,7 +134,9 @@ class InitNewArtworkFromAllUsersPage extends InitPageBase {
         xRestrict: nowData.xRestrict,
       }
 
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         store.idList.push({
           type: Tools.getWorkTypeString(nowData.illustType),
           id: nowData.id,
@@ -146,7 +155,7 @@ class InitNewArtworkFromAllUsersPage extends InitPageBase {
       this.fetchCount >= this.maxCount
     ) {
       log.log(lang.transl('_开始获取作品页面'))
-      this.getIdListFinished()
+      this.getIdListFinished(generation)
       return
     }
 
@@ -154,6 +163,7 @@ class InitNewArtworkFromAllUsersPage extends InitPageBase {
     this.option.lastId = data.body.lastId
     if (states.slowCrawlMode) {
       await Utils.sleep(settings.slowCrawlDealy)
+      if (!ownsCrawl(generation)) return
     }
     this.getIdList()
   }

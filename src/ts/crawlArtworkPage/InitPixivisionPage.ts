@@ -1,3 +1,4 @@
+import { CrawlGeneration, ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化 pixivision 页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { Tools } from '../Tools'
@@ -38,9 +39,14 @@ class InitPixivisionPage extends InitPageBase {
     this.getPixivision()
   }
 
-  // 保存要下载的图片的信息
-  private addResult(id: string, url: string, ext: string) {
-    store.addResult({
+  /** 保存要下载的图片的信息；使用本轮抓取所有权。 */
+  private addResult(
+    generation: CrawlGeneration,
+    id: string,
+    url: string,
+    ext: string
+  ) {
+    store.addResult(generation, {
       id: id,
       idNum: Number.parseInt(id),
       original: url,
@@ -48,7 +54,11 @@ class InitPixivisionPage extends InitPageBase {
     })
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   private async getPixivision() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     const a = document.querySelector(
       'a[data-gtm-action=ClickCategory]'
     )! as HTMLAnchorElement
@@ -69,8 +79,9 @@ class InitPixivisionPage extends InitPageBase {
         let arr = url.split('/')
         const id = arr[arr.length - 1].split('.')[0].split('_')[0] // 作品id，尝试提取出数字部分
         await this.testExtName(url, id)
+        if (!ownsCrawl(generation)) return
       }
-      this.crawlFinished()
+      this.crawlFinished(generation)
     } else {
       // 漫画和 cosplay ，直接保存页面上的图片
       let selector = ''
@@ -99,23 +110,27 @@ class InitPixivisionPage extends InitPageBase {
           if (extTest && extTest.length > 1) {
             ext = extTest[1]
           }
-          this.addResult(id, url, ext)
+          this.addResult(generation, id, url, ext)
         }
       })
-      this.crawlFinished()
+      this.crawlFinished(generation)
     }
   }
 
-  // 通过加载图片来判断图片的后缀名。pixivision 页面直接获取的图片后缀都是 jpg 的
+  /** 通过加载图片来判断图片的后缀名。pixivision 页面直接获取的图片后缀都是 jpg 的；使用本轮抓取所有权。 */
   private async testExtName(url: string, id: string) {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     let ext = 'jpg' // 默认为 jpg
     await Utils.loadImg(url).catch(() => {
       // 如果图片加载失败则把后缀改为 png
       url = url.replace('.jpg', '.png')
       ext = 'png'
     })
+    if (!ownsCrawl(generation)) return
 
-    this.addResult(id, url, ext)
+    this.addResult(generation, id, url, ext)
 
     this.logResultNumber()
   }

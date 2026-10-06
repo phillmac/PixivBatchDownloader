@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化比赛页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { Tools } from '../Tools'
@@ -110,16 +111,21 @@ class InitContestPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList(): Promise<void> {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     const data = await API.getContestWorksData(
       this.type,
       this.name,
       this.page,
       this.order
     )
+    if (!ownsCrawl(generation)) return
     if (data.error) {
       log.error(lang.transl('_API返回了错误信息') + data.error)
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     // 提取作品 id
@@ -129,7 +135,9 @@ class InitContestPage extends InitPageBase {
       if (result[1]) {
         const id = result[1]
         const filterOpt: FilterOption = { id }
-        if (await filter.check(filterOpt)) {
+        const passesFilter = await filter.check(filterOpt)
+        if (!ownsCrawl(generation)) return
+        if (passesFilter) {
           store.idList.push({
             type: this.type === 'illust' ? 'illusts' : 'novels',
             id,
@@ -150,13 +158,17 @@ class InitContestPage extends InitPageBase {
       data.body.next_url === null
     ) {
       log.log(lang.transl('_开始获取作品页面'))
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     } else {
       return this.getIdList()
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   private async crawlWinning() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     log.log(lang.transl('_抓取获奖作品'))
 
     // 获奖作品直接存在于页面源码里，所以直接获取即可，不需要请求 API
@@ -170,7 +182,9 @@ class InitContestPage extends InitPageBase {
       const id = this.getWorkId(link)
       if (id) {
         const filterOpt: FilterOption = { id }
-        if (await filter.check(filterOpt)) {
+        const passesFilter = await filter.check(filterOpt)
+        if (!ownsCrawl(generation)) return
+        if (passesFilter) {
           store.idList.push({
             type: this.type === 'illust' ? 'illusts' : 'novels',
             id,
@@ -179,7 +193,7 @@ class InitContestPage extends InitPageBase {
       }
     }
 
-    return this.getIdListFinished()
+    return this.getIdListFinished(generation)
   }
 
   private getWinningLinks(): NodeListOf<HTMLAnchorElement> {

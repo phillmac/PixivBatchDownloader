@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
 import { Tools } from '../Tools'
@@ -119,13 +120,18 @@ class InitRankingNovelPageNew extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     try {
       const json = await API.getRankingDataNovel(
         this.mode,
         this.date,
         this.page
       )
+      if (!ownsCrawl(generation)) return
 
       this.listPageFinished++
 
@@ -172,7 +178,9 @@ class InitRankingNovelPageNew extends InitPageBase {
           )
         }
 
-        if ((await filter.check(filterOpt)) && checkLang) {
+        const passesFilter = (await filter.check(filterOpt)) && checkLang
+        if (!ownsCrawl(generation)) return
+        if (passesFilter) {
           const id = novel.id.toString()
           store.setRankList(id, Number.parseInt(novel.rank as string))
           store.idList.push({
@@ -183,24 +191,25 @@ class InitRankingNovelPageNew extends InitPageBase {
 
         this.checkTotal++
         if (this.checkTotal >= this.crawlNumber) {
-          return this.getIdListFinished()
+          return this.getIdListFinished(generation)
         }
       }
 
       // 抓取完毕
       if (store.idList.length >= this.crawlNumber || !display_a.next) {
-        this.getIdListFinished()
+        this.getIdListFinished(generation)
       } else {
         // 继续抓取
         this.page = display_a.next
         this.getIdList()
       }
     } catch (error: Error | any) {
+      if (!ownsCrawl(generation)) return
       if (error.status === 404) {
         // 如果发生了404错误，可能确实没有这一页了，也就是说数据已经获取完毕了
         console.log('404错误，直接下载已有部分')
       }
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
   }
 

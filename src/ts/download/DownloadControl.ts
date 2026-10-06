@@ -1,3 +1,4 @@
+import { managedCrawlBlocksDownload } from './ManagedCrawlAutomation'
 import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
 import { Tools } from '../Tools'
@@ -135,6 +136,13 @@ class DownloadControl {
       this.hideResultBtns()
       this.hideDownloadArea()
       this.reset()
+    })
+
+    window.addEventListener(EVT.list.stopCrawl, () => {
+      if (managedCrawlBlocksDownload()) {
+        this.hideResultBtns()
+        this.hideDownloadArea()
+      }
     })
 
     for (const ev of [
@@ -306,10 +314,11 @@ class DownloadControl {
       }
     })
 
-    // 当下载完毕，或者抓取结果为空时，检查是否有等待下载的任务
+    // 下载完成、抓取结果为空或托管抓取撤销写入权限后，推进等待任务
     const checkWaitingIdListEvents = [
       EVT.list.downloadComplete,
       EVT.list.crawlEmpty,
+      EVT.list.managedCrawlTerminal,
     ]
     checkWaitingIdListEvents.forEach((evt) => {
       window.addEventListener(evt, () => {
@@ -464,6 +473,7 @@ class DownloadControl {
 
   /** 抓取完毕之后更新状态，并决定是否立即开始下载 */
   private readyDownload(openPanel = true) {
+    if (managedCrawlBlocksDownload()) return
     if (states.busy) {
       return
     }
@@ -522,6 +532,7 @@ class DownloadControl {
 
   // 开始下载
   private startDownload() {
+    if (managedCrawlBlocksDownload()) return
     if (states.busy) {
       return toast.error(lang.transl('_当前任务尚未完成'))
     }

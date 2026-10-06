@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 import { InitPageBase } from '../crawl/InitPageBase'
 import { API } from '../API'
 import { lang } from '../Language'
@@ -250,12 +251,9 @@ class InitBookmarkPage extends InitPageBase {
     store.tag = Tools.getTagFromURL()
     this.isHide = Utils.getURLSearchField(location.href, 'rest') === 'hide'
     this.order = (Utils.getURLSearchField(location.href, 'order') || 'desc') as
-      | 'desc'
-      | 'asc'
+      'desc' | 'asc'
     this.mode = (Utils.getURLSearchField(location.href, 'mode') || 'all') as
-      | 'all'
-      | 'safe'
-      | 'r18'
+      'all' | 'safe' | 'r18'
     this.work_tag = Utils.getURLSearchField(location.href, 'work_tag') || ''
     this.bm =
       Utils.getURLSearchField(location.href, 'bm').replaceAll('-', '') || ''
@@ -266,9 +264,13 @@ class InitBookmarkPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let data: BookmarkData
@@ -284,7 +286,9 @@ class InitBookmarkPage extends InitPageBase {
         this.work_tag,
         this.bm
       )
+      if (!ownsCrawl(generation)) return
     } catch (error) {
+      if (!ownsCrawl(generation)) return
       if ((error as any).message.includes('not valid JSON')) {
         if (lang.type.includes('zh')) {
           log.error(`预期的数据格式为 JSON，但抓取结果不是 JSON。已取消抓取。<br>
@@ -293,14 +297,14 @@ class InitBookmarkPage extends InitPageBase {
           log.error(`Expected data format is JSON, but the fetch result is not JSON. Fetch has been canceled. <br>
 One possible reason: You have been banned from Pixiv.`)
         }
-        return this.getIdListFinished()
+        return this.getIdListFinished(generation)
       }
       this.getIdList()
       return
     }
 
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     if (
@@ -312,7 +316,7 @@ One possible reason: You have been banned from Pixiv.`)
         this.idList.splice(this.requsetNumber, this.idList.length)
       }
       store.idList = store.idList.concat(this.idList)
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     for (const workData of data.body.works) {
@@ -334,7 +338,9 @@ One possible reason: You have been banned from Pixiv.`)
 
       this.filteredNumber++
 
-      if (await filter.check(filterOpt)) {
+      const passesFilter = await filter.check(filterOpt)
+      if (!ownsCrawl(generation)) return
+      if (passesFilter) {
         this.idList.push({
           type:
             (workData as ArtworkCommonData).illustType === undefined
@@ -355,6 +361,7 @@ One possible reason: You have been banned from Pixiv.`)
 
     if (states.slowCrawlMode) {
       await Utils.sleep(settings.slowCrawlDealy)
+      if (!ownsCrawl(generation)) return
     }
     this.getIdList()
   }

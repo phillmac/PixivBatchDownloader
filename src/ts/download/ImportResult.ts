@@ -1,3 +1,8 @@
+import {
+  currentCrawl,
+  replacementOwner,
+  revokeCrawl,
+} from '../crawl/CrawlGeneration'
 import { EVT } from '../EVT'
 import { Result } from '../store/StoreType'
 import { lang } from '../Language'
@@ -26,6 +31,7 @@ class ImportResult {
   }
 
   private async import() {
+    const generationAtStart = currentCrawl()
     const loadedJSON = (await Utils.loadJSONFile().catch((err) => {
       return msgBox.error(err)
     })) as Result[]
@@ -78,6 +84,14 @@ class ImportResult {
       return
     }
 
+    // 文件选择和过滤期间可能开始了新的抓取；导入不能覆盖新的所有者。
+    if (states.busy || currentCrawl() !== generationAtStart) {
+      return
+    }
+    if (generationAtStart !== null) {
+      revokeCrawl(generationAtStart)
+    }
+
     // 恢复数据
     // 通过 store.addResult 添加数据，可以应用多图作品设置，对导入的结果进行调整
     store.reset()
@@ -85,9 +99,11 @@ class ImportResult {
     store.URLWhenCrawlStart = window.location.href
     store.crawlCompleteTime = new Date()
     for (const r of temp) {
-      store.addResult(r)
+      store.addResult(replacementOwner, r)
     }
 
+    // 有效导入替换内存队列；旧抓取已撤销权限时释放托管下载保护。
+    EVT.fire('importResultLoaded')
     // 发送通知
     EVT.fire('crawlComplete')
 

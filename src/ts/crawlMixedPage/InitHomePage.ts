@@ -1,3 +1,4 @@
+import { beginCrawl } from '../crawl/CrawlGeneration'
 // 初始化首页
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -257,6 +258,7 @@ class InitHomePage extends InitPageBase {
     })
   }
 
+  /** 导入 ID 列表并建立真实抓取所有权。 */
   private async importIDList() {
     EVT.fire('closeSettingsPanel')
 
@@ -270,6 +272,10 @@ class InitHomePage extends InitPageBase {
     const loadedJSON = (await Utils.loadJSONFile().catch((err) => {
       return msgBox.error(err)
     })) as IDData[]
+    if (states.busy) {
+      toast.error(lang.transl('_当前任务尚未完成'))
+      return
+    }
     if (!loadedJSON) {
       return
     }
@@ -300,6 +306,10 @@ class InitHomePage extends InitPageBase {
         item.type = 'novels'
       }
     })
+    // 导入 ID 后开始真实抓取，旧 worker 必须失去写入权限。
+    states.stopCrawl = false
+    this.generation = beginCrawl()
+    EVT.fire('crawlStart')
     store.idList = loadedJSON
 
     this.crawlImportIDList()

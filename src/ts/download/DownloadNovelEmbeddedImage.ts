@@ -96,16 +96,18 @@ class DownloadNovelEmbeddedImage {
     content: string,
     embeddedImages: EmbeddedImages,
     novelName: string,
-    mode: 'single novel' | 'merge novel'
+    mode: 'single novel' | 'merge novel',
+    cancelled: () => boolean = () => false
   ) {
     const imageList = await this.getImageList(novelId, content, embeddedImages)
+    if (cancelled()) return
 
     let current = 1
     const total = imageList.length
 
     // 保存为 TXT 格式时，每加载完一个图片，就立即保存这个图片
     for (let image of imageList) {
-      if (this.stop) {
+      if (this.stop || cancelled()) {
         log.warning(
           lang.transl('_由于下载已暂停或停止所以不再下载小说里剩余的图片')
         )
@@ -120,8 +122,10 @@ class DownloadNovelEmbeddedImage {
       }
 
       await this.waitDownloadInterval(mode, total)
+      if (cancelled()) break
 
       const blob = await this.getImage(image.url, 'blob', novelId, novelTitle)
+      if (cancelled()) break
       if (blob === null) {
         continue
       }
@@ -151,7 +155,8 @@ class DownloadNovelEmbeddedImage {
     content: string,
     embeddedImages: EmbeddedImages,
     jepub: any,
-    mode: 'single novel' | 'merge novel'
+    mode: 'single novel' | 'merge novel',
+    cancelled: () => boolean = () => false
   ): Promise<{
     size: number
     content: string
@@ -159,11 +164,12 @@ class DownloadNovelEmbeddedImage {
     const imageList = await this.getImageList(novelId, content, embeddedImages)
 
     let size = 0
+    if (cancelled()) return { size, content }
     let current = 1
     const total = imageList.length
 
     for (const image of imageList) {
-      if (this.stop) {
+      if (this.stop || cancelled()) {
         log.warning(
           lang.transl('_由于下载已暂停或停止所以不再下载小说里剩余的图片')
         )
@@ -181,6 +187,7 @@ class DownloadNovelEmbeddedImage {
       }
 
       await this.waitDownloadInterval(mode, total)
+      if (cancelled()) break
 
       const buffer = await this.getImage(
         image.url,
@@ -188,6 +195,7 @@ class DownloadNovelEmbeddedImage {
         novelId,
         novelTitle
       )
+      if (cancelled()) break
       // 如果图片获取失败，将正文里它对应的标记替换为提示文字
       if (buffer === null) {
         content = content.replaceAll(image.flag, `fetch ${image.url} failed`)

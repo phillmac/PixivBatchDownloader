@@ -1,3 +1,4 @@
+import { ownsCrawl } from '../crawl/CrawlGeneration'
 //初始化 artwork 作品页
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -143,15 +144,21 @@ class InitArtworkPage extends InitPageBase {
     }
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     const userId = Tools.getCurrentPageUserId()
     const checkUser = await this.checkUserId(userId)
+    if (!ownsCrawl(generation)) return
     if (!checkUser) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let type: userWorksType[] = ['illusts', 'manga']
     let idList = await API.getUserWorksByType(userId, type)
+    if (!ownsCrawl(generation)) return
 
     // 储存符合条件的 id
     let nowId = parseInt(Tools.getIllustId(window.location.href))
@@ -179,12 +186,16 @@ class InitArtworkPage extends InitPageBase {
       store.idList = store.idList.splice(0, this.crawlNumber)
     }
 
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 
-  // 下载相关作品时使用
+  /** 下载相关作品时使用；使用本轮抓取所有权。 */
   private async getRelatedList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     let data = await API.getRelatedData(Tools.getIllustId())
+    if (!ownsCrawl(generation)) return
     // 相关作品的列表由两部分构成，所以要组合起来
     let ids: string[] = []
     for (const illust of data.body.illusts) {
@@ -208,7 +219,7 @@ class InitArtworkPage extends InitPageBase {
     }
 
     log.log(lang.transl('_相关作品抓取完毕', store.idList.length.toString()))
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 
   protected resetGetIdListStatus() {

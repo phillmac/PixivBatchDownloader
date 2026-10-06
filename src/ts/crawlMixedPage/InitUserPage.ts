@@ -1,3 +1,4 @@
+import { beginCrawl, ownsCrawl } from '../crawl/CrawlGeneration'
 // 初始化用户页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -56,6 +57,7 @@ class InitUserPage extends InitPageBase {
     this.addCancelTimedCrawlBtn()
   }
 
+  /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   protected addAnyElement() {
     this.addInitPageBtn(
       'otherBtns',
@@ -104,6 +106,8 @@ class InitUserPage extends InitPageBase {
 
       // 获取这一页里所有作品的 id 列表
       // 模拟了抓取流程，以获取相同的 id 列表
+      // 批量收藏复用 ID 抓取流程，也需要独立的 ID 写入所有权。
+      this.generation = beginCrawl()
       EVT.fire('bookmarkModeStart')
       store.tag = Tools.getTagFromURL()
       this.crawlNumber = 1 // 设置为只抓取 1 页
@@ -184,12 +188,16 @@ class InitUserPage extends InitPageBase {
     return requsetNumber
   }
 
-  // 获取用户某些类型的作品的 id 列表
+  /** 获取用户某些类型的作品的 id 列表；使用本轮抓取所有权。 */
   protected async getIdList() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     const userId = Tools.getCurrentPageUserId()
     const checkUser = await this.checkUserId(userId)
+    if (!ownsCrawl(generation)) return
     if (!checkUser) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     let type: userWorksType[] = []
@@ -212,6 +220,7 @@ class InitUserPage extends InitPageBase {
         break
     }
     let idList = await API.getUserWorksByType(userId, type)
+    if (!ownsCrawl(generation)) return
 
     // 判断是否全都是小说，如果是，把每页的作品个数设置为 30 个
     const allWorkIsNovels = idList.every((data) => {
@@ -238,13 +247,16 @@ class InitUserPage extends InitPageBase {
     // 储存
     store.idList = store.idList.concat(idList)
 
-    this.getIdListFinished()
+    this.getIdListFinished(generation)
   }
 
-  // 获取用户某些类型的作品的 id 列表（附带 tag）
+  /** 获取用户某些类型的作品的 id 列表（附带 tag）；使用本轮抓取所有权。 */
   private async getIdListByTag() {
+    const generation = this.generation
+    if (!ownsCrawl(generation)) return
+
     if (states.stopCrawl) {
-      return this.getIdListFinished()
+      return this.getIdListFinished(generation)
     }
 
     // 这里不用判断用户主页的情况，因为用户主页不会带 tag
@@ -279,9 +291,10 @@ class InitUserPage extends InitPageBase {
         offset,
         this.onceNumber
       )
+      if (!ownsCrawl(generation)) return
 
       if (states.stopCrawl) {
-        return this.getIdListFinished()
+        return this.getIdListFinished(generation)
       }
 
       // 图片和小说返回的数据是不同的，小说没有 illustType 标记
@@ -323,7 +336,7 @@ class InitUserPage extends InitPageBase {
         store.idList.length >= requsetNumber ||
         data.body.works.length < this.onceNumber
       ) {
-        return this.getIdListFinished()
+        return this.getIdListFinished(generation)
       }
     }
   }
