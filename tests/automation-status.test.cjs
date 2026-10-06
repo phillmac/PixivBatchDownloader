@@ -1879,15 +1879,12 @@ test('managed manual stop wins over late completion and result changes', async (
   assert.equal((await h.exports.getAutomationStatus()).phase, 'STOPPED')
   assert.deepEqual(h.discardCalls, [])
   assert.equal(abortComplete, 1)
-  const next = h.context.__PBD_AUTOMATION_ARM_CRAWL__(arm.url)
-  h.fire('crawlStart')
-  h.fire('crawlComplete')
-  assert.equal(
-    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(next.operationId, next.url))
-      .outcome,
-    'already-completed'
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.requiresReload, true)
+  assert.throws(
+    () => h.context.__PBD_AUTOMATION_ARM_CRAWL__(arm.url),
+    /reload required after terminal managed crawl/
   )
-  assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
   assert.equal(h.discardCalls.length, 0)
 })
 
@@ -1988,6 +1985,7 @@ test('not-started abort cancels the arm and owned abort suppresses before Stop C
   )
   assert.equal(result.outcome, 'aborted')
   assert.equal(h.states.stopCrawl, true)
+  assert.equal(h.managed.managedCrawlRequiresReload(), true)
 })
 
 test('managed arm is consumed only by a normal crawl, not crawl-tag-list work', async () => {
@@ -2018,6 +2016,8 @@ test('Resume replacement releases only the revoked managed queue for its task UR
   h.fire('resume')
   assert.equal(h.managed.getManagedCrawl(), null)
   assert.equal(h.managed.managedCrawlBlocksDownload(), false)
+  assert.equal(h.managed.managedCrawlRequiresReload(), true)
+  assert.equal((await h.exports.getAutomationStatus()).requiresReload, true)
 })
 
 test('MergeNovel stops publishing crawl-owned files after generation revocation', async () => {
@@ -2260,7 +2260,7 @@ for (const replacement of ['new crawl', 'import']) {
     const pending = h.worker.getWorksData(undefined, old.generation)
     await started.promise
     await h.managed.abortManagedCrawl(old.arm.operationId, old.arm.url)
-    if (replacement === 'new crawl') h.start()
+    if (replacement === 'new crawl') h.start(false)
     else {
       h.store.reset()
       h.store.addResult(h.generation.replacementOwner, {
@@ -2313,7 +2313,7 @@ for (const filename of [
     const pending = producer.getIdList()
     await started.promise
     await h.managed.abortManagedCrawl(old.arm.operationId, old.arm.url)
-    const next = h.start()
+    const next = h.start(false)
     producer.generation = next.generation
     h.store.idList = [{ id: 'new', type: 'illusts' }]
     response.resolve(
@@ -2346,7 +2346,7 @@ test('save modules reject ownership lost during their filters and ugoira metadat
           )
     await Promise.resolve()
     await h.managed.abortManagedCrawl(old.arm.operationId, old.arm.url)
-    h.start()
+    h.start(false)
     pause.resolve(
       kind === 'ugoira'
         ? { body: { frames: [], mime_type: '', originalSrc: '', src: '' } }
@@ -2356,6 +2356,19 @@ test('save modules reject ownership lost during their filters and ugoira metadat
     assert.equal(h.store.result.length, 0)
     assert.equal(h.store.resultMeta.length, 0)
   }
+})
+
+test('manual recrawl is blocked on a document after managed abort until reload', async () => {
+  const h = crawlHarness()
+  const task = h.start()
+  await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
+    task.arm.operationId,
+    task.arm.url
+  )
+  assert.equal(h.generation.currentCrawl(), null)
+  await h.worker.readyCrawl()
+  assert.equal(h.generation.currentCrawl(), null)
+  assert.equal(h.managed.managedCrawlRequiresReload(), true)
 })
 
 test('managed manual stop revokes synchronously; unmanaged stop preserves partial finalization', async () => {
@@ -2391,6 +2404,7 @@ test('work-count and ID-only managed stops remain distinct from completed', asyn
     } else h.worker.onlyCrawlIdList = true
     await h.worker.getIdListFinished(task.generation)
     assert.equal(h.managed.getManagedCrawl().state, reason)
+    assert.equal(h.managed.managedCrawlRequiresReload(), true)
     assert.equal(h.generation.ownsCrawl(task.generation), false)
     assert.equal(h.complete(), 0)
     assert.deepEqual(h.discardCalls, [])
@@ -2424,6 +2438,7 @@ test('wrong generation and completed late abort do not mutate authority or downl
   )
   assert.equal(h.generation.ownsCrawl(task.generation), true)
   assert.equal(h.managed.managedCrawlBlocksDownload(), false)
+  assert.equal(h.managed.managedCrawlRequiresReload(), false)
   assert.equal(JSON.stringify(h.store.result), before)
 })
 
