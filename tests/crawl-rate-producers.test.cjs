@@ -634,7 +634,7 @@ test('two unique nested expansions cumulatively pace the same parent before seco
   assert.equal(search.page.rateSession.client, client)
   client.finish()
 })
-test('actual post-merge logic finalizes stopped current generation and silently ignores superseded generation', async () => {
+test('actual post-merge accounting counts only successful owned merges and finalizes stopped crawls', async () => {
   // 提取实际方法，避免复制其停止/所有权判断。
   const source = ts.createSourceFile(
     'base.ts',
@@ -652,15 +652,24 @@ test('actual post-merge logic finalizes stopped current generation and silently 
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText
   for (const type of ['novels', 'novelSeries']) {
-    for (const superseded of [false, true]) {
+    for (const scenario of [
+      { success: false, stopped: true, superseded: false },
+      { success: false, stopped: false, superseded: false },
+      { success: true, stopped: false, superseded: false },
+      { success: true, stopped: true, superseded: false },
+      { success: true, stopped: true, superseded: true },
+    ]) {
+      const { success, stopped, superseded } = scenario
       const generation = {}
       let current = true
       let finalized = 0
       let advanced = 0
       const states = { stopCrawl: false }
       const merge = async () => {
-        states.stopCrawl = true
+        assert.equal(page.mergedNovelCount, 0)
+        states.stopCrawl = stopped
         current = !superseded
+        return type === 'novels' ? success : success ? 2 : 0
       }
       const Page = vm.runInNewContext(`${code}\nPage`, {
         ownsCrawl: (g) => g === generation && current,
@@ -671,13 +680,17 @@ test('actual post-merge logic finalizes stopped current generation and silently 
         cacheWorkData: {
           get: () => ({ body: { seriesNavData: { seriesId: 'series' } } }),
         },
-        settings: { autoMergeNovel: true },
+        settings: {
+          autoMergeNovel: true,
+          skipNovelsInSeriesWhenAutoMerge: true,
+        },
         autoMergeNovel: { merge },
         MergeNovel: class {
           merge = merge
         },
       })
       const page = new Page()
+      page.mergedNovelCount = 0
       page.metadataPermit = () => ({})
       page.crawlFinished = (g) => {
         assert.equal(g, generation)
@@ -687,10 +700,11 @@ test('actual post-merge logic finalizes stopped current generation and silently 
       await page.getWorksData({ id: '1', type }, generation)
       assert.equal(
         finalized,
-        superseded ? 0 : 1,
+        !superseded && stopped ? 1 : 0,
         `${type}: superseded=${superseded}`
       )
-      assert.equal(advanced, 0)
+      assert.equal(advanced, !superseded && !stopped ? 1 : 0)
+      assert.equal(page.mergedNovelCount, success && !superseded ? 1 : 0)
     }
   }
 })
@@ -740,4 +754,74 @@ test('additive reservations queued before first permit preserve cumulative budge
   assert.equal(s.state.sessions['queued-additions'].paced, true)
   assert.equal(new Set(s.messages.map((m) => m.id)).size, 1)
   client.finish()
+})
+
+test('AutoMergeNovel duplicate waiters reuse success, zero and cancellation results without merging twice', async () => {
+  for (const outcome of ['success', 'zero', 'stop', 'superseded', 'cancel']) {
+    let valid = true
+    let current = true
+    let calls = 0
+    let finish
+    let wake
+    const events = new EventTarget()
+    const generation = {}
+    const permit = { valid: () => valid, acquire: async () => true }
+    const { autoMergeNovel } = load(
+      'src/ts/download/AutoMergeNovel.ts',
+      {
+        '../crawl/CrawlGeneration': { ownsCrawl: () => current },
+        '../EVT': { EVT: { list: { crawlStart: 'start' } } },
+        '../utils/Utils': {
+          Utils: {
+            sleep: () =>
+              new Promise((resolve) => {
+                wake = resolve
+              }),
+          },
+        },
+        './MergeNovel': {
+          MergeNovel: class {
+            async merge() {
+              calls++
+              return new Promise((resolve) => {
+                finish = resolve
+              })
+            }
+          },
+        },
+      },
+      { window: events }
+    )
+    autoMergeNovel.showTip = () => {}
+    const first = autoMergeNovel.merge('series', '', true, generation, permit)
+    await flush()
+    const duplicate = autoMergeNovel.merge(
+      'series',
+      '',
+      false,
+      generation,
+      permit
+    )
+    await flush()
+    assert.equal(calls, 1)
+    if (outcome === 'stop') autoMergeNovel.stop = true
+    if (outcome === 'superseded') current = false
+    if (outcome === 'cancel') valid = false
+    finish(outcome === 'zero' ? 0 : 2)
+    const expected = outcome === 'success'
+    assert.equal(await first, expected)
+    wake()
+    assert.equal(await duplicate, expected)
+    assert.equal(
+      await autoMergeNovel.merge('series', '', false, generation, permit),
+      expected
+    )
+    assert.equal(calls, 1)
+    if (outcome === 'success' || outcome === 'zero') {
+      assert.deepEqual(Array.from(autoMergeNovel.completedQueue), ['series'])
+      assert.equal(autoMergeNovel.novelTotal, expected ? 2 : 0)
+    }
+    events.dispatchEvent(new Event('start'))
+    assert.equal(autoMergeNovel.successfulSeries.size, 0)
+  }
 })

@@ -23,6 +23,8 @@ class AutoMergeNovel {
   /** 已完成的队列 */
   // 抓取完毕时，已完成的队列里的 id 数量就是合并了多少个系列的数量
   private completedQueue: string[] = []
+  /** 本轮抓取中成功产出合并小说的系列，与队列处理完成分别记录。 */
+  private successfulSeries = new Set<string>()
   /** 正在合并（尚未完成）的系列 id */
   private workingId = ''
   /* *保存系列 id 和它对应的标题，用于在日志里显示**/
@@ -84,19 +86,19 @@ class AutoMergeNovel {
     }
   }
 
-  /** 自动合并系列；forceStart 允许启动，嵌套任务转发父会话许可和取消检查。 */
+  /** 自动合并系列；返回是否成功产出合并小说，重复调用等待并复用同一系列的结果。 */
   public async merge(
     seriesId: string,
     seriesTitle?: string,
     forceStart = false,
     generation?: CrawlGeneration,
     permit?: CrawlMetadataPermit
-  ) {
-    if (generation !== undefined && !ownsCrawl(generation)) return
-    if (permit && !permit.valid()) return
+  ): Promise<boolean> {
+    if (generation !== undefined && !ownsCrawl(generation)) return false
+    if (permit && !permit.valid()) return false
     if (!seriesId) {
       toast.error('seriesId is undefined')
-      return
+      return false
     }
 
     if (forceStart) {
@@ -116,7 +118,12 @@ class AutoMergeNovel {
       // 这样两个模块会同时发送请求，会增加用户被 Pixiv 警告的风险
       // 所以如果 absent 为 false，则等待这个系列合并完成（这会让 getWorksData 也保持等待），避免两个模块同时发送请求
       await this.waitMergeComplete(seriesId, generation, permit)
-      return
+      return (
+        !this.stop &&
+        (!permit || permit.valid()) &&
+        (generation === undefined || ownsCrawl(generation)) &&
+        this.successfulSeries.has(seriesId)
+      )
     }
 
     if (
@@ -124,7 +131,7 @@ class AutoMergeNovel {
       (permit && !permit.valid()) ||
       (generation !== undefined && !ownsCrawl(generation))
     ) {
-      return
+      return false
     }
 
     this.idTitleMap[seriesId] = seriesTitle || ''
@@ -137,7 +144,7 @@ class AutoMergeNovel {
       (permit && !permit.valid()) ||
       (generation !== undefined && !ownsCrawl(generation))
     )
-      return
+      return false
     this.workingId = workingId
     const seriesTitleLog = this.idTitleMap[this.workingId]
     const novelTotal = await new MergeNovel().merge(
@@ -153,14 +160,16 @@ class AutoMergeNovel {
       (permit && !permit.valid()) ||
       (generation !== undefined && !ownsCrawl(generation))
     ) {
-      return
+      return false
     }
 
+    if (novelTotal > 0) this.successfulSeries.add(workingId)
     this.novelTotal += novelTotal
     // shift() 所移除的 id 就是 this.workingId
     this.pendingQueue.shift()
     this.workingId && this.completedQueue.push(this.workingId)
     this.workingId = ''
+    return this.successfulSeries.has(seriesId)
   }
 
   private enableTip = true
@@ -199,6 +208,7 @@ class AutoMergeNovel {
     })
   }
 
+  /** 清理本轮抓取的队列和成功结果。 */
   private reset() {
     this.stop = true
     // 允许再次显示提示
@@ -209,6 +219,7 @@ class AutoMergeNovel {
     // 如果不重置的话，由于队列里已经存在了这个系列 id，那么在重复抓取时就会导致不会再合并这个系列
     this.pendingQueue = []
     this.completedQueue = []
+    this.successfulSeries.clear()
     this.workingId = ''
     this.idTitleMap = {}
     this.novelTotal = 0
