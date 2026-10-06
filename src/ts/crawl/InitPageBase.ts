@@ -503,6 +503,19 @@ abstract class InitPageBase {
     }
 
     if (!ownsCrawl(generation) || states.stopCrawl) return
+    this.ensureRateSession(generation, this.idListLength)
+
+    // 进入抓取流程
+    this.startGetWorksData(generation)
+  }
+
+  /** 每代只创建一次限速会话；导入列表在 worker 开始前捕获作品数量。 */
+  protected ensureRateSession(
+    generation: CrawlGeneration,
+    workCount = store.idList.length
+  ) {
+    if (this.rateSession?.generation === generation) return
+    this.idListLength = workCount
     const managed = getManagedCrawl()
     const client = new CrawlRateClient(
       `${managed?.generation === generation ? managed.operationId : 'manual'}:${crypto.randomUUID()}`,
@@ -524,14 +537,12 @@ abstract class InitPageBase {
     window.addEventListener(EVT.list.crawlEmpty, finish)
     window.addEventListener(EVT.list.crawlStart, finish)
     window.addEventListener('pagehide', finish)
-
-    // 进入抓取流程
-    this.startGetWorksData(generation)
   }
 
   /** 并发调用 getWorksData 方法 */
   protected startGetWorksData(generation = this.generation) {
-    if (!ownsCrawl(generation)) return
+    if (!ownsCrawl(generation) || states.stopCrawl) return
+    this.ensureRateSession(generation)
     // 如果 idList 里有系列小说，就把抓取线程设置为 1, 避免同时合并多个系列小说
     // 这是因为合并每个系列小说时都需要发送多个请求，如果同时合并多个，容易触发 429 限制
     if (store.idList.some((idData) => idData.type === 'novelSeries')) {

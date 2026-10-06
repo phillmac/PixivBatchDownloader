@@ -53,7 +53,7 @@ test('small concurrent job is paced; accounts remain independent', () => {
   policy.registerCrawl(s, 'a', '123', 1, 40, 0)
   policy.registerCrawl(s, 'b', '123', 2, 40, 0)
   policy.registerCrawl(s, 'c', '456', 3, 51, 0)
-  assert.equal(s.sessions.a.paced, false)
+  assert.equal(s.sessions.a.paced, true)
   assert.equal(s.sessions.b.paced, true)
   policy.permitCrawl(s, 'a', 100)
   assert.equal(policy.permitCrawl(s, 'b', 100).granted, false)
@@ -199,10 +199,15 @@ test('fast starts move both gates; boundary is exactly 1800ms', () => {
   assert.equal(s.nextAt['123'], 1820)
   policy.registerCrawl(s, 'paced', '123', 2, 51, 20)
   assert.equal(policy.permitCrawl(s, 'paced', 1819).granted, false)
-  assert.equal(policy.permitCrawl(s, 'fast', 1820).granted, true)
-  assert.deepEqual(Array.from(s.waiting['123']), ['paced'])
+  assert.equal(s.sessions.fast.paced, true)
+  assert.equal(s.sessions.paced.paced, true)
+  assert.equal(policy.permitCrawl(s, 'fast', 1819).granted, false)
+  assert.equal(policy.permitCrawl(s, 'fast', 1820).granted, false)
+  assert.deepEqual(Array.from(s.waiting['123']), ['paced', 'fast'])
+  assert.equal(policy.permitCrawl(s, 'paced', 1820).granted, true)
   assert.equal(policy.permitCrawl(s, 'paced', 3619).granted, false)
-  assert.equal(policy.permitCrawl(s, 'paced', 3620).granted, true)
+  assert.equal(policy.permitCrawl(s, 'paced', 3620).granted, false)
+  assert.equal(policy.permitCrawl(s, 'fast', 3620).granted, true)
 })
 test('expiry refreshes on registration and denied permits, retaining the gate', () => {
   const s = state()
@@ -459,10 +464,7 @@ test('empty crawl immediately finishes session and removes all finish listeners'
   const source = fs.readFileSync('src/ts/crawl/InitPageBase.ts', 'utf8')
   const block = source.slice(
     source.indexOf('    const finish = () => {'),
-    source.indexOf(
-      '    // 进入抓取流程',
-      source.indexOf('    const finish = () => {')
-    )
+    source.indexOf('\n  }', source.indexOf('    const finish = () => {'))
   )
   const events = new EventTarget()
   const s = state()
@@ -494,4 +496,103 @@ test('empty crawl immediately finishes session and removes all finish listeners'
     events.dispatchEvent(new Event(event))
   assert.equal(finished, 1)
   assert.equal(s.nextAt['123'], 1800)
+})
+
+test('reconnect registration paces all live same-account sessions', () => {
+  const s = state()
+  policy.registerCrawl(s, 'a', '123', 1, 40, 0)
+  policy.registerCrawl(s, 'b', '123', 2, 40, 0)
+  policy.registerCrawl(s, 'other', '456', 3, 40, 0)
+  // 模拟重启后恢复的旧版本快速会话。
+  s.sessions.a.paced = false
+  s.sessions.b.paced = false
+  policy.registerCrawl(s, 'a', '123', 1, 40, 1)
+  assert.equal(s.sessions.a.paced, true)
+  assert.equal(s.sessions.b.paced, true)
+  assert.equal(s.sessions.other.paced, false)
+})
+
+test('direct metadata worker entry creates one rate session before imported workers', () => {
+  const generation = {}
+  const store = {
+    loggedUserID: '123',
+    idList: Array.from({ length: 51 }, (_, i) => ({
+      id: `${i}`,
+      type: 'illusts',
+    })),
+  }
+  const clients = []
+  const workers = []
+  let managed = { generation, operationId: 'managed-operation' }
+  const events = new EventTarget()
+  events.setTimeout = (worker) => {
+    assert.equal(clients.length, 1)
+    workers.push(worker)
+  }
+  const { InitPageBase } = load(
+    'src/ts/crawl/InitPageBase.ts',
+    {
+      './CrawlRateClient': {
+        CrawlRateClient: class {
+          constructor(...args) {
+            this.args = args
+            this.finished = 0
+            clients.push(this)
+          }
+          finish() {
+            this.finished++
+          }
+        },
+      },
+      './CrawlGeneration': { ownsCrawl: (value) => value === generation },
+      '../download/ManagedCrawlAutomation': { getManagedCrawl: () => managed },
+      '../store/Store': { store },
+      '../store/States': { states: { stopCrawl: false } },
+      '../Tools': { Tools: {} },
+      '../Language': { lang: { transl: () => '' } },
+      '../Log': { log: { log() {}, warning() {} } },
+      '../EVT': {
+        EVT: {
+          list: {
+            stopCrawl: 'stop',
+            crawlComplete: 'complete',
+            crawlEmpty: 'empty',
+            crawlStart: 'start',
+          },
+        },
+      },
+    },
+    { window: events, crypto: { randomUUID: () => 'unique' } }
+  )
+  const page = new InitPageBase()
+  page.generation = generation
+  page.idListLength = 999 // 上一代的数量不能用于导入列表。
+  page.getWorksData = () => {
+    assert.equal(page.rateSession.client, clients[0])
+    store.idList.shift()
+  }
+  page.startGetWorksData()
+  assert.equal(clients[0].args[0], 'managed-operation:unique')
+  assert.equal(clients[0].args[1], '123')
+  assert.equal(clients[0].args[2], 51)
+  assert.equal(page.idListLength, 51)
+  workers.forEach((worker) => worker())
+  page.startGetWorksData()
+  assert.equal(clients.length, 1)
+  assert.equal(page.idListLength, 51)
+  events.dispatchEvent(new Event('empty'))
+  assert.equal(clients[0].finished, 1)
+  events.dispatchEvent(new Event('stop'))
+  assert.equal(clients[0].finished, 1)
+
+  const manual = new InitPageBase()
+  manual.generation = generation
+  managed = { generation: {}, operationId: 'stale-operation' }
+  manual.ensureRateSession(generation, 75)
+  assert.equal(clients[1].args[0], 'manual:unique')
+  manual.startGetWorksData = InitPageBase.prototype.startGetWorksData
+  events.setTimeout = () => {}
+  manual.startGetWorksData()
+  assert.equal(clients.length, 2)
+  assert.equal(clients[1].args[2], 75)
 })

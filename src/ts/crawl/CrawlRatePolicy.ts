@@ -43,17 +43,24 @@ export function registerCrawl(
       throw new Error('Crawl session ownership mismatch')
     existing.paced ||= workCount > FAST_TO_PACED_THRESHOLD
     existing.expiresAt = now + SESSION_TTL_MS
-    return
+  } else {
+    state.sessions[id] = {
+      account,
+      tabId,
+      paced:
+        workCount > FAST_TO_PACED_THRESHOLD ||
+        (state.nextAt[account] || 0) > now ||
+        Object.values(state.sessions).some((s) => s.account === account),
+      started: 0,
+      expiresAt: now + SESSION_TTL_MS,
+    }
   }
-  state.sessions[id] = {
-    account,
-    tabId,
-    paced:
-      workCount > FAST_TO_PACED_THRESHOLD ||
-      (state.nextAt[account] || 0) > now ||
-      Object.values(state.sessions).some((s) => s.account === account),
-    started: 0,
-    expiresAt: now + SESSION_TTL_MS,
+  // 并发或重连注册时，同账号所有存活会话立即进入限速模式。
+  const sessions = Object.values(state.sessions).filter(
+    (session) => session.account === account
+  )
+  if (sessions.length > 1) {
+    for (const session of sessions) session.paced = true
   }
 }
 /** 不预订未来许可；实际授予时持久化下一次最早启动时间。 */
