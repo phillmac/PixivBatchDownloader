@@ -227,14 +227,17 @@ window.addEventListener(EVT.list.crawlStart, () => {
   cleanup = null
 })
 
-window.addEventListener(EVT.list.crawlComplete, () => {
-  // Once aborting has begun, a late crawlComplete cannot make the partial queue
-  // valid again. Stop wins over completion.
+function markManagedCrawlCompleted() {
+  // Once aborting has begun, a late completion event cannot make the partial
+  // queue valid again. Stop wins over completion.
   if (operation?.state === 'crawling' && operation.url === taskUrl()) {
     operation.state = 'completed'
     operation.completedAt = new Date().toISOString()
   }
-})
+}
+
+window.addEventListener(EVT.list.crawlComplete, markManagedCrawlCompleted)
+window.addEventListener(EVT.list.crawlEmpty, markManagedCrawlCompleted)
 
 window.addEventListener(EVT.list.stopCrawl, () => {
   if (operation?.state === 'crawling') {
