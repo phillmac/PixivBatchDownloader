@@ -229,9 +229,7 @@ abstract class InitPageBase {
     }
 
     if (managedCrawlRequiresReload()) {
-      toast.error(
-        'Reload the page before starting another crawl after a managed crawl was stopped.'
-      )
+      toast.error(lang.transl('_托管抓取停止后请刷新页面'))
       return
     }
 
