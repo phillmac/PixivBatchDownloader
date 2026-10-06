@@ -1,3 +1,4 @@
+import './CrawlRateCoordinator'
 import './ManageFollowing'
 import './CheckDownloadCount'
 import { DonwloadListData, SendToBackEndData } from '../download/DownloadType'

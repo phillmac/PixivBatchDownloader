@@ -1,5 +1,7 @@
+import { CrawlRateClient } from './CrawlRateClient'
 import { beginCrawl, CrawlGeneration, ownsCrawl } from './CrawlGeneration'
 import {
+  getManagedCrawl,
   managedCrawlRequiresReload,
   skipManagedCrawl,
 } from '../download/ManagedCrawlAutomation'
@@ -43,6 +45,8 @@ import { ppdTask } from '../PPDTask'
 abstract class InitPageBase {
   /** 当前实例的抓取所有权；异步任务必须捕获后传递。 */
   protected generation!: CrawlGeneration
+  /** 当前代数的账号限速会话。 */
+  private rateSession?: { generation: CrawlGeneration; client: CrawlRateClient }
   /**要抓取的个数/页数 */
   protected crawlNumber = 0
   /**当前页面类型最多有多少个页面/作品 */
@@ -498,6 +502,29 @@ abstract class InitPageBase {
       }
     }
 
+    if (!ownsCrawl(generation) || states.stopCrawl) return
+    const managed = getManagedCrawl()
+    const client = new CrawlRateClient(
+      `${managed?.generation === generation ? managed.operationId : 'manual'}:${crypto.randomUUID()}`,
+      store.loggedUserID || Tools.getLoggedUserID(),
+      this.idListLength
+    )
+    this.rateSession?.client.finish()
+    this.rateSession = { generation, client }
+    const finish = () => {
+      client.finish()
+      window.removeEventListener(EVT.list.stopCrawl, finish)
+      window.removeEventListener(EVT.list.crawlComplete, finish)
+      window.removeEventListener(EVT.list.crawlEmpty, finish)
+      window.removeEventListener(EVT.list.crawlStart, finish)
+      window.removeEventListener('pagehide', finish)
+    }
+    window.addEventListener(EVT.list.stopCrawl, finish)
+    window.addEventListener(EVT.list.crawlComplete, finish)
+    window.addEventListener(EVT.list.crawlEmpty, finish)
+    window.addEventListener(EVT.list.crawlStart, finish)
+    window.addEventListener('pagehide', finish)
+
     // 进入抓取流程
     this.startGetWorksData(generation)
   }
@@ -566,7 +593,14 @@ abstract class InitPageBase {
         // 如果不使用缓存，则必定会导致一个小说发送两次请求
         // 使用缓存有负面影响：作品的某些数据（如收藏数量）在它被缓存之后可能已经发生变化
         // 但通常问题不大
-        const data = await cacheWorkData.getWorkDataAsync(id, 'novel', unlisted)
+        if (!cacheWorkData.get(id, 'novel')) {
+          if (!(await this.waitForMetadataPermit(generation))) return
+        }
+        if (!ownsCrawl(generation) || states.stopCrawl) return
+        const cached = cacheWorkData.get(id, 'novel')
+        const data =
+          cached ||
+          (await cacheWorkData.getWorkDataAsync(id, 'novel', unlisted))
         if (!ownsCrawl(generation)) return
         // 自动合并系列小说
         const seriesId = data.body.seriesNavData?.seriesId
@@ -591,6 +625,8 @@ abstract class InitPageBase {
         this.afterGetWorksData(undefined, generation)
       } else {
         // 获取图像作品时，不使用缓存的数据，因为目前在一次抓取里不会重复请求同一个图像作品
+        if (!(await this.waitForMetadataPermit(generation))) return
+        if (!ownsCrawl(generation) || states.stopCrawl) return
         const data = await API.getArtworkData(id, unlisted)
         if (!ownsCrawl(generation)) return
         await saveArtworkData.save(generation, data, idData.downloadIndexes)
@@ -619,6 +655,26 @@ abstract class InitPageBase {
         this.getWorksData(idData, generation)
       }
     }
+  }
+
+  /** 许可前后验证抓取代数；当前抓取停止时收尾，后台故障仍由客户端重试。 */
+  private async waitForMetadataPermit(generation: CrawlGeneration) {
+    if (!ownsCrawl(generation)) return false
+    if (states.stopCrawl) {
+      this.crawlFinished(generation)
+      return false
+    }
+    const session = this.rateSession
+    if (!session || session.generation !== generation)
+      throw new Error('Missing crawl rate session')
+    const permitted = await session.client.permit(
+      () => ownsCrawl(generation) && !states.stopCrawl
+    )
+    if (!ownsCrawl(generation)) return false
+    if (!permitted && states.stopCrawl) {
+      this.crawlFinished(generation)
+    }
+    return permitted
   }
 
   /** 每当获取完一个作品的信息；使用本轮抓取所有权。 */
