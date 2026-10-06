@@ -1,4 +1,8 @@
-import { replacementOwner } from '../crawl/CrawlGeneration'
+import {
+  currentCrawl,
+  replacementOwner,
+  revokeCrawl,
+} from '../crawl/CrawlGeneration'
 import { EVT } from '../EVT'
 import { Result } from '../store/StoreType'
 import { lang } from '../Language'
@@ -27,6 +31,7 @@ class ImportResult {
   }
 
   private async import() {
+    const generationAtStart = currentCrawl()
     const loadedJSON = (await Utils.loadJSONFile().catch((err) => {
       return msgBox.error(err)
     })) as Result[]
@@ -77,6 +82,14 @@ class ImportResult {
     if (temp.length === 0) {
       msgBox.warning(lang.transl('_没有符合条件的结果'))
       return
+    }
+
+    // 文件选择和过滤期间可能开始了新的抓取；导入不能覆盖新的所有者。
+    if (states.busy || currentCrawl() !== generationAtStart) {
+      return
+    }
+    if (generationAtStart !== null) {
+      revokeCrawl(generationAtStart)
     }
 
     // 恢复数据

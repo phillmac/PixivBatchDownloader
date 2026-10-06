@@ -48,7 +48,7 @@ function harness(controller, durable) {
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
       stopCrawl: 'stopCrawl',
-      managedCrawlAbortComplete: 'managedCrawlAbortComplete',
+      managedCrawlTerminal: 'managedCrawlTerminal',
       getIdListFinished: 'getIdListFinished',
       resultChange: 'resultChange',
       downloadStart: 'downloadStart',
@@ -1139,6 +1139,8 @@ test('imported results bind the queue to the current page URL', async () => {
     ext: 'jpg',
     pageCount: 1,
   }
+  let activeGeneration = 7
+  const revoked = []
   const context = vm.createContext({ console, Date, window })
   const file = path.join(root, 'src/ts/download/ImportResult.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
@@ -1158,7 +1160,14 @@ test('imported results bind the queue to the current page URL', async () => {
       return { Utils: { loadJSONFile: async () => [imported] } }
     if (name === '../store/States') return { states: { busy: false } }
     if (name === '../crawl/CrawlGeneration')
-      return { replacementOwner: 'replacement' }
+      return {
+        currentCrawl: () => activeGeneration,
+        replacementOwner: 'replacement',
+        revokeCrawl: (generation) => {
+          revoked.push(generation)
+          if (activeGeneration === generation) activeGeneration = null
+        },
+      }
     if (name === '../store/Store') return { store }
     if (name === '../store/States') return { states }
     if (name === '../Toast') return { toast: { error() {} } }
@@ -1177,6 +1186,110 @@ test('imported results bind the queue to the current page URL', async () => {
   assert.equal(store.crawlCompleteTime instanceof Date, true)
   assert.equal(store.result.length, 1)
   assert.equal(fired.includes('crawlComplete'), true)
+  assert.deepEqual(revoked, [7])
+})
+
+test('import refuses to replace results when a crawl takes ownership during filtering', async () => {
+  const listeners = new Map()
+  const fired = []
+  const states = { busy: false }
+  let activeGeneration = 11
+  const revoked = []
+  let releaseFilter
+  let filterEntered
+  const filterStarted = new Promise((resolve) => {
+    filterEntered = resolve
+  })
+  const window = {
+    location: { href: 'https://www.pixiv.net/en/users/9' },
+    addEventListener(name, callback) {
+      listeners.set(name, callback)
+    },
+  }
+  const EVT = {
+    list: { importResult: 'importResult', crawlComplete: 'crawlComplete' },
+    fire(name) {
+      fired.push(name)
+    },
+  }
+  const store = {
+    result: [{ id: 'existing' }],
+    URLWhenCrawlStart: 'https://www.pixiv.net/en/users/old',
+    crawlCompleteTime: new Date(0),
+    resetCalls: 0,
+    reset() {
+      this.resetCalls++
+      this.result = []
+    },
+    addResult(owner, value) {
+      this.result.push(value)
+    },
+  }
+  const imported = {
+    idNum: 1,
+    id: '1',
+    original: 'https://example.invalid/1.jpg',
+    type: 0,
+    ext: 'jpg',
+    pageCount: 1,
+  }
+  const context = vm.createContext({ console, Date, window })
+  const file = path.join(root, 'src/ts/download/ImportResult.ts')
+  const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const exports = {}
+  vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
+    filename: file,
+  })((name) => {
+    if (name === '../EVT') return { EVT }
+    if (name === '../store/StoreType') return {}
+    if (name === '../Language') return { lang: { transl: (value) => value } }
+    if (name === '../utils/Utils')
+      return { Utils: { loadJSONFile: async () => [imported] } }
+    if (name === '../store/States') return { states }
+    if (name === '../crawl/CrawlGeneration')
+      return {
+        currentCrawl: () => activeGeneration,
+        replacementOwner: 'replacement',
+        revokeCrawl: (generation) => revoked.push(generation),
+      }
+    if (name === '../store/Store') return { store }
+    if (name === '../Toast') return { toast: { error() {} } }
+    if (name === '../MsgBox')
+      return { msgBox: { error() {}, warning() {}, success() {} } }
+    if (name === '../filter/Filter')
+      return {
+        filter: {
+          check: async () => {
+            filterEntered()
+            await new Promise((resolve) => {
+              releaseFilter = resolve
+            })
+            return true
+          },
+        },
+      }
+    if (name === '../Tools')
+      return { Tools: { getWorkTypeString: () => 'artwork' } }
+    throw new Error(`unexpected require ${name}`)
+  }, exports)
+
+  listeners.get('importResult')()
+  await filterStarted
+  activeGeneration = 12
+  states.busy = true
+  releaseFilter()
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(store.resetCalls, 0)
+  assert.deepEqual(store.result, [{ id: 'existing' }])
+  assert.deepEqual(revoked, [])
+  assert.equal(fired.includes('crawlComplete'), false)
 })
 
 test('automation status snapshots live controller after durable lookup', async () => {
@@ -1752,7 +1865,7 @@ test('checkpoint does not recreate metadata deleted by another tab', async () =>
 test('managed manual stop wins over late completion and result changes', async () => {
   const h = harness({ busy: false, resultLength: 3 }, null)
   let abortComplete = 0
-  h.context.window.addEventListener('managedCrawlAbortComplete', () => {
+  h.context.window.addEventListener('managedCrawlTerminal', () => {
     abortComplete++
   })
   const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
@@ -2162,6 +2275,10 @@ test('managed manual stop revokes synchronously; unmanaged stop preserves partia
 test('work-count and ID-only managed stops remain distinct from completed', async () => {
   for (const reason of ['skipped-work-count', 'skipped-id-list']) {
     const h = crawlHarness()
+    let terminal = 0
+    h.context.window.addEventListener('managedCrawlTerminal', () => {
+      terminal++
+    })
     const task = h.start()
     h.store.idList = [{ id: '100', type: 'illusts' }]
     if (reason === 'skipped-work-count') {
@@ -2174,6 +2291,8 @@ test('work-count and ID-only managed stops remain distinct from completed', asyn
     assert.equal(h.generation.ownsCrawl(task.generation), false)
     assert.equal(h.complete(), 0)
     assert.deepEqual(h.discardCalls, [])
+    await new Promise((resolve) => queueMicrotask(resolve))
+    assert.equal(terminal, 1)
   }
 })
 
@@ -2284,7 +2403,7 @@ test('managed terminal event advances the production waiting-ID scheduler after 
       .getText(schedulerAst)
       .startsWith('checkWaitingIdListEvents.forEach')
   )
-  const source = `const checkWaitingIdListEvents = [EVT.list.downloadComplete, EVT.list.crawlEmpty, EVT.list.managedCrawlAbortComplete]; ${queueStatement.getText(schedulerAst)}`
+  const source = `const checkWaitingIdListEvents = [EVT.list.downloadComplete, EVT.list.crawlEmpty, EVT.list.managedCrawlTerminal]; ${queueStatement.getText(schedulerAst)}`
   const code = ts.transpileModule(source, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText

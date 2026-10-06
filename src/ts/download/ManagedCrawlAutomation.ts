@@ -90,12 +90,11 @@ function terminate(
   if (owned.generation !== null) revokeCrawl(owned.generation)
   owned.state = state
   owned.abortedAt = new Date().toISOString()
-  if (state === 'aborted') {
-    // 等 stopCrawl 的同步监听器结束后再推进等待队列。
-    queueMicrotask(() => {
-      if (operation === owned) EVT.fire('managedCrawlAbortComplete')
-    })
-  }
+  // 等 stopCrawl 的同步监听器结束后再推进等待队列。抓取代数已经撤销，
+  // 因此迟到 worker 即使尚未返回也不能污染下一任务。
+  queueMicrotask(() => {
+    if (operation === owned) EVT.fire('managedCrawlTerminal')
+  })
 }
 /** 标记明确的非元数据停止原因，在真实 stopCrawl 前撤销权限。 */
 export function skipManagedCrawl(

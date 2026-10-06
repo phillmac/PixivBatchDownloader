@@ -28,7 +28,7 @@ class EVENT {
     crawlStart: 'crawlStart',
     stopCrawl: 'stopCrawl',
     /** 托管抓取已撤销写入权限；通知等待队列继续，不代表网络请求已结束。 */
-    managedCrawlAbortComplete: 'managedCrawlAbortComplete',
+    managedCrawlTerminal: 'managedCrawlTerminal',
     /** 让下载器抓取特定的 tag，而不是自动获取当前页面的 tag（仅在 tag 搜索页面有效） */
     crawlTag: 'crawlTag',
     /** 当检查到错误的设置时触发 */
@@ -231,7 +231,7 @@ class EVENT {
     type:
       | 'crawlStart'
       | 'stopCrawl'
-      | 'managedCrawlAbortComplete'
+      | 'managedCrawlTerminal'
       | 'wrongSetting'
       | 'getIdListFinished'
       | 'crawlComplete'

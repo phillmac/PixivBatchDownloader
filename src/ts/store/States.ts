@@ -125,7 +125,7 @@ class States {
     // 下载完成，或者下载中止时，复位快速下载类状态
     const resetQuickState = [
       EVT.list.crawlEmpty,
-      EVT.list.managedCrawlAbortComplete,
+      EVT.list.managedCrawlTerminal,
       EVT.list.downloadStop,
       EVT.list.downloadPause,
       EVT.list.downloadComplete,
