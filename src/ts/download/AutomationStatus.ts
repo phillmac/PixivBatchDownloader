@@ -5,6 +5,7 @@ import {
   getManagedCrawl,
   getManagedCrawlArm,
   managedCrawlBlocksDownload,
+  managedCrawlRequiresReload,
 } from './ManagedCrawlAutomation'
 import { downloadDiagnostics } from './DownloadDiagnostics'
 import { resume } from './Resume'
@@ -306,6 +307,7 @@ export async function getAutomationStatus() {
     controller,
     managedOperation: getManagedCrawl(),
     managedArm: getManagedCrawlArm(),
+    requiresReload: managedCrawlRequiresReload(),
     crawlIdList,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [

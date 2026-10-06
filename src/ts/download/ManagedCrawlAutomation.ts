@@ -33,6 +33,12 @@ let operation: ManagedOperation | null = null
 let armed: ManagedOperation | null = null
 /** 内容脚本内的操作序号。 */
 let sequence = 0
+/** 终止过托管抓取的文档不再复用；刷新页面会重建模块状态。 */
+let reloadRequired = false
+/** 当前文档是否必须刷新后才能开始新的托管抓取。 */
+export function managedCrawlRequiresReload() {
+  return reloadRequired
+}
 /** 忽略 URL fragment，与任务 URL 规则保持一致。 */
 function normalizeUrl(url: string) {
   return url.split('#')[0]
@@ -48,6 +54,8 @@ export function armManagedCrawl(url: string) {
   const expectedUrl = normalizeUrl(url)
   if (normalizeUrl(window.location.href) !== expectedUrl)
     throw new Error('managed crawl URL does not match the live page')
+  if (reloadRequired)
+    throw new Error('reload required after terminal managed crawl')
   if (states.busy || operation?.state === 'crawling')
     throw new Error('cannot arm while a crawl is active')
   armed = {
@@ -90,6 +98,7 @@ function terminate(
   if (owned.generation !== null) revokeCrawl(owned.generation)
   owned.state = state
   owned.abortedAt = new Date().toISOString()
+  reloadRequired = true
   // 等 stopCrawl 的同步监听器结束后再推进等待队列。抓取代数已经撤销，
   // 因此迟到 worker 即使尚未返回也不能污染下一任务。
   queueMicrotask(() => {

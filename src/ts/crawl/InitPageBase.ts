@@ -1,5 +1,8 @@
 import { beginCrawl, CrawlGeneration, ownsCrawl } from './CrawlGeneration'
-import { skipManagedCrawl } from '../download/ManagedCrawlAutomation'
+import {
+  managedCrawlRequiresReload,
+  skipManagedCrawl,
+} from '../download/ManagedCrawlAutomation'
 // 初始化所有页面抓取流程的基类
 import { lang } from '../Language'
 import { Colors } from '../Colors'
@@ -222,6 +225,11 @@ abstract class InitPageBase {
     // states.busy 表示下载器正在抓取或正在下载
     if (states.busy) {
       toast.error(lang.transl('_当前任务尚未完成'))
+      return
+    }
+
+    if (managedCrawlRequiresReload()) {
+      toast.error(lang.transl('_托管抓取停止后请刷新页面'))
       return
     }
 
