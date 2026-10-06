@@ -1,3 +1,10 @@
+import {
+  armManagedCrawl,
+  abortManagedCrawl,
+  getManagedCrawl,
+  getManagedCrawlArm,
+  managedCrawlBlocksDownload,
+} from './ManagedCrawlAutomation'
 import { downloadDiagnostics } from './DownloadDiagnostics'
 import { resume } from './Resume'
 import { EVT } from '../EVT'
@@ -25,9 +32,7 @@ type AutomationIdEntry = { id: string; type: IDTypeString }
 
 /** 自动化 ID 数量门限的同步判定结果。 */
 type CrawlIdGateDecision = 'accepted' | 'rejected'
-type CrawlIdGateRejectReason =
-  | 'count-exceeded'
-  | 'novel-series-size-unknown'
+type CrawlIdGateRejectReason = 'count-exceeded' | 'novel-series-size-unknown'
 
 /** 自动化客户端在抓取开始前预设的一次性 ID 数量门限。 */
 type CrawlIdGate = { maxCount: number }
@@ -36,13 +41,11 @@ type CrawlIdGate = { maxCount: number }
 type CrawlIdListSnapshot = LifecycleObservation & {
   count: number
   items: AutomationIdEntry[]
-  gate:
-    | {
-        maxCount: number
-        decision: CrawlIdGateDecision
-        reason: CrawlIdGateRejectReason | null
-      }
-    | null
+  gate: {
+    maxCount: number
+    decision: CrawlIdGateDecision
+    reason: CrawlIdGateRejectReason | null
+  } | null
 }
 
 /** 当前内容脚本生命周期内观察到的真实下载器事件。 */
@@ -135,8 +138,8 @@ function captureCrawlIdList() {
     ? containsNovelSeries
       ? 'novel-series-size-unknown'
       : items.length > gate.maxCount
-      ? 'count-exceeded'
-      : null
+        ? 'count-exceeded'
+        : null
     : null
   const decision: CrawlIdGateDecision | null = gate
     ? rejectReason
@@ -274,7 +277,11 @@ export async function getAutomationStatus() {
   else if (bookmarkMode) phase = 'BOOKMARKING'
   else if (crawlingForCurrent) phase = 'CRAWLING'
   else if (busy) phase = 'BUSY_OTHER'
-  else if (stoppedForCurrent) phase = 'STOPPED'
+  else if (
+    stoppedForCurrent ||
+    (managedCrawlBlocksDownload() && getManagedCrawl()?.url === currentUrl)
+  )
+    phase = 'STOPPED'
   else if (durable && !liveResultsBoundToCurrent) phase = 'RESTORING'
   else if (pause && durable && liveResultsBoundToCurrent)
     phase = 'PAUSED_RESUMABLE'
@@ -291,6 +298,8 @@ export async function getAutomationStatus() {
     phase,
     page: { url: currentUrl },
     controller,
+    managedOperation: getManagedCrawl(),
+    managedArm: getManagedCrawlArm(),
     crawlIdList,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [
@@ -300,11 +309,6 @@ export async function getAutomationStatus() {
     ),
     durable,
   }
-}
-
-/** 删除当前页面 URL 对应的单个 Resume 任务，不影响其他页面保存的队列。 */
-export async function discardAutomationCurrentResume() {
-  return resume.discardSavedTask(normalizeUrl(window.location.href))
 }
 
 /** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
@@ -328,10 +332,14 @@ const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
-  __PBD_AUTOMATION_DISCARD_CURRENT_RESUME__?: typeof discardAutomationCurrentResume
+  __PBD_AUTOMATION_ARM_CRAWL__?: typeof armManagedCrawl
+  __PBD_AUTOMATION_ABORT_CRAWL__?: typeof abortManagedCrawl
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
-automationGlobal.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__ =
-  discardAutomationCurrentResume
+automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl
+automationGlobal.__PBD_AUTOMATION_ABORT_CRAWL__ = (operationId, url) =>
+  abortManagedCrawl(operationId, url)
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

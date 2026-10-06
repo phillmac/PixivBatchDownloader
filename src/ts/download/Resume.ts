@@ -110,21 +110,19 @@ class Resume {
   }
 
   /** 仅删除指定 URL 的持久化未完成任务，供外部自动化安全放弃部分抓取结果。 */
-  public async discardSavedTask(url = this.getURL()) {
-    await this.ready
+  public async discardSavedTask(url: string) {
     const normalizedUrl = this.normalizeURL(url)
-    if (!Utils.isPixiv()) {
-      return { discarded: false, url: normalizedUrl, taskId: null }
-    }
-
-    // 先抑制这个 URL 的后续保存并使已经排队/进行中的旧快照失效，
-    // 避免停止抓取后的迟到 resultChange 在删除后又复活部分任务。
+    // 在 await 前抑制保存和恢复，保证 stopCrawl 的同步监听器不能复活队列。
     this.suppressedSaveUrls.add(normalizedUrl)
+    const generation = ++this.persistenceGeneration
     this.restoreGeneration++
-    this.persistenceGeneration++
     this.restorePending = false
     if (this.currentMeta?.url === normalizedUrl) {
       this.invalidateTaskOwnership(this.currentMeta.id)
+    }
+    await this.ready
+    if (!Utils.isPixiv()) {
+      return { discarded: false, url: normalizedUrl, taskId: null }
     }
 
     // 等正在执行的保存请求退出；旧代数请求会在写入前自行放弃。
@@ -137,7 +135,7 @@ class Resume {
       normalizedUrl,
       'url'
     )) as TaskMeta | null
-    if (!meta) {
+    if (!meta || generation !== this.persistenceGeneration) {
       return { discarded: false, url: normalizedUrl, taskId: null }
     }
 
@@ -153,6 +151,9 @@ class Resume {
       return null
     }
     const normalizedUrl = this.normalizeURL(url)
+    if (this.suppressedSaveUrls.has(normalizedUrl)) {
+      return null
+    }
     const meta = (await this.IDB.get(
       this.metaName,
       normalizedUrl,
@@ -257,7 +258,10 @@ class Resume {
 
   private bindEvents() {
     window.addEventListener(EVT.list.crawlStart, () => {
-      this.suppressedSaveUrls.delete(this.getURL())
+      // 新抓取使旧清理失效，避免异步删除下一次同 URL 的有效队列。
+      if (this.suppressedSaveUrls.delete(this.getURL())) {
+        this.persistenceGeneration++
+      }
     })
 
     // 切换页面时，重新检查恢复数据
@@ -320,6 +324,7 @@ class Resume {
   private async restoreData() {
     const generation = ++this.restoreGeneration
     const restoreUrl = this.getURL()
+    if (this.suppressedSaveUrls.has(restoreUrl)) return
 
     // 如果下载器在抓取或者在下载，则记住待恢复状态，在下一次 idle 事件后重试。
     if (states.busy) {
@@ -773,3 +778,5 @@ class Resume {
 /** 断点续传模块单例。 */
 const resume = new Resume()
 export { resume }
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

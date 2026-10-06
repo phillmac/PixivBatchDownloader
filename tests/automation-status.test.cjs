@@ -38,6 +38,9 @@ function harness(controller, durable) {
   }
   const listeners = new Map()
   const EVT = {
+    fire(name) {
+      for (const callback of listeners.get(name) || []) callback()
+    },
     list: {
       crawlStart: 'crawlStart',
       crawlComplete: 'crawlComplete',
@@ -68,10 +71,32 @@ function harness(controller, durable) {
       target: ts.ScriptTarget.ES2022,
     },
   }).outputText
+  const managed = {}
+  const managedFile = path.join(
+    root,
+    'src/ts/download/ManagedCrawlAutomation.ts'
+  )
+  const managedCode = ts.transpileModule(fs.readFileSync(managedFile, 'utf8'), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  vm.runInContext(`(function(require, exports) {${managedCode}\n})`, context)(
+    (name) => {
+      if (name === './Resume') return { resume }
+      if (name === '../EVT') return { EVT }
+      if (name === '../store/Store') return { store }
+      if (name === '../store/States') return { states }
+      throw new Error(name)
+    },
+    managed
+  )
   const exports = {}
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })((name) => {
+    if (name === './ManagedCrawlAutomation') return managed
     if (name === './DownloadDiagnostics')
       return { downloadDiagnostics: diagnostics }
     if (name === './Resume') return { resume }
@@ -82,6 +107,7 @@ function harness(controller, durable) {
   }, exports)
   return {
     exports,
+    managed,
     context,
     store,
     states,
@@ -457,7 +483,10 @@ test('bookmark-only ID completion neither consumes the gate nor creates a crawl 
   h.fire('getIdListFinished')
   assert.equal(h.states.exportIDList, true)
   assert.equal(h.exports.getAutomationCrawlIdList().gate.decision, 'rejected')
-  assert.equal(h.exports.getAutomationCrawlIdList().gate.reason, 'count-exceeded')
+  assert.equal(
+    h.exports.getAutomationCrawlIdList().gate.reason,
+    'count-exceeded'
+  )
 })
 
 test('crawl ID gate validates configuration and refuses mid-task mutation', () => {
@@ -647,20 +676,29 @@ test('isolated world exposes read-only automation function', async () => {
   )
   assert.equal(typeof h.context.__PBD_AUTOMATION_STATUS__, 'function')
   assert.equal(typeof h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__, 'function')
-  assert.equal(typeof h.context.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__, 'function')
   assert.equal(
-    typeof h.context.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__,
+    typeof h.context.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__,
     'function'
   )
-  assert.equal((await h.context.__PBD_AUTOMATION_STATUS__()).phase, 'IDLE')
-  assert.equal(h.context.__PBD_AUTOMATION_CRAWL_ID_LIST__(), null)
-  const discarded = await h.context.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__()
-  assert.deepEqual(JSON.parse(JSON.stringify(discarded)), {
-    discarded: true,
-    url: 'https://www.pixiv.net/en/users/1',
-    taskId: 123,
-  })
-  assert.deepEqual(h.discardCalls, ['https://www.pixiv.net/en/users/1'])
+  assert.equal(
+    typeof h.context.__PBD_AUTOMATION_DISCARD_CURRENT_RESUME__,
+    'undefined'
+  )
+  const armed = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    h.context.window.location.href
+  )
+  h.fire('crawlStart')
+  h.context.window.location.href = 'https://www.pixiv.net/en/users/2'
+  const result = await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
+    armed.operationId,
+    armed.url
+  )
+  assert.equal(result.outcome, 'aborted')
+  assert.deepEqual(h.discardCalls, [armed.url])
+  assert.equal(
+    (await h.exports.getAutomationStatus()).managedOperation.state,
+    'aborted'
+  )
 })
 
 test('Resume status lookup skips IndexedDB when Resume is disabled off Pixiv', async () => {
@@ -1755,3 +1793,127 @@ test('checkpoint does not recreate metadata deleted by another tab', async () =>
   assert.equal(h.resume.currentMeta, null)
   assert.equal(h.putManyCalls.length, 0)
 })
+
+test('managed manual stop wins over late completion and result changes', async () => {
+  const h = harness({ busy: false, resultLength: 3 }, null)
+  const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    h.context.window.location.href
+  )
+  h.fire('crawlStart')
+  h.fire('stopCrawl')
+  h.fire('crawlComplete')
+  h.fire('resultChange')
+  await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(arm.operationId, arm.url)
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'STOPPED')
+  assert.deepEqual(h.discardCalls, [arm.url])
+  const next = h.context.__PBD_AUTOMATION_ARM_CRAWL__(arm.url)
+  h.fire('crawlStart')
+  h.fire('crawlComplete')
+  assert.equal(
+    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(next.operationId, next.url))
+      .outcome,
+    'already-completed'
+  )
+  assert.equal((await h.exports.getAutomationStatus()).phase, 'READY')
+  assert.equal(h.discardCalls.length, 1)
+})
+
+test('managed abort fails closed for wrong token, URL and unmatched crawl', async () => {
+  const h = harness({ busy: false }, null)
+  const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    h.context.window.location.href
+  )
+  h.fire('crawlStart')
+  assert.equal(
+    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__('wrong', arm.url)).outcome,
+    'ownership-mismatch'
+  )
+  assert.equal(
+    (
+      await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
+        arm.operationId,
+        arm.url + '?x'
+      )
+    ).outcome,
+    'ownership-mismatch'
+  )
+  h.context.window.location.href += '?other'
+  h.store.URLWhenCrawlStart = h.context.window.location.href
+  h.fire('crawlStart')
+  h.fire('stopCrawl')
+  assert.equal((await h.exports.getAutomationStatus()).managedOperation, null)
+  assert.equal(h.discardCalls.length, 0)
+})
+
+test('download controller blocks ready UI and direct start for aborted managed results', async () => {
+  const h = harness({ busy: false, resultLength: 3 }, null)
+  const arm = h.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    h.context.window.location.href
+  )
+  h.fire('crawlStart')
+  await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(arm.operationId, arm.url)
+  const file = path.join(root, 'src/ts/download/DownloadControl.ts')
+  const source = fs
+    .readFileSync(file, 'utf8')
+    .replace(
+      'new DownloadControl()',
+      'exports.controllerClass = DownloadControl'
+    )
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const exports = {}
+  vm.runInContext(`(function(require, exports) {${compiled}\n})`, h.context)(
+    (name) => {
+      if (name === './ManagedCrawlAutomation') return h.managed
+      // Any attempt to prepare results, show buttons or download reaches an unstubbed dependency.
+      return {}
+    },
+    exports
+  )
+  const controller = Object.create(exports.controllerClass.prototype)
+  controller.readyDownload()
+  controller.startDownload()
+})
+
+test('only matching crawl consumes an arm and owned abort suppresses before Stop Crawl', async () => {
+  const h = harness({ busy: false }, null)
+  const url = h.context.window.location.href
+
+  const stale = h.context.__PBD_AUTOMATION_ARM_CRAWL__(url + '#fragment')
+  assert.equal(
+    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(stale.operationId, url))
+      .outcome,
+    'not-started'
+  )
+  h.context.window.location.href = url + '?other'
+  h.store.URLWhenCrawlStart = h.context.window.location.href
+  h.fire('crawlStart')
+  assert.equal((await h.exports.getAutomationStatus()).managedOperation, null)
+  assert.equal(
+    (await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(stale.operationId, url))
+      .outcome,
+    'not-started'
+  )
+
+  h.context.window.location.href = url
+  h.store.URLWhenCrawlStart = url
+  const owned = stale
+  assert.equal((await h.exports.getAutomationStatus()).managedArm.operationId, stale.operationId)
+  h.fire('crawlStart')
+  h.context.window.addEventListener('stopCrawl', () => {
+    assert.deepEqual(h.discardCalls, [url])
+    assert.equal(h.managed.getManagedCrawl().state, 'aborting')
+  })
+  const result = await h.context.__PBD_AUTOMATION_ABORT_CRAWL__(
+    owned.operationId,
+    url
+  )
+  assert.equal(result.outcome, 'aborted')
+  assert.equal(h.states.stopCrawl, true)
+})
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]

@@ -1,3 +1,4 @@
+import { managedCrawlBlocksDownload } from './ManagedCrawlAutomation'
 import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
 import { Tools } from '../Tools'
@@ -135,6 +136,13 @@ class DownloadControl {
       this.hideResultBtns()
       this.hideDownloadArea()
       this.reset()
+    })
+
+    window.addEventListener(EVT.list.stopCrawl, () => {
+      if (managedCrawlBlocksDownload()) {
+        this.hideResultBtns()
+        this.hideDownloadArea()
+      }
     })
 
     for (const ev of [
@@ -464,6 +472,7 @@ class DownloadControl {
 
   /** 抓取完毕之后更新状态，并决定是否立即开始下载 */
   private readyDownload(openPanel = true) {
+    if (managedCrawlBlocksDownload()) return
     if (states.busy) {
       return
     }
@@ -522,6 +531,7 @@ class DownloadControl {
 
   // 开始下载
   private startDownload() {
+    if (managedCrawlBlocksDownload()) return
     if (states.busy) {
       return toast.error(lang.transl('_当前任务尚未完成'))
     }
@@ -804,3 +814,5 @@ class DownloadControl {
 }
 
 new DownloadControl()
+
+[executed on device: vps-2782c273.vps.ovh.ca (aab511b1-1559-4c02-ab43-c54e410fdc88)]
