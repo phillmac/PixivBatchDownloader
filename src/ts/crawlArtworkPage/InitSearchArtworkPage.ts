@@ -25,7 +25,6 @@ import { pageType } from '../PageType'
 import { Config } from '../Config'
 import { downloadOnClickBookmark } from '../download/DownloadOnClickBookmark'
 import '../pageFunciton/RemoveWorksOfFollowedUsersOnSearchPage'
-import { vipSearchOptimize } from '../crawl/VipSearchOptimize'
 import '../filter/FilterSearchResults'
 
 // 用于测试抓取的 URL：
@@ -636,8 +635,12 @@ class InitSearchArtworkPage extends InitPageBase {
         //   `已抓取 ${this.listPageFinished} 页，检查最后一个作品的收藏数量`
         // )
         const lastWork = data.data[data.data.length - 1]
-        const check = await vipSearchOptimize.checkWork(lastWork.id, 'illusts')
-        if (!ownsCrawl(generation)) return
+        const check = await this.checkVipWork(
+          lastWork.id,
+          'illusts',
+          generation
+        )
+        if (!ownsCrawl(generation) || states.stopCrawl) return
         if (check) {
           log.log(lang.transl('_后续作品低于最低收藏数量要求跳过后续作品'))
           log.log(lang.transl('_列表页抓取完成'))

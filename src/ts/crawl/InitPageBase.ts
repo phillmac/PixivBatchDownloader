@@ -1,4 +1,4 @@
-import { CrawlRateClient } from './CrawlRateClient'
+import { CrawlRateClient, CrawlMetadataPermit } from './CrawlRateClient'
 import { beginCrawl, CrawlGeneration, ownsCrawl } from './CrawlGeneration'
 import {
   getManagedCrawl,
@@ -514,13 +514,17 @@ abstract class InitPageBase {
     generation: CrawlGeneration,
     workCount = store.idList.length
   ) {
-    if (this.rateSession?.generation === generation) return
+    if (!ownsCrawl(generation) || states.stopCrawl) return
+    if (this.rateSession?.generation === generation) {
+      this.rateSession.client.updateWorkCount(Math.max(1, workCount))
+      return
+    }
     this.idListLength = workCount
     const managed = getManagedCrawl()
     const client = new CrawlRateClient(
       `${managed?.generation === generation ? managed.operationId : 'manual'}:${crypto.randomUUID()}`,
       store.loggedUserID || Tools.getLoggedUserID(),
-      this.idListLength
+      Math.max(1, this.idListLength)
     )
     this.rateSession?.client.finish()
     this.rateSession = { generation, client }
@@ -619,8 +623,15 @@ abstract class InitPageBase {
         if (canMerge) {
           const seriseTitle = data.body.seriesNavData?.title
           this.mergedNovelCount++
-          await autoMergeNovel.merge(seriesId, seriseTitle, false, generation)
+          await autoMergeNovel.merge(
+            seriesId,
+            seriseTitle,
+            false,
+            generation,
+            this.metadataPermit(generation)
+          )
           if (!ownsCrawl(generation)) return
+          if (states.stopCrawl) return this.crawlFinished(generation)
         }
         // 如果这个小说不会被合并，或者即使合并也不跳过它，则保存到抓取结果里
         if (!canMerge || !settings.skipNovelsInSeriesWhenAutoMerge) {
@@ -631,8 +642,15 @@ abstract class InitPageBase {
       } else if (idData.type === 'novelSeries') {
         // 合并系列小说
         this.mergedNovelCount++
-        await new MergeNovel().merge(id, idData.title, true, generation)
+        await new MergeNovel().merge(
+          id,
+          idData.title,
+          true,
+          generation,
+          this.metadataPermit(generation)
+        )
         if (!ownsCrawl(generation)) return
+        if (states.stopCrawl) return this.crawlFinished(generation)
         this.afterGetWorksData(undefined, generation)
       } else {
         // 获取图像作品时，不使用缓存的数据，因为目前在一次抓取里不会重复请求同一个图像作品
@@ -668,8 +686,39 @@ abstract class InitPageBase {
     }
   }
 
+  /** 把父会话许可传给嵌套合并，禁止创建第二个会话。 */
+  private metadataPermit(generation: CrawlGeneration): CrawlMetadataPermit {
+    return {
+      acquire: () => this.waitForMetadataPermit(generation),
+      addWorkCount: (delta) => {
+        this.ensureRateSession(generation)
+        if (ownsCrawl(generation) && !states.stopCrawl) {
+          this.rateSession?.client.addWorkCount(delta)
+        }
+      },
+      valid: () => ownsCrawl(generation) && !states.stopCrawl,
+    }
+  }
+
+  /** 搜索列表抽查复用本代会话；累积数量在抽查前提升限速模式。 */
+  protected async checkVipWork(
+    id: string,
+    type: 'illusts' | 'novels',
+    generation: CrawlGeneration
+  ) {
+    if (!ownsCrawl(generation) || states.stopCrawl) return false
+    const permit = this.metadataPermit(generation)
+    return vipSearchOptimize.checkWork(id, type, {
+      valid: permit.valid,
+      acquire: () => {
+        this.ensureRateSession(generation, Math.max(1, store.idList.length))
+        return permit.acquire()
+      },
+    })
+  }
+
   /** 许可前后验证抓取代数；当前抓取停止时收尾，后台故障仍由客户端重试。 */
-  private async waitForMetadataPermit(generation: CrawlGeneration) {
+  protected async waitForMetadataPermit(generation: CrawlGeneration) {
     if (!ownsCrawl(generation)) return false
     if (states.stopCrawl) {
       this.crawlFinished(generation)

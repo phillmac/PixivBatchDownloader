@@ -1,3 +1,5 @@
+import { CrawlRateClient, CrawlMetadataPermit } from '../crawl/CrawlRateClient'
+import { store } from '../store/Store'
 import { EVT } from '../EVT'
 import { CrawlGeneration, ownsCrawl } from '../crawl/CrawlGeneration'
 import { Utils } from '../utils/Utils'
@@ -89,11 +91,17 @@ class MergeNovel {
   private readonly limit = 30
   private last = 0
   private slowMode = false
+  /** 父抓取许可；嵌套合并不能自行登记。 */
+  private parentPermit?: CrawlMetadataPermit
+  /** 独立合并持有的会话，所有终态都需要关闭。 */
+  private rateClient?: CrawlRateClient
   /** Parent crawl lease. Direct/manual merges do not carry one. */
   private crawlGeneration?: CrawlGeneration
   /** A revoked parent crawl may finish network I/O but cannot publish side effects. */
   private isCancelled = () =>
-    this.crawlGeneration !== undefined && !ownsCrawl(this.crawlGeneration)
+    (this.parentPermit !== undefined && !this.parentPermit.valid()) ||
+    (this.crawlGeneration !== undefined &&
+      (!ownsCrawl(this.crawlGeneration) || states.stopCrawl))
   /** Asset download cancellation combines normal download stop and crawl revocation. */
   private assetCancelled = () =>
     downloadNovelEmbeddedImage.stop || this.isCancelled()
@@ -127,48 +135,66 @@ class MergeNovel {
     seriesId: string | number,
     seriesTitle?: string,
     slowMode: boolean = false,
-    generation?: CrawlGeneration
+    generation?: CrawlGeneration,
+    permit?: CrawlMetadataPermit
   ): Promise<number> {
     if (!seriesId) {
       toast.error(`seriesId is undefined`)
       return 0
     }
 
+    this.parentPermit = permit
     this.crawlGeneration = generation
     if (this.isCancelled()) return 0
 
-    const link = this.initMergeContext(seriesId, seriesTitle, slowMode)
-    const canMerge = await this.checkCanMergeSeries(seriesTitle, link)
-    if (this.isCancelled() || !canMerge) return 0
+    try {
+      const link = this.initMergeContext(seriesId, seriesTitle, slowMode)
+      const canMerge = await this.checkCanMergeSeries(seriesTitle, link)
+      if (this.isCancelled() || !canMerge) return 0
 
-    this.logMergeStart(link)
-    this.closeSettingsPanelOnSeriesPage()
+      this.logMergeStart(link)
+      this.closeSettingsPanelOnSeriesPage()
 
-    const gotNovelIds = await this.tryGetNovelIds(link)
-    if (this.isCancelled() || !gotNovelIds) return 0
+      const gotNovelIds = await this.tryGetNovelIds(link)
+      if (this.isCancelled() || !gotNovelIds) return 0
 
-    this.enableSlowModeIfNeeded()
-    await this.getAllNovelData()
-    if (this.isCancelled()) return 0
-    await this.loadGlossaryData(seriesId)
-    if (this.isCancelled()) return 0
-    const body = await this.loadSeriesData()
-    if (this.isCancelled() || !body) return 0
+      // 每次实际展开只预留一次；缓存小说也计入保守预算。
+      this.parentPermit?.addWorkCount?.(this.novelIdList.length)
+      if (!this.parentPermit && this.novelIdList.length > 0) {
+        if (generation !== undefined)
+          throw new Error('Missing parent metadata permit')
+        this.rateClient = new CrawlRateClient(
+          `merge-novel:${crypto.randomUUID()}`,
+          store.loggedUserID || Tools.getLoggedUserID(),
+          this.novelIdList.length
+        )
+      }
+      this.enableSlowModeIfNeeded()
+      await this.getAllNovelData()
+      if (this.isCancelled()) return 0
+      await this.loadGlossaryData(seriesId)
+      if (this.isCancelled()) return 0
+      const body = await this.loadSeriesData()
+      if (this.isCancelled() || !body) return 0
 
-    this.novelName = mergeNovelFileName.getName(
-      this.seriesData!,
-      this.seriesBookmarkCount
-    )
-    await this.mergeByFormat(body)
-    if (this.isCancelled()) return 0
-    await this.downloadSeriesCoverFile(body.cover.urls.original)
-    if (this.isCancelled()) return 0
+      this.novelName = mergeNovelFileName.getName(
+        this.seriesData!,
+        this.seriesBookmarkCount
+      )
+      await this.mergeByFormat(body)
+      if (this.isCancelled()) return 0
+      await this.downloadSeriesCoverFile(body.cover.urls.original)
+      if (this.isCancelled()) return 0
 
-    this.logMergeFinished(link)
-    await this.saveMergedNovelDownloadRecords()
-    if (this.isCancelled()) return 0
-    this.scheduleReset()
-    return this.allNovelData.length
+      this.logMergeFinished(link)
+      await this.saveMergedNovelDownloadRecords()
+      if (this.isCancelled()) return 0
+      this.scheduleReset()
+      return this.allNovelData.length
+    } finally {
+      this.rateClient?.finish()
+      this.rateClient = undefined
+    }
   }
 
   /** 初始化这次合并任务使用的上下文数据，并返回系列链接。 */
@@ -1066,11 +1092,16 @@ class MergeNovel {
       // 另外获取设定资料时也有可能需要发送多个请求，但并不总是需要多次请求，所以获取设定资料时没有添加等待时间
       await this.sleep(this.crawlInterval)
       if (this.isCancelled()) return null
+      const permitted = this.parentPermit
+        ? await this.parentPermit.acquire()
+        : await this.rateClient?.permit(() => !this.isCancelled())
+      if (!permitted || this.isCancelled()) return null
       data = await API.getNovelData(id)
       if (this.isCancelled()) return null
       cacheWorkData.set(data)
       return data
     } catch (error: Error | any) {
+      if (this.isCancelled()) return null
       // 请求小说的数据出错时跳过它，不重试（通常是 404 错误，没有必要重试）
       log.error('⏩' + lang.transl('_跳过这个小说'))
       return null
