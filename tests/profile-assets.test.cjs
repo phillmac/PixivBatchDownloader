@@ -7,6 +7,7 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
+/** Load ProfileAssets.ts with isolated test doubles for Pixiv/API helpers. */
 function loadModule(
   profile,
   {
@@ -44,6 +45,7 @@ function loadModule(
   return exports
 }
 
+/** Build a successful Pixiv user-profile API response fixture. */
 function profile(body) {
   return { error: false, message: '', body }
 }
