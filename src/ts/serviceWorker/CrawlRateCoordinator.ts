@@ -3,6 +3,7 @@ import {
   CRAWL_RATE_PORT,
   CrawlRateState,
   registerCrawl,
+  snapshotCrawl,
   finishCrawl,
   permitCrawl,
   UNKNOWN_ACCOUNT,
@@ -91,6 +92,8 @@ browser.runtime.onConnect.addListener((port) => {
       }
       if (state.sessions[id]?.tabId !== tabId)
         throw new Error('Crawl session ownership lost')
+      if (msg.action === 'status')
+        return { snapshot: snapshotCrawl(state, id, tabId, Date.now()) }
       if (msg.action === 'finish') {
         finishCrawl(state, id)
         return { granted: true }

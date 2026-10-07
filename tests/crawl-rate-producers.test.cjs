@@ -14,6 +14,7 @@ function load(file, dependencies = {}, globals = {}) {
   }).outputText
   vm.runInNewContext(`(function(require,exports){${code}\n})`, {
     console,
+    performance,
     setTimeout,
     clearTimeout,
     crypto,

@@ -7,7 +7,7 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function harness(controller, durable) {
+function harness(controller, durable, telemetry = async () => null) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
   const store = { URLWhenCrawlStart: location.href, idList: [] }
   const states = {
@@ -60,6 +60,13 @@ function harness(controller, durable) {
   }
   const window = {
     location,
+    removeEventListener(name, callback) {
+      const callbacks = listeners.get(name) || []
+      listeners.set(
+        name,
+        callbacks.filter((item) => item !== callback)
+      )
+    },
     addEventListener(name, callback) {
       const callbacks = listeners.get(name) || []
       callbacks.push(callback)
@@ -114,6 +121,8 @@ function harness(controller, durable) {
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })((name) => {
+    if (name === '../crawl/CrawlRateClient')
+      return { getCrawlRateTelemetry: telemetry }
     if (name === './ManagedCrawlAutomation') return managed
     if (name === './DownloadDiagnostics')
       return { downloadDiagnostics: diagnostics }
@@ -904,6 +913,13 @@ function createResumeHarness(options = {}) {
   }
   const window = {
     location,
+    removeEventListener(name, callback) {
+      const callbacks = listeners.get(name) || []
+      listeners.set(
+        name,
+        callbacks.filter((item) => item !== callback)
+      )
+    },
     addEventListener(name, callback) {
       const callbacks = listeners.get(name) || []
       callbacks.push(callback)
@@ -2049,6 +2065,7 @@ test('MergeNovel stops publishing crawl-owned files after generation revocation'
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })((name) => {
+    if (name === '../store/States') return { states: { stopCrawl: false } }
     if (name === '../crawl/CrawlGeneration')
       return { ownsCrawl: (generation) => generation === activeGeneration }
     if (name === './SendDownload')
@@ -2107,6 +2124,7 @@ function crawlHarness() {
   const h = harness({ busy: false, resultLength: 0 }, null)
   h.context.window.setTimeout = setTimeout
   h.context.window.clearTimeout = clearTimeout
+  h.context.crypto = require('node:crypto')
   h.context.location = { pathname: '/en/users/1/requests' }
   h.EVT.list = new Proxy(h.EVT.list, { get: (obj, key) => obj[key] || key })
   h.EVT.bindOnce = () => {}
@@ -2132,6 +2150,16 @@ function crawlHarness() {
   }
   const log = new Proxy({}, { get: () => noop })
   const modules = {
+    './CrawlRateClient': {
+      CrawlRateClient: class {
+        updateWorkCount() {}
+        addWorkCount() {}
+        async permit(valid) {
+          return valid()
+        }
+        finish() {}
+      },
+    },
     '../crawl/CrawlGeneration': h.generation,
     './CrawlGeneration': h.generation,
     '../download/ManagedCrawlAutomation': h.managed,
@@ -2202,6 +2230,7 @@ function crawlHarness() {
       : null
     h.fire('crawlStart')
     worker.generation = h.generation.currentCrawl()
+    worker.ensureRateSession(worker.generation, 1)
     worker.finishedRequest = 0
     worker.ajaxThread = 1
     worker.crawlFinishBecauseStopCrawl = false
@@ -2636,4 +2665,42 @@ test('managed ID export remains non-destructive and never marks metadata complet
   assert.equal(h.managed.getManagedCrawl().state, 'skipped-id-list')
   assert.equal(h.complete(), 0)
   assert.deepEqual(h.discardCalls, [])
+})
+
+test('automation status includes optional compact crawl telemetry and fails soft', async () => {
+  const inactive = harness({}, null)
+  assert.equal((await inactive.exports.getAutomationStatus()).crawlRate, null)
+  const telemetry = {
+    coordinatorAvailable: true,
+    policy: { mode: 'paced' },
+    runtime: { permits: 2 },
+  }
+  const active = harness({}, null, async () => telemetry)
+  const status = await active.exports.getAutomationStatus()
+  assert.equal(status.crawlRate, telemetry)
+  assert.equal(status.schemaVersion, 1)
+  assert.equal(status.phase, 'IDLE')
+  for (const lookup of [
+    async () => {
+      throw new Error('unavailable')
+    },
+    () => {
+      throw new Error('sync failure')
+    },
+  ]) {
+    const failed = harness({}, null, lookup)
+    assert.equal((await failed.exports.getAutomationStatus()).crawlRate, null)
+  }
+})
+
+test('automation telemetry lookup receives the current managed operation identity', async () => {
+  let selected
+  const h = harness({}, null, async (operationId) => {
+    selected = operationId
+    return null
+  })
+  const arm = h.managed.armManagedCrawl(h.context.window.location.href)
+  h.fire('crawlStart')
+  await h.exports.getAutomationStatus()
+  assert.equal(selected, arm.operationId)
 })

@@ -13,6 +13,7 @@ function load(file, dependencies = {}, globals = {}) {
   }).outputText
   vm.runInNewContext(`(function(require,exports){${code}\n})`, {
     console,
+    performance,
     setTimeout,
     clearTimeout,
     ...globals,
@@ -343,6 +344,15 @@ test('coordinator serializes, persists restart, rejects storage failure and clea
   ])
   assert.equal(replies.filter((r) => r.granted).length, 1)
   assert.equal(disk.ppbdCrawlRateV1.sessions.a.account, policy.UNKNOWN_ACCOUNT)
+  const persistedBeforeStatus = JSON.stringify(disk.ppbdCrawlRateV1)
+  const snapshotReply = await send(1, 'status', 'a')
+  assert.equal(snapshotReply.snapshot.activeCrawls, 2)
+  assert.equal(snapshotReply.snapshot.pacedCrawls, 2)
+  assert.equal(snapshotReply.snapshot.waitingCrawls, 1)
+  assert.equal(snapshotReply.snapshot.policy.workCount, 51)
+  assert.equal(snapshotReply.snapshot.policy.reason, 'work-count-threshold')
+  assert.equal(JSON.stringify(disk.ppbdCrawlRateV1), persistedBeforeStatus)
+  assert.ok((await send(2, 'status', 'a')).error)
   restart()
   assert.equal((await send(2, 'permit', 'b')).granted, false)
   now += 1800
@@ -606,4 +616,286 @@ test('direct metadata worker entry creates one rate session before imported work
   manual.startGetWorksData()
   assert.equal(clients.length, 2)
   assert.equal(clients[1].args[2], 75)
+})
+
+test('client aggregates timing, selects main identity and handles telemetry failures', async () => {
+  let now = 0,
+    denied = false,
+    failure = false
+  const s = state()
+  const browser = {
+    runtime: {
+      connect() {
+        let receive
+        return {
+          onMessage: {
+            addListener(fn) {
+              receive = fn
+            },
+          },
+          onDisconnect: { addListener() {} },
+          disconnect() {},
+          postMessage(msg) {
+            let reply = { granted: true }
+            if (msg.action === 'register')
+              policy.registerCrawl(
+                s,
+                msg.id,
+                msg.account,
+                1,
+                msg.workCount,
+                now
+              )
+            if (msg.action === 'status')
+              reply = failure
+                ? { error: 'unavailable' }
+                : { snapshot: policy.snapshotCrawl(s, msg.id, 1, now) }
+            if (msg.action === 'permit' && denied) {
+              reply = { granted: false, retryAfterMs: 200 }
+              denied = false
+            }
+            queueMicrotask(() => receive({ ...reply, request: msg.request }))
+          },
+        }
+      },
+    },
+  }
+  const exports = load(
+    'src/ts/crawl/CrawlRateClient.ts',
+    {
+      'webextension-polyfill': { default: browser },
+      './CrawlRatePolicy': policy,
+      '../utils/Utils': {
+        Utils: {
+          async sleep(ms) {
+            now += ms
+          },
+        },
+      },
+    },
+    {
+      crypto: require('node:crypto'),
+      queueMicrotask,
+      performance: { now: () => now },
+    }
+  )
+  const maintenance = new exports.CrawlRateClient('bookmark:x', '123', 1)
+  const manual = new exports.CrawlRateClient('manual:x', '123', 1, 'main')
+  const managed = new exports.CrawlRateClient('operation:x', '123', 51, 'main')
+  await manual.permit(() => true)
+  denied = true
+  await manual.permit(() => true)
+  let status = await exports.getCrawlRateTelemetry()
+  assert.equal(status.policy.workCount, 1)
+  assert.equal(status.runtime.permits, 2)
+  assert.equal(status.runtime.waitedPermits, 1)
+  assert.equal(status.runtime.maxPermitWaitMs, 200)
+  assert.equal(status.runtime.meanPermitWaitMs, 100)
+  assert.equal(
+    (await exports.getCrawlRateTelemetry('operation')).policy.workCount,
+    51
+  )
+  failure = true
+  assert.equal(
+    (await exports.getCrawlRateTelemetry('operation')).coordinatorAvailable,
+    false
+  )
+  for (const client of [maintenance, manual, managed]) client.finish()
+  assert.equal(await exports.getCrawlRateTelemetry(), null)
+})
+
+test('telemetry persists monotonic counts and stable safety reasons', () => {
+  let s = state()
+  policy.registerCrawl(s, 'a', '123', 1, 50, 0)
+  assert.equal(s.sessions.a.reason, 'sole-fast-crawl')
+  policy.registerCrawl(s, 'b', '123', 2, 2, 0)
+  assert.equal(s.sessions.a.reason, 'concurrent-crawl')
+  policy.registerCrawl(s, 'a', '123', 1, 51, 1)
+  policy.registerCrawl(s, 'a', '123', 1, 1, 2)
+  s = policy.readCrawlRateState(JSON.parse(JSON.stringify(s)), 2)
+  assert.equal(s.sessions.a.workCount, 51)
+  assert.equal(s.sessions.a.reason, 'work-count-threshold')
+  policy.finishCrawl(s, 'b')
+  assert.equal(policy.snapshotCrawl(s, 'a', 1, 3).policy.mode, 'paced')
+  assert.equal(s.sessions.a.reason, 'work-count-threshold')
+  const fast = state()
+  policy.registerCrawl(fast, 'a', '123', 1, 1, 0)
+  for (let i = 0; i < 100; i++)
+    assert.equal(policy.permitCrawl(fast, 'a', i).granted, true)
+  assert.equal(policy.permitCrawl(fast, 'a', 100).granted, false)
+  assert.equal(fast.sessions.a.reason, 'fast-allowance-exhausted')
+  policy.registerCrawl(fast, 'b', '123', 2, 1, 100)
+  assert.equal(fast.sessions.a.reason, 'fast-allowance-exhausted')
+  policy.finishCrawl(fast, 'a')
+  policy.finishCrawl(fast, 'b')
+  policy.registerCrawl(fast, 'recent', '123', 1, 1, 100)
+  assert.equal(fast.sessions.recent.reason, 'recent-account-activity')
+})
+
+test('legacy missing telemetry cannot restore fast eligibility', () => {
+  for (const missing of ['workCount', 'reason', 'both']) {
+    const s = state()
+    policy.registerCrawl(s, 'old', '123', 1, 40, 0)
+    if (missing !== 'reason') delete s.sessions.old.workCount
+    if (missing !== 'workCount') delete s.sessions.old.reason
+    const restored = policy.readCrawlRateState(s, 0)
+    assert.equal(restored.sessions.old.paced, true)
+    assert.ok(Number.isFinite(restored.sessions.old.workCount))
+    policy.registerCrawl(restored, 'old', '123', 1, 1, 0)
+    assert.equal(restored.sessions.old.paced, true)
+  }
+})
+
+test('snapshot expires waiters, verifies ownership, and never changes permits or TTL', () => {
+  const s = state()
+  policy.registerCrawl(s, 'a', '123', 1, 51, 0)
+  policy.registerCrawl(s, 'b', '123', 2, 1, 0)
+  policy.registerCrawl(s, 'other', '456', 3, 1, 0)
+  policy.permitCrawl(s, 'a', 0)
+  policy.permitCrawl(s, 'b', 1)
+  s.sessions.b.expiresAt = 100
+  const before = JSON.stringify(s)
+  const snapshot = policy.snapshotCrawl(s, 'a', 1, 50)
+  assert.equal(snapshot.activeCrawls, 2)
+  assert.equal(snapshot.pacedCrawls, 2)
+  assert.equal(snapshot.waitingCrawls, 1)
+  assert.equal(JSON.stringify(s), before)
+  assert.doesNotMatch(
+    JSON.stringify(snapshot),
+    /"tabId"|"sessions"|"expiresAt"/
+  )
+  assert.throws(() => policy.snapshotCrawl(s, 'a', 2, 50))
+  const expired = policy.snapshotCrawl(s, 'a', 1, 100)
+  assert.equal(expired.activeCrawls, 1)
+  assert.equal(expired.waitingCrawls, 0)
+  assert.equal(s.sessions.a.expiresAt, policy.SESSION_TTL_MS)
+  assert.throws(() => policy.snapshotCrawl(s, 'a', 1, policy.SESSION_TTL_MS))
+})
+
+function telemetryClientHarness() {
+  let now = 0
+  let deny = false
+  let fail = false
+  const s = state()
+  const messages = []
+  const browser = {
+    runtime: {
+      connect() {
+        let receive
+        return {
+          onMessage: {
+            addListener(fn) {
+              receive = fn
+            },
+          },
+          onDisconnect: { addListener() {} },
+          disconnect() {},
+          postMessage(msg) {
+            messages.push(msg)
+            let reply = { granted: true }
+            if (msg.action === 'register')
+              policy.registerCrawl(
+                s,
+                msg.id,
+                msg.account,
+                1,
+                msg.workCount,
+                now
+              )
+            if (msg.action === 'finish') policy.finishCrawl(s, msg.id)
+            if (msg.action === 'status')
+              reply = fail
+                ? { error: 'unavailable' }
+                : { snapshot: policy.snapshotCrawl(s, msg.id, 1, now) }
+            if (msg.action === 'permit') {
+              now += 5
+              reply = { granted: !deny, retryAfterMs: 100 }
+              deny = false
+            }
+            queueMicrotask(() => receive({ ...reply, request: msg.request }))
+          },
+        }
+      },
+    },
+  }
+  const exports = load(
+    'src/ts/crawl/CrawlRateClient.ts',
+    {
+      'webextension-polyfill': { default: browser },
+      './CrawlRatePolicy': policy,
+      '../utils/Utils': {
+        Utils: {
+          async sleep(ms) {
+            now += ms
+          },
+        },
+      },
+    },
+    {
+      crypto: require('node:crypto'),
+      queueMicrotask,
+      performance: { now: () => now },
+    }
+  )
+  return {
+    ...exports,
+    s,
+    messages,
+    deny() {
+      deny = true
+    },
+    fail() {
+      fail = true
+    },
+  }
+}
+
+test('client telemetry aggregates immediate and retried permit timing and fails soft', async () => {
+  const h = telemetryClientHarness()
+  const client = new h.CrawlRateClient('manual:random', '123', 40, 'main')
+  assert.equal(await client.permit(() => true), true)
+  let rate = await client.telemetry()
+  assert.equal(rate.runtime.permits, 1)
+  assert.equal(rate.runtime.waitedPermits, 0)
+  assert.equal(rate.runtime.meanPermitWaitMs, 5)
+  h.deny()
+  assert.equal(await client.permit(() => true), true)
+  rate = await client.telemetry()
+  assert.equal(rate.runtime.permits, 2)
+  assert.equal(rate.runtime.waitedPermits, 1)
+  assert.equal(rate.runtime.maxPermitWaitMs, 110)
+  assert.equal(rate.runtime.meanPermitWaitMs, 57.5)
+  assert.equal(rate.coordinatorAvailable, true)
+  h.fail()
+  rate = await client.telemetry()
+  assert.equal(rate.coordinatorAvailable, false)
+  assert.equal(rate.policy.reason, 'sole-fast-crawl')
+  assert.equal(rate.runtime.permits, 2)
+  assert.doesNotMatch(JSON.stringify(rate), /random/)
+  client.finish()
+  assert.equal(await h.getCrawlRateTelemetry(), null)
+  const fresh = new h.CrawlRateClient('manual:fresh', '123', 1, 'main')
+  assert.equal(await fresh.telemetry(), null)
+  fresh.finish()
+})
+
+test('primary telemetry selects managed and manual main clients ahead of maintenance', async () => {
+  const h = telemetryClientHarness()
+  const maintenance = new h.CrawlRateClient('bookmark:random', '123', 2)
+  const manual = new h.CrawlRateClient('manual:random', '123', 40, 'main')
+  const managed = new h.CrawlRateClient('operation:random', '456', 51, 'main')
+  assert.equal(
+    (await h.getCrawlRateTelemetry('operation')).policy.accountId,
+    '456'
+  )
+  assert.equal((await h.getCrawlRateTelemetry()).policy.workCount, 40)
+  manual.updateWorkCount(50)
+  manual.addWorkCount(2)
+  assert.equal((await h.getCrawlRateTelemetry()).policy.workCount, 52)
+  assert.equal(h.s.sessions['manual:random'].workCount, 52)
+  manual.finish()
+  assert.equal((await h.getCrawlRateTelemetry()).policy.accountId, '456')
+  managed.finish()
+  assert.equal((await h.getCrawlRateTelemetry()).policy.workCount, 2)
+  maintenance.finish()
 })
