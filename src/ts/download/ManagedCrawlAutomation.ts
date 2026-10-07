@@ -16,10 +16,13 @@ export type ManagedCrawlState =
   | 'aborted'
   | 'skipped-work-count'
   | 'skipped-id-list'
+/** 托管抓取的数据范围策略。 */
+export type ManagedCrawlMode = 'full' | 'incremental'
 /** 单次托管操作及绑定的抓取所有权。 */
 type ManagedOperation = {
   operationId: string
   url: string
+  mode: ManagedCrawlMode
   generation: CrawlGeneration | null
   state: ManagedCrawlState
   armedAt: string
@@ -47,10 +50,12 @@ function normalizeUrl(url: string) {
 function taskUrl() {
   return normalizeUrl(store.URLWhenCrawlStart || window.location.href)
 }
-/** 武装下一次匹配 URL 的真实抓取。 */
-export function armManagedCrawl(url: string) {
+/** 武装下一次匹配 URL 的真实抓取，并明确全量或增量语义。 */
+export function armManagedCrawl(url: string, mode: ManagedCrawlMode = 'full') {
   if (typeof url !== 'string' || !/^https:\/\/www\.pixiv\.net\//.test(url))
     throw new Error('expected an exact Pixiv URL')
+  if (mode !== 'full' && mode !== 'incremental')
+    throw new Error('managed crawl mode must be full or incremental')
   const expectedUrl = normalizeUrl(url)
   if (normalizeUrl(window.location.href) !== expectedUrl)
     throw new Error('managed crawl URL does not match the live page')
@@ -61,6 +66,7 @@ export function armManagedCrawl(url: string) {
   armed = {
     operationId: `${Date.now()}-${++sequence}`,
     url: expectedUrl,
+    mode,
     generation: null,
     state: 'armed',
     armedAt: new Date().toISOString(),
@@ -77,6 +83,19 @@ export function getManagedCrawl() {
 /** 返回待消费武装的独立快照。 */
 export function getManagedCrawlArm() {
   return armed ? { ...armed } : null
+}
+/** 返回当前真实抓取持有的显式模式；非托管或非抓取阶段返回 null。 */
+export function getManagedCrawlMode() {
+  return operation?.state === 'crawling' && operation.url === taskUrl()
+    ? operation.mode
+    : null
+}
+/** 决定抓取阶段是否应用下载记录过滤；托管模式覆盖用户的持久设置。 */
+export function shouldFilterDownloadedWorks(settingEnabled: boolean) {
+  const mode = getManagedCrawlMode()
+  if (mode === 'full') return false
+  if (mode === 'incremental') return true
+  return settingEnabled
 }
 /** 终止的部分队列不允许下载，已完成队列保持可下载。 */
 export function managedCrawlBlocksDownload(

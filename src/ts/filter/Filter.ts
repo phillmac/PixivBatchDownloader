@@ -13,6 +13,7 @@ import { Utils } from '../utils/Utils'
 import { Tools } from '../Tools'
 import { showEnabledFilter } from './ShowEnabledFilter'
 import { workSelection } from '../WorkSelection'
+import { shouldFilterDownloadedWorks } from '../download/ManagedCrawlAutomation'
 
 /** 过滤选项，所有字段都是可选的 */
 export interface FilterOption {
@@ -1054,7 +1055,7 @@ class Filter {
     type: FilterOption['IDTypeString']
   ): Promise<boolean> {
     if (
-      !settings.DonotCrawlAlreadyDownloadedWorks ||
+      !shouldFilterDownloadedWorks(settings.DonotCrawlAlreadyDownloadedWorks) ||
       !id ||
       !type ||
       type === 'novelSeries'
