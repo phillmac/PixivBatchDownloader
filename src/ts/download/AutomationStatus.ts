@@ -1,4 +1,5 @@
 import { getCrawlRateTelemetry } from '../crawl/CrawlRateClient'
+import { getProfileAssetMetadata } from '../ProfileAssets'
 import {
   skipManagedCrawl,
   armManagedCrawl,
@@ -324,6 +325,34 @@ export async function getAutomationStatus() {
   }
 }
 
+/** 从当前用户主页 URL 读取自动化资源查询所绑定的用户 ID。 */
+function automationProfileUserId() {
+  const match = window.location.href.match(/\/users\/(\d+)/)
+  if (!match?.[1]) {
+    throw new Error(
+      'automation profile assets require a Pixiv user-profile page'
+    )
+  }
+  return match[1]
+}
+
+/** 返回当前用户主页的头像和背景资源元数据；不会下载文件。 */
+export async function getAutomationProfileAssets() {
+  const requestedUserId = automationProfileUserId()
+  const metadata = await getProfileAssetMetadata(requestedUserId)
+  const currentUserId = automationProfileUserId()
+  if (currentUserId !== requestedUserId) {
+    return getAutomationProfileAssets()
+  }
+
+  return {
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
+    page: { url: normalizeUrl(window.location.href) },
+    ...metadata,
+  }
+}
+
 /** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
 export function getAutomationCrawlIdList() {
   const currentUrl = normalizeUrl(window.location.href)
@@ -343,12 +372,14 @@ export function getAutomationCrawlIdList() {
 /** 在隔离世界暴露只读自动化查询函数。 */
 const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
+  __PBD_AUTOMATION_PROFILE_ASSETS__?: typeof getAutomationProfileAssets
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
   __PBD_AUTOMATION_ARM_CRAWL__?: typeof armManagedCrawl
   __PBD_AUTOMATION_ABORT_CRAWL__?: typeof abortManagedCrawl
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
+automationGlobal.__PBD_AUTOMATION_PROFILE_ASSETS__ = getAutomationProfileAssets
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
 automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl
