@@ -524,7 +524,8 @@ abstract class InitPageBase {
     const client = new CrawlRateClient(
       `${managed?.generation === generation ? managed.operationId : 'manual'}:${crypto.randomUUID()}`,
       store.loggedUserID || Tools.getLoggedUserID(),
-      Math.max(1, this.idListLength)
+      Math.max(1, this.idListLength),
+      'main'
     )
     this.rateSession?.client.finish()
     this.rateSession = { generation, client }

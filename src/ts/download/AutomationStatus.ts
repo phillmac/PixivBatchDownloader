@@ -1,3 +1,4 @@
+import { getCrawlRateTelemetry } from '../crawl/CrawlRateClient'
 import {
   skipManagedCrawl,
   armManagedCrawl,
@@ -243,6 +244,9 @@ window.addEventListener(EVT.list.resume, () => {
 export async function getAutomationStatus() {
   const requestedUrl = normalizeUrl(window.location.href)
   const durable = await resume.getSavedTaskStatus(requestedUrl)
+  const crawlRate = await Promise.resolve()
+    .then(() => getCrawlRateTelemetry(getManagedCrawl()?.operationId))
+    .catch(() => null)
   const currentUrl = normalizeUrl(window.location.href)
   if (currentUrl !== requestedUrl) {
     return getAutomationStatus()
@@ -309,6 +313,7 @@ export async function getAutomationStatus() {
     managedArm: getManagedCrawlArm(),
     requiresReload: managedCrawlRequiresReload(),
     crawlIdList,
+    crawlRate,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [
         key,

@@ -15,6 +15,10 @@ export interface CrawlRateSession {
   account: string
   tabId: number
   paced: boolean
+  /** 已知的最高作品数量；旧状态采用已开始请求数作为下界。 */
+  workCount: number
+  /** 首个安全原因，显式数量/额度原因可以提升优先级。 */
+  reason: string
   started: number
   expiresAt: number
 }
@@ -41,7 +45,9 @@ export function registerCrawl(
     const existing = state.sessions[id]
     if (existing.account !== account || existing.tabId !== tabId)
       throw new Error('Crawl session ownership mismatch')
-    existing.paced ||= workCount > FAST_TO_PACED_THRESHOLD
+    existing.workCount = Math.max(existing.workCount, workCount)
+    if (workCount > FAST_TO_PACED_THRESHOLD)
+      promoteCrawl(existing, 'work-count-threshold')
     existing.expiresAt = now + SESSION_TTL_MS
   } else {
     state.sessions[id] = {
@@ -51,6 +57,15 @@ export function registerCrawl(
         workCount > FAST_TO_PACED_THRESHOLD ||
         (state.nextAt[account] || 0) > now ||
         Object.values(state.sessions).some((s) => s.account === account),
+      workCount,
+      reason:
+        workCount > FAST_TO_PACED_THRESHOLD
+          ? 'work-count-threshold'
+          : Object.values(state.sessions).some((s) => s.account === account)
+            ? 'concurrent-crawl'
+            : (state.nextAt[account] || 0) > now
+              ? 'recent-account-activity'
+              : 'sole-fast-crawl',
       started: 0,
       expiresAt: now + SESSION_TTL_MS,
     }
@@ -60,7 +75,7 @@ export function registerCrawl(
     (session) => session.account === account
   )
   if (sessions.length > 1) {
-    for (const session of sessions) session.paced = true
+    for (const session of sessions) promoteCrawl(session, 'concurrent-crawl')
   }
 }
 /** 不预订未来许可；实际授予时持久化下一次最早启动时间。 */
@@ -69,7 +84,8 @@ export function permitCrawl(state: CrawlRateState, id: string, now: number) {
   const session = state.sessions[id]
   if (!session) throw new Error('Crawl session no longer active')
   session.expiresAt = now + SESSION_TTL_MS
-  if (session.started >= FAST_ALLOWANCE_WORKS) session.paced = true
+  if (session.started >= FAST_ALLOWANCE_WORKS)
+    promoteCrawl(session, 'fast-allowance-exhausted')
   const next = Math.max(
     state.nextAt[session.account] || 0,
     (state.lastAt[session.account] ?? -PACED_INTERVAL_MS) + PACED_INTERVAL_MS
@@ -134,6 +150,11 @@ export function readCrawlRateState(
       typeof entry.started !== 'number' ||
       !Number.isSafeInteger(entry.started) ||
       entry.started < 0 ||
+      (entry.workCount !== undefined &&
+        (typeof entry.workCount !== 'number' ||
+          !Number.isFinite(entry.workCount) ||
+          entry.workCount < 0)) ||
+      (entry.reason !== undefined && typeof entry.reason !== 'string') ||
       (entry.expiresAt !== undefined &&
         (typeof entry.expiresAt !== 'number' ||
           !Number.isFinite(entry.expiresAt)))
@@ -142,7 +163,16 @@ export function readCrawlRateState(
     sessions[id] = {
       account: entry.account,
       tabId: entry.tabId,
-      paced: entry.paced,
+      // 旧记录缺少遥测字段时无法证明快速资格，保守恢复为限速。
+      paced: entry.paced || entry.workCount === undefined || !entry.reason,
+      workCount:
+        typeof entry.workCount === 'number' ? entry.workCount : entry.started,
+      reason:
+        entry.workCount !== undefined &&
+        typeof entry.reason === 'string' &&
+        entry.reason
+          ? entry.reason
+          : 'legacy-state-unknown',
       started: entry.started,
       expiresAt:
         typeof entry.expiresAt === 'number'
@@ -179,3 +209,47 @@ function readTimes(value: unknown): Record<string, number> {
   }
   return result
 }
+
+/** 保持限速模式；显式数量/额度原因优先于并发和近期活动。 */
+function promoteCrawl(session: CrawlRateSession, reason: string) {
+  const explicit = (value: string) =>
+    value === 'work-count-threshold' || value === 'fast-allowance-exhausted'
+  if (
+    !session.paced ||
+    (!explicit(session.reason) &&
+      (explicit(reason) || reason === 'concurrent-crawl'))
+  )
+    session.reason = reason
+  session.paced = true
+}
+/** 只读会话和账号聚合；清理过期记录但不续期或预订许可。 */
+export function snapshotCrawl(
+  state: CrawlRateState,
+  id: string,
+  tabId: number,
+  now: number
+) {
+  expireCrawls(state, now)
+  const session = state.sessions[id]
+  if (!session || session.tabId !== tabId)
+    throw new Error('Crawl session ownership lost')
+  const sessions = Object.values(state.sessions).filter(
+    (s) => s.account === session.account
+  )
+  return {
+    policy: {
+      accountId: session.account,
+      workCount: session.workCount,
+      fastAllowanceWorks: FAST_ALLOWANCE_WORKS,
+      switchThresholdWorks: FAST_TO_PACED_THRESHOLD,
+      pacedIntervalMs: PACED_INTERVAL_MS,
+      mode: session.paced ? ('paced' as const) : ('fast' as const),
+      reason: session.reason,
+    },
+    activeCrawls: sessions.length,
+    pacedCrawls: sessions.filter((s) => s.paced).length,
+    waitingCrawls: state.waiting[session.account]?.length || 0,
+  }
+}
+/** 后台提供的权威精简快照。 */
+export type CrawlRateSnapshot = ReturnType<typeof snapshotCrawl>

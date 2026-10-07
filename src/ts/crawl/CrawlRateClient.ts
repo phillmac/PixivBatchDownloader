@@ -1,6 +1,7 @@
 import browser from 'webextension-polyfill'
 import {
   CRAWL_RATE_PORT,
+  CrawlRateSnapshot,
   FAST_TO_PACED_THRESHOLD,
   PACED_INTERVAL_MS,
 } from './CrawlRatePolicy'
@@ -8,6 +9,7 @@ import { Utils } from '../utils/Utils'
 
 /** Worker 返回的许可或失败。 */
 interface RateReply {
+  snapshot?: CrawlRateSnapshot
   granted?: boolean
   retryAfterMs?: number
   error?: string
@@ -21,10 +23,76 @@ export interface CrawlMetadataPermit {
   /** 检查父任务是否仍然有效。 */
   valid: () => boolean
 }
+/** 当前标签页存活的客户端；身份仅用于本地匹配。 */
+const clients = new Set<CrawlRateClient>()
+/** 优先匹配托管身份或手动主抓取，维护任务只作为独立任务回退。 */
+export async function getCrawlRateTelemetry(operationId?: string) {
+  const active = [...clients]
+  const primary = operationId
+    ? active.find((client) => client.matchesMain(operationId))
+    : active.find((client) => client.matchesMain('manual'))
+  const selected =
+    primary ||
+    active.find((client) => client.matchesMain('manual')) ||
+    active.find((client) => client.isMain()) ||
+    active[0]
+  return selected?.telemetry() ?? null
+}
 /** 捕获单次抓取身份，等待期间始终检查代数所有权。 */
 export class CrawlRateClient {
   /** 终态不可再次注册或请求许可。 */
   private closed = false
+  /** 本地许可计时聚合，不保留逐请求记录。 */
+  private permits = 0
+  /** 至少等待或重试一次的成功许可数。 */
+  private waitedPermits = 0
+  /** 成功许可累计等待毫秒数。 */
+  private totalPermitWaitMs = 0
+  /** 最大成功许可等待时间。 */
+  private maxPermitWaitMs = 0
+  /** 主抓取身份匹配，不对外公开随机 ID。 */
+  public matchesMain(prefix: string) {
+    return this.isMain() && this.id.startsWith(`${prefix}:`)
+  }
+  /** 主抓取角色由入口显式声明。 */
+  public isMain() {
+    return this.kind === 'main'
+  }
+  /** 最近一次权威快照；失败回退不推断账号并发或模式。 */
+  private lastSnapshot?: CrawlRateSnapshot
+  /** 查询失败不影响自动化状态或许可流程。 */
+  public async telemetry() {
+    if (this.closed) return null
+    let coordinatorAvailable = false
+    try {
+      let registration
+      do {
+        registration = this.registered
+        await registration
+      } while (registration !== this.registered)
+      const reply = await this.send('status')
+      if (!reply.snapshot) throw new Error('Missing crawl rate snapshot')
+      this.lastSnapshot = reply.snapshot
+      coordinatorAvailable = true
+    } catch {
+      // 仅复用此前后台返回的字段，绝不从本地客户端数量推断账号状态。
+    }
+    if (this.closed || !this.lastSnapshot) return null
+    const { policy, ...counts } = this.lastSnapshot
+    return {
+      coordinatorAvailable,
+      policy: { ...policy },
+      runtime: {
+        permits: this.permits,
+        waitedPermits: this.waitedPermits,
+        maxPermitWaitMs: this.maxPermitWaitMs,
+        meanPermitWaitMs: this.permits
+          ? this.totalPermitWaitMs / this.permits
+          : 0,
+        ...counts,
+      },
+    }
+  }
   /** 已登记的最高作品数量，后续只能提升。 */
   private workCount: number
   /** 同一会话的初始注册。 */
@@ -33,8 +101,10 @@ export class CrawlRateClient {
   constructor(
     private readonly id: string,
     private readonly account: string,
-    workCount: number
+    workCount: number,
+    private readonly kind: 'main' | 'maintenance' = 'maintenance'
   ) {
+    clients.add(this)
     this.workCount = Math.max(1, workCount)
     this.registered = this.send('register', {
       workCount: this.workCount,
@@ -99,6 +169,8 @@ export class CrawlRateClient {
   /** 等待实际许可；失去所有权后不能启动元数据请求。 */
   public async permit(valid: () => boolean): Promise<boolean> {
     if (this.closed || !valid()) return false
+    const enteredAt = performance.now()
+    let waited = false
     while (!this.closed && valid()) {
       try {
         let registration
@@ -109,11 +181,20 @@ export class CrawlRateClient {
         if (this.closed || !valid()) return false
         const reply = await this.send('permit')
         if (this.closed || !valid()) return false
-        if (reply.granted) return true
+        if (reply.granted) {
+          const waitMs = Math.max(0, performance.now() - enteredAt)
+          this.permits++
+          if (waited) this.waitedPermits++
+          this.totalPermitWaitMs += waitMs
+          this.maxPermitWaitMs = Math.max(this.maxPermitWaitMs, waitMs)
+          return true
+        }
+        waited = true
         await Utils.sleep(
           Math.max(100, reply.retryAfterMs || PACED_INTERVAL_MS)
         )
       } catch {
+        waited = true
         if (this.closed || !valid()) return false
         // 过期或 worker/存储故障后保守重登记，不能恢复快速额度。
         await Utils.sleep(PACED_INTERVAL_MS)
@@ -132,6 +213,7 @@ export class CrawlRateClient {
   public finish() {
     if (this.closed) return
     this.closed = true
+    clients.delete(this)
     void this.registered
       .then(() => this.send('finish'))
       .catch((error) =>
