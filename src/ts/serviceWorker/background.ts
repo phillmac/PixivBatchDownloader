@@ -1,3 +1,4 @@
+import { handleSettingPatch } from './SettingPersistence'
 import './CrawlRateCoordinator'
 import './ManageFollowing'
 import './CheckDownloadCount'
@@ -397,6 +398,8 @@ browser.runtime.onMessage.addListener(async function (
   sender: browser.Runtime.MessageSender
 ) {
   const tabId = sender.tab?.id
+  const settingPatch = handleSettingPatch(msg)
+  if (settingPatch) return settingPatch
 
   if (isDownloadDiagnosticMessage(msg)) {
     if (msg.msg === 'get_download_worker_diagnostics') {

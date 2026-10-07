@@ -47,6 +47,7 @@
 // 该模块监听了 browser.storage.onChanged 事件。当用户在任意标签页里修改设置之后，其他标签页都可以感知到变化，并根据 settingsAcrossDifferentTabs 设置决定是否同步这些变化
 
 import browser from 'webextension-polyfill'
+import { mergeSettingPatch, SETTING_PATCH_MESSAGE } from './SettingPersistence'
 import { EVT } from '../EVT'
 import { Utils } from '../utils/Utils'
 import { convertOldSettings } from './ConvertOldSettings'
@@ -61,11 +62,7 @@ import { Tools } from '../Tools'
 import { SendDownload } from '../download/SendDownload'
 
 export type OptionCategoryLevel1 =
-  | 'crawl'
-  | 'naming'
-  | 'download'
-  | 'enhance'
-  | 'general'
+  'crawl' | 'naming' | 'download' | 'enhance' | 'general'
 
 /** 保存每个可折叠区域的展开/折叠状态 */
 type ExpandedCards = {
@@ -176,6 +173,7 @@ export const defaultHotkeys: HotkeyMap = {
 }
 
 type SettingValue =
+  | CrawlNumberConfig
   | string
   | number
   | boolean
@@ -192,7 +190,7 @@ export interface SettingChangeData {
   value: SettingValue
 }
 
-type CrawlNumberConfig = {
+export type CrawlNumberConfig = {
   /**是否显示“抓取多少作品” */
   work: boolean
   /**是否显示“抓取多少页面” */
@@ -1195,8 +1193,36 @@ class Settings {
 
   private bindEvents() {
     // 当设置发生变化时进行本地存储
-    window.addEventListener(EVT.list.settingChange, () => {
-      if (!this.isApplyingSettingsFromOtherTab) {
+    window.addEventListener(EVT.list.settingChange, (ev: CustomEventInit) => {
+      if (!this.isApplyingSettingsFromOtherTab && this.settingsRestored) {
+        const { name, value } = ev.detail.data as SettingChangeData
+        const patch: Record<string, unknown> = {
+          [name]:
+            name === 'crawlNumber' && this.writingCrawlPage !== undefined
+              ? {
+                  [this.writingCrawlPage]: Utils.deepCopy(
+                    this.settings.crawlNumber[this.writingCrawlPage]
+                  ),
+                }
+              : Utils.deepCopy(value),
+        }
+        // setter 中直接更新的派生设置也需要持久化。
+        const dependencies: Partial<Record<SettingKeys, SettingKeys[]>> = {
+          widthTag: ['widthTagBoolean'],
+          restrict: ['restrictBoolean'],
+          ratio: ['userSetChecked'],
+          ugoiraSaveAs: [
+            'ugoiraSaveAsWebM',
+            'ugoiraSaveAsWebP',
+            'ugoiraSaveAsGIF',
+            'ugoiraSaveAsAPNG',
+            'ugoiraSaveAsZIP',
+            'ugoiraSaveAsUgoira',
+          ],
+        }
+        for (const key of dependencies[name] || [])
+          patch[key] = Utils.deepCopy(this.settings[key])
+        this.pendingPatch = mergeSettingPatch(this.pendingPatch, patch)
         this.shouldFireSettingsStored ||= this.settingsRestored
         this.store()
       }
@@ -1322,21 +1348,92 @@ class Settings {
     })
   }
 
-  private store = Utils.debounce(() => {
-    const fireSettingsStoredEvent = this.shouldFireSettingsStored
-    this.shouldFireSettingsStored = false
+  /** UI 单页抓取限制更新的作用域。 */
+  private writingCrawlPage?: PageName
 
-    // browser.storage.local 的储存上限是 5 MiB（5242880 Byte）
-    browser.storage.local
-      .set({
-        [Config.settingStoreName]: this.settings,
+  /** UI 更新单个页面限制，保留其他标签页的独立页面配置。 */
+  public setCrawlNumberForPage(page: PageName, cfg: CrawlNumberConfig) {
+    this.writingCrawlPage = page
+    try {
+      this.setSetting('crawlNumber', {
+        ...this.settings.crawlNumber,
+        [page]: cfg,
       })
-      .then(() => {
-        if (fireSettingsStoredEvent) {
-          EVT.fire('settingsStored')
+    } finally {
+      this.writingCrawlPage = undefined
+    }
+  }
+
+  /** 尚未提交的本地变化；不能保存整个可能已过期的标签页副本。 */
+  private pendingPatch: Record<string, unknown> = {}
+
+  /** 等待当前标签页已提交的写入。 */
+  private persistence: Promise<void> = Promise.resolve()
+
+  /** 提交当前补丁；失败保留补丁，供下一次显式提交重试。 */
+  public flushSettings(): Promise<void> {
+    const result = this.persistence
+      .catch(() => undefined)
+      .then(async () => {
+        // 执行时取出补丁，失败重试与较新的排队写入才能按顺序合并。
+        const patch = this.pendingPatch
+        this.pendingPatch = {}
+        const fireSettingsStoredEvent = this.shouldFireSettingsStored
+        this.shouldFireSettingsStored = false
+        if (Object.keys(patch).length === 0) return
+        try {
+          await browser.runtime.sendMessage({
+            msg: SETTING_PATCH_MESSAGE,
+            patch,
+          })
+          if (fireSettingsStoredEvent) EVT.fire('settingsStored')
+        } catch (error) {
+          this.pendingPatch = mergeSettingPatch(patch, this.pendingPatch)
+          this.shouldFireSettingsStored ||= fireSettingsStoredEvent
+          throw error
         }
       })
+    this.persistence = result
+    return result
+  }
+
+  /** UI 设置保持原有的短延迟批量保存。 */
+  private store = Utils.debounce(() => {
+    void this.flushSettings().catch(console.error)
   }, 50)
+
+  /** 自动化必须等待初始化，避免默认值被误认为有效设置。 */
+  public isRestored() {
+    return this.settingsRestored
+  }
+
+  /** 自动化持久化单个控制，并通过正常 setter 通知当前标签页。 */
+  public async persistControl(
+    key: SettingKeys,
+    value: SettingValue,
+    crawlPage?: PageName
+  ) {
+    await this.flushSettings()
+    await browser.runtime.sendMessage({
+      msg: SETTING_PATCH_MESSAGE,
+      patch: { [key]: value },
+      crawlPage,
+    })
+    this.isApplyingSettingsFromOtherTab = true
+    try {
+      if (key === 'crawlNumber' && crawlPage !== undefined) {
+        this.setSetting(key, {
+          ...this.settings.crawlNumber,
+          [crawlPage]: value,
+        })
+      } else {
+        this.setSetting(key, value)
+      }
+    } finally {
+      this.isApplyingSettingsFromOtherTab = false
+    }
+    EVT.fire('settingsStored')
+  }
 
   // 接收整个设置项，通过循环将其更新到 settings 上
   // 循环设置而不是整个替换的原因：
@@ -1396,12 +1493,21 @@ class Settings {
         const settingKey = key as SettingKeys
         if (
           settingKey === 'settingsAcrossDifferentTabs' ||
-          !this.allSettingKeys.includes(settingKey) ||
-          this.isSameSettingValue(this.settings[settingKey], value)
-        ) {
+          !this.allSettingKeys.includes(settingKey)
+        )
           continue
-        }
-        this.setSetting(settingKey, value)
+        // 新安装/升级后的存储可能只有部分页面配置，不能丢失本地默认页面。
+        const pageMapKeys: SettingKeys[] = [
+          'crawlNumber',
+          'nameRuleForEachPageType',
+          'nameRuleForEachPageTypeForNovel',
+        ]
+        const nextValue = pageMapKeys.includes(settingKey)
+          ? { ...(this.settings[settingKey] as object), ...(value as object) }
+          : value
+        if (this.isSameSettingValue(this.settings[settingKey], nextValue))
+          continue
+        this.setSetting(settingKey, nextValue)
       }
     } finally {
       this.isApplyingSettingsFromOtherTab = false
@@ -1723,5 +1829,12 @@ const self = new Settings()
 const settings = self.settings
 const setSetting = self.setSetting.bind(self)
 const exportSettings = self.exportSettings.bind(self)
+/** 自动化设置接口使用的初始化与持久化操作。 */
+export const settingPersistence = {
+  isRestored: self.isRestored.bind(self),
+  flush: self.flushSettings.bind(self),
+  persistControl: self.persistControl.bind(self),
+  setCrawlNumberForPage: self.setCrawlNumberForPage.bind(self),
+}
 
 export { settings, setSetting, exportSettings, SettingKeys }
