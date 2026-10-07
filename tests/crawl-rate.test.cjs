@@ -245,7 +245,7 @@ test('storage validation initializes all fields and migrates legacy state safely
   ])
     assert.throws(() => policy.readCrawlRateState(broken, 0))
 })
-test('main path has one integration, preserves cache and existing slow fallback', () => {
+test('main path has one integration, preserves cache and coordinator-only metadata spacing', () => {
   const source = fs.readFileSync('src/ts/crawl/InitPageBase.ts', 'utf8')
   assert.doesNotMatch(source, /SharedCrawlRate|this\.crawlRate/)
   assert.equal(
@@ -254,7 +254,9 @@ test('main path has one integration, preserves cache and existing slow fallback'
     2
   )
   assert.match(source, /if \(!cacheWorkData.get\(id, 'novel'\)\)/)
-  assert.match(source, /Utils.sleep\(settings.slowCrawlDealy\)/)
+  assert.doesNotMatch(source, /Utils.sleep\(settings.slowCrawlDealy\)/)
+  assert.match(source, /states.slowCrawlMode = true/)
+  assert.match(source, /this.ajaxThread = 1/)
   assert.equal(
     (
       fs
