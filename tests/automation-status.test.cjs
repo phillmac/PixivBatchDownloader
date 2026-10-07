@@ -2017,6 +2017,38 @@ test('checkpoint does not recreate metadata deleted by another tab', async () =>
   assert.equal(h.putManyCalls.length, 0)
 })
 
+test('managed crawl mode explicitly overrides downloaded-record filtering', async () => {
+  const full = harness({ busy: false }, null)
+  const url = full.context.window.location.href
+  assert.equal(full.managed.shouldFilterDownloadedWorks(true), true)
+  const fullArm = full.context.__PBD_AUTOMATION_ARM_CRAWL__(url, 'full')
+  assert.equal(fullArm.mode, 'full')
+  assert.equal(full.managed.shouldFilterDownloadedWorks(true), true)
+  full.fire('crawlStart')
+  assert.equal(full.managed.getManagedCrawlMode(), 'full')
+  assert.equal(full.managed.shouldFilterDownloadedWorks(true), false)
+
+  const incremental = harness({ busy: false }, null)
+  const incrementalArm = incremental.context.__PBD_AUTOMATION_ARM_CRAWL__(
+    incremental.context.window.location.href,
+    'incremental'
+  )
+  assert.equal(incrementalArm.mode, 'incremental')
+  incremental.fire('crawlStart')
+  assert.equal(incremental.managed.getManagedCrawlMode(), 'incremental')
+  assert.equal(incremental.managed.shouldFilterDownloadedWorks(false), true)
+
+  const invalid = harness({ busy: false }, null)
+  assert.throws(
+    () =>
+      invalid.context.__PBD_AUTOMATION_ARM_CRAWL__(
+        invalid.context.window.location.href,
+        'partial'
+      ),
+    /mode must be full or incremental/
+  )
+})
+
 test('managed manual stop wins over late completion and result changes', async () => {
   const h = harness({ busy: false, resultLength: 3 }, null)
   let abortComplete = 0
