@@ -1,5 +1,10 @@
 import { getCrawlRateTelemetry } from '../crawl/CrawlRateClient'
 import {
+  configureKnownOverlap,
+  getKnownOverlapSnapshot,
+  startKnownOverlap,
+} from '../crawl/KnownOverlap'
+import {
   getProfileAssetMetadata,
   getProfileAssetPayload,
   ProfileAssetKind,
@@ -59,6 +64,7 @@ type CrawlDiscoverySnapshot = LifecycleObservation & {
   count: number
   items: AutomationIdEntry[]
   controls: CrawlControlSnapshot
+  knownOverlap: ReturnType<typeof getKnownOverlapSnapshot>
 }
 
 /** 公共过滤器运行后、详细元数据抓取前的作品 ID 列表。 */
@@ -157,6 +163,7 @@ function captureCrawlDiscovery() {
       onlyUndownloaded: settings.DonotCrawlAlreadyDownloadedWorks,
       downloadDeduplication: settings.deduplication,
     },
+    knownOverlap: getKnownOverlapSnapshot(taskUrl),
   }
 }
 
@@ -219,6 +226,21 @@ function captureCrawlIdList() {
   }
 }
 
+export function setAutomationKnownOverlap(
+  url: string,
+  ids: string[] | null,
+  requiredConsecutive = 3
+) {
+  if (states.busy) {
+    throw new Error('cannot configure known overlap while downloader is busy')
+  }
+  const currentUrl = normalizeUrl(window.location.href)
+  if (normalizeUrl(url) !== currentUrl) {
+    throw new Error('known overlap URL must match the current page')
+  }
+  return configureKnownOverlap(currentUrl, ids, requiredConsecutive)
+}
+
 /** 预设下一次正常抓取的作品 ID 数量门限；超过门限时会在元数据请求前停止。 */
 export function setAutomationCrawlIdGate(maxCount: number | null) {
   if (states.busy) {
@@ -238,6 +260,7 @@ export function setAutomationCrawlIdGate(maxCount: number | null) {
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
 window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe(window.location.href)
+  startKnownOverlap(lifecycle.crawlStarted.url)
   crawlDiscoverySnapshot = null
   crawlIdListSnapshot = null
   lifecycle.crawlCompleted = null
@@ -260,8 +283,15 @@ window.addEventListener(EVT.list.crawlEmpty, () => {
 })
 window.addEventListener(EVT.list.getIdListReadyForFilter, captureCrawlDiscovery)
 window.addEventListener(EVT.list.getIdListFinished, captureCrawlIdList)
+window.addEventListener(EVT.list.bookmarkModeStart, () => {
+  // Batch-bookmark operations do not emit crawlStart and must never inherit a
+  // managed crawl's active/armed overlap boundary.
+  configureKnownOverlap(window.location.href, null)
+})
 window.addEventListener(EVT.list.stopCrawl, () => {
   lifecycle.crawlStopped = observe(crawlTaskUrl())
+  // A canceled crawl must not leak its active overlap set into later actions.
+  configureKnownOverlap(crawlTaskUrl(), null)
   // 只复位由自动化门限持有的临时状态，避免干扰其他功能。
   if (ownsTransientExportIdList) {
     states.exportIDList = false
@@ -334,6 +364,14 @@ export async function getAutomationStatus() {
             downloadDeduplication:
               crawlDiscoverySnapshot.controls.downloadDeduplication,
           },
+          knownOverlap: crawlDiscoverySnapshot.knownOverlap
+            ? {
+                ...crawlDiscoverySnapshot.knownOverlap,
+                boundaryIds: [
+                  ...crawlDiscoverySnapshot.knownOverlap.boundaryIds,
+                ],
+              }
+            : null,
         }
       : null
   const crawlIdList =
@@ -379,6 +417,7 @@ export async function getAutomationStatus() {
     requiresReload: managedCrawlRequiresReload(),
     crawlDiscovery,
     crawlIdList,
+    knownOverlap: getKnownOverlapSnapshot(currentUrl),
     crawlRate,
     lifecycle: Object.fromEntries(
       Object.entries(lifecycle).map(([key, value]) => [
@@ -464,6 +503,12 @@ export function getAutomationCrawlDiscovery() {
       downloadDeduplication:
         crawlDiscoverySnapshot.controls.downloadDeduplication,
     },
+    knownOverlap: crawlDiscoverySnapshot.knownOverlap
+      ? {
+          ...crawlDiscoverySnapshot.knownOverlap,
+          boundaryIds: [...crawlDiscoverySnapshot.knownOverlap.boundaryIds],
+        }
+      : null,
     items: crawlDiscoverySnapshot.items.map((item) => ({ ...item })),
   }
 }
@@ -492,6 +537,7 @@ const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_CRAWL_DISCOVERY__?: typeof getAutomationCrawlDiscovery
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
+  __PBD_AUTOMATION_SET_KNOWN_OVERLAP__?: typeof setAutomationKnownOverlap
   __PBD_AUTOMATION_ARM_CRAWL__?: typeof armManagedCrawl
   __PBD_AUTOMATION_ABORT_CRAWL__?: typeof abortManagedCrawl
 }
@@ -503,5 +549,7 @@ automationGlobal.__PBD_AUTOMATION_CRAWL_DISCOVERY__ =
   getAutomationCrawlDiscovery
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
+automationGlobal.__PBD_AUTOMATION_SET_KNOWN_OVERLAP__ =
+  setAutomationKnownOverlap
 automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl
 automationGlobal.__PBD_AUTOMATION_ABORT_CRAWL__ = abortManagedCrawl

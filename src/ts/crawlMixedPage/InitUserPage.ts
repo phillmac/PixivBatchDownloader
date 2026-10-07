@@ -1,4 +1,5 @@
 import { beginCrawl, ownsCrawl } from '../crawl/CrawlGeneration'
+import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
 // 初始化用户页面
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -9,7 +10,7 @@ import { log } from '../Log'
 import { Tools } from '../Tools'
 import { userWorksType, tagPageFlag } from '../crawl/CrawlArgument'
 import { UserImageWorksWithTag, UserNovelsWithTag } from '../crawl/CrawlResult'
-import { WorkTypeString } from '../store/StoreType'
+import { IDData, WorkTypeString } from '../store/StoreType'
 import { states } from '../store/States'
 import '../pageFunciton/SaveAvatarIcon'
 import '../pageFunciton/SaveAvatarImage'
@@ -240,8 +241,19 @@ class InitUserPage extends InitPageBase {
     idList.splice(idList.length - offset, idList.length)
 
     // 删除超过 requsetNumber 的作品。删除前面的 id，也就是早期作品
-    if (idList.length > requsetNumber) {
+    const limitedBySetting = idList.length > requsetNumber
+    if (limitedBySetting) {
       idList.splice(0, idList.length - requsetNumber)
+    }
+
+    // 已知重叠按最新到最旧扫描；下载器内部仍保留原来的旧到新 ID 顺序。
+    // 用户主页同时混有图片与小说，两类 ID 并不是同一时间序列，因此只能过滤已知
+    // ID，不能用跨类型的连续 ID 作为提前终止边界。
+    const allowBoundary = this.listType !== ListType.UserHome
+    const overlap = consumeKnownOverlap([...idList].reverse(), allowBoundary)
+    idList = [...overlap.items].reverse()
+    if (!overlap.boundaryReached) {
+      finishKnownOverlap(limitedBySetting ? 'crawl-limit' : 'source-exhausted')
     }
 
     // 储存
@@ -283,6 +295,7 @@ class InitUserPage extends InitPageBase {
 
     // 循环请求作品，一次请求一页。假设用户的标签页面最大页数不会超过这个数字
     const maxRequest = 1000
+    let sourceScanned = 0
     for (const iterator of new Array(maxRequest)) {
       let data = await API.getUserWorksByTypeWithTag(
         Tools.getCurrentPageUserId(),
@@ -297,11 +310,12 @@ class InitUserPage extends InitPageBase {
         return this.getIdListFinished(generation)
       }
 
-      // 图片和小说返回的数据是不同的，小说没有 illustType 标记
+      // 图片和小说返回的数据是不同的，小说没有 illustType 标记。
+      const pageItems: IDData[] = []
       if (this.listType === ListType.Novels) {
         const d = data as UserNovelsWithTag
         d.body.works.forEach((data) =>
-          store.idList.push({
+          pageItems.push({
             type: 'novels',
             id: data.id,
           })
@@ -321,24 +335,32 @@ class InitUserPage extends InitPageBase {
               type = 'ugoira'
               break
           }
-          store.idList.push({
+          pageItems.push({
             type,
             id: data.id,
           })
         })
       }
 
+      sourceScanned += data.body.works.length
+      const overlap = consumeKnownOverlap(pageItems)
+      store.idList = store.idList.concat(overlap.items)
       offset += data.body.works.length
+      if (overlap.boundaryReached) {
+        return this.getIdListFinished(generation)
+      }
 
-      // 如果已经抓取到了预定的数量
-      // 或者 API 返回的作品数量不足一页的数量，则认为抓取完毕
-      if (
-        store.idList.length >= requsetNumber ||
-        data.body.works.length < this.onceNumber
-      ) {
+      // 有限抓取按源作品数计数，不能因为已知 ID 被过滤后继续越过用户的页数上限。
+      const sourceExhausted = data.body.works.length < this.onceNumber
+      const crawlLimitReached =
+        this.crawlNumber !== -1 && sourceScanned >= requsetNumber
+      if (sourceExhausted || crawlLimitReached) {
+        finishKnownOverlap(sourceExhausted ? 'source-exhausted' : 'crawl-limit')
         return this.getIdListFinished(generation)
       }
     }
+    finishKnownOverlap('crawl-limit')
+    this.getIdListFinished(generation)
   }
 
   protected resetGetIdListStatus() {
