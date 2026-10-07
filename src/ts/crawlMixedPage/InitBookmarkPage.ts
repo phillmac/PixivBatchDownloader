@@ -1,3 +1,4 @@
+import { registerAutomationCrawl } from '../download/AutomationCommandBindings'
 import { ownsCrawl } from '../crawl/CrawlGeneration'
 import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
 import { InitPageBase } from '../crawl/InitPageBase'
@@ -35,6 +36,7 @@ class InitBookmarkPage extends InitPageBase {
   constructor() {
     super()
     this.init()
+    registerAutomationCrawl(pageType.type, this.readyCrawl.bind(this))
   }
 
   /** 储存从列表页获取到的作品 id */

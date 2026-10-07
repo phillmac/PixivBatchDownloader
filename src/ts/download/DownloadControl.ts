@@ -1,3 +1,4 @@
+import { registerAutomationDownload } from './AutomationCommandBindings'
 import { managedCrawlBlocksDownload } from './ManagedCrawlAutomation'
 import browser from 'webextension-polyfill'
 import { EVT } from '../EVT'
@@ -38,6 +39,12 @@ class DownloadControl {
     this.createDownloadArea()
 
     this.bindEvents()
+    registerAutomationDownload({
+      start: () => this.startDownload(),
+      pause: () => this.pauseDownload(),
+      stop: () => this.stopDownload(),
+      prepared: () => this.automationPrepared,
+    })
 
     downloadDiagnostics.setPageStateProvider(() => ({
       taskBatch: this.taskBatch,
@@ -87,6 +94,9 @@ class DownloadControl {
     }
   }
 
+  /** readyDownload 的延迟准备结束前，自动化不能开始下载。 */
+  private automationPrepared = false
+
   private wrapper: HTMLDivElement = document.createElement('div')
 
   /**在插槽里添加的操作抓取结果的按钮 */
@@ -132,6 +142,7 @@ class DownloadControl {
 
   private bindEvents() {
     window.addEventListener(EVT.list.crawlStart, () => {
+      this.automationPrepared = false
       downloadDiagnostics.finishAll('crawl-start')
       this.hideResultBtns()
       this.hideDownloadArea()
@@ -152,6 +163,7 @@ class DownloadControl {
     ]) {
       window.addEventListener(ev, (ev) => {
         // 当恢复了未完成的抓取数据时，将下载状态设置为暂停
+        if (!states.busy) this.automationPrepared = false
         this.pause = ev.type === 'resume'
         //  resultChange 事件不需要打开下载面板，这是因为手动排除功能可能会频繁触发此事件，如果显示下载面板，那么会频繁打断用户的操作，影响用户体验。
         const openPanel = ev.type !== 'resultChange'
@@ -495,6 +507,7 @@ class DownloadControl {
     this.setDownloaded()
 
     this.setDownloadThread()
+    this.automationPrepared = true
 
     // 是否自动开始下载
 
@@ -560,6 +573,7 @@ class DownloadControl {
     this.setDownloaded()
 
     this.setDownloadThread()
+    this.automationPrepared = true
 
     EVT.fire('downloadStart')
 

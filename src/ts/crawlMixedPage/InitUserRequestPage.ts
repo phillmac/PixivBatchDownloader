@@ -1,3 +1,4 @@
+import { registerAutomationCrawl } from '../download/AutomationCommandBindings'
 import { beginCrawl, ownsCrawl } from '../crawl/CrawlGeneration'
 import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
 import { InitPageBase } from '../crawl/InitPageBase'
@@ -24,6 +25,7 @@ class InitUserRequestPage extends InitPageBase {
   constructor() {
     super()
     this.init()
+    registerAutomationCrawl(pageType.type, this.readyCrawl.bind(this))
   }
 
   private bookmarkAll = new BookmarkAllWorks()

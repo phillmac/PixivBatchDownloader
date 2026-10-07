@@ -1,3 +1,4 @@
+import { registerAutomationCrawl } from '../download/AutomationCommandBindings'
 import { beginCrawl, ownsCrawl } from '../crawl/CrawlGeneration'
 import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
 // 初始化用户页面
@@ -34,6 +35,7 @@ class InitUserPage extends InitPageBase {
   constructor() {
     super()
     this.init()
+    registerAutomationCrawl(pageType.type, this.readyCrawl.bind(this))
   }
 
   private listType: ListType = ListType.UserHome // 当前页面应该获取哪些类型的作品
