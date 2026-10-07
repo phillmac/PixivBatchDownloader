@@ -90,6 +90,7 @@ class MergeNovel {
   private allNovelData: NovelSummary[] = []
   private readonly limit = 30
   private last = 0
+  /** 系列级操作和资源下载使用的慢速模式；单篇元数据由共享协调器控制。 */
   private slowMode = false
   /** 父抓取许可；嵌套合并不能自行登记。 */
   private parentPermit?: CrawlMetadataPermit
@@ -111,9 +112,9 @@ class MergeNovel {
   private readonly br = '<br/>'
   private readonly br2 = '<br/><br/>'
 
-  // 由于每个系列里都可能含有多个小说和图片，所以下载器可能会发送很多请求。为了避免触发 Pixiv 的警告，下载器在合并时总是会添加间隔时间，以降低发送请求的频率。
+  // 系列级操作与资源下载保留安全间隔；单篇小说元数据的请求间隔由共享协调器统一控制。
 
-  /** 抓取时的间隔时间，最低为 2400 ms。这不会触发 429 错误 */
+  /** 系列列表、设定资料和系列数据使用的安全间隔，最低为 2400 ms。 */
   // 我尝试过更低的延迟时间，例如 2000, 没有触发 429 错误，但依然被警告了，所以增加到 2400
   private get crawlInterval() {
     return Math.max(2400, settings.slowCrawlDealy)
@@ -289,7 +290,7 @@ class MergeNovel {
 
   /** 当小说数量较多时，自动启用慢速抓取模式。 */
   private enableSlowModeIfNeeded() {
-    // 在获取每篇小说的数据之前，检查是否需要应用抓取间隔时间
+    // 根据小说数量启用系列级操作与资源下载的安全间隔
     if (
       !this.slowMode &&
       this.novelIdList.length > settings.slowCrawlOnWorksNumber
@@ -1088,9 +1089,7 @@ class MergeNovel {
     }
 
     try {
-      // 自动合并系列小说时，可能会连续不断的合并多个系列，这些系列可能包含非常多的小说，所以需要添加等待时间，以减小出现 429 错误的概率
-      // 另外获取设定资料时也有可能需要发送多个请求，但并不总是需要多次请求，所以获取设定资料时没有添加等待时间
-      await this.sleep(this.crawlInterval)
+      // 单篇小说元数据只使用父会话或独立会话的共享许可，不叠加系列级安全间隔
       if (this.isCancelled()) return null
       const permitted = this.parentPermit
         ? await this.parentPermit.acquire()

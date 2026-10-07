@@ -826,3 +826,61 @@ test('AutoMergeNovel duplicate waiters reuse success, zero and cancellation resu
     assert.equal(autoMergeNovel.successfulSeries.size, 0)
   }
 })
+
+// 按实际方法检查间隔归属，避免把系列级安全等待误当作元数据等待移除。
+test('coordinated metadata methods have no local sleeps; series safety pacing remains', () => {
+  function methods(file, className) {
+    const source = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true
+    )
+    const declaration = source.statements.find(
+      (node) => ts.isClassDeclaration(node) && node.name.text === className
+    )
+    return Object.fromEntries(
+      declaration.members
+        .filter((node) => node.name && node.body)
+        .map((node) => [node.name.getText(source), node.body.getText(source)])
+    )
+  }
+  const base = methods('src/ts/crawl/InitPageBase.ts', 'InitPageBase')
+  const bookmarks = methods(
+    'src/ts/pageFunciton/BookmarkAllWorks.ts',
+    'BookmarkAllWorks'
+  )
+  const merge = methods('src/ts/download/MergeNovel.ts', 'MergeNovel')
+  for (const body of [
+    base.afterGetWorksData,
+    bookmarks.getTagData,
+    merge.fetchNovelData,
+  ]) {
+    assert.doesNotMatch(body, /\bsleep\s*\(/)
+    assert.doesNotMatch(body, /slowCrawlDealy/)
+  }
+  assert.match(
+    base.getWorksData,
+    /await this.waitForMetadataPermit\(generation\)/
+  )
+  assert.match(bookmarks.getTagData, /await client.permit\(/)
+  assert.match(merge.fetchNovelData, /await this.parentPermit.acquire\(\)/)
+  assert.match(merge.fetchNovelData, /await this.rateClient\?\.permit\(/)
+  for (const name of ['tryGetNovelIds', 'loadSeriesData']) {
+    assert.match(merge[name], /await this.sleep\(this.crawlInterval\)/)
+  }
+  assert.ok(
+    merge.tryGetNovelIds.indexOf('await this.sleep(this.crawlInterval)') <
+      merge.tryGetNovelIds.indexOf('await this.getNovelIds()')
+  )
+  assert.ok(
+    merge.loadSeriesData.indexOf('await this.sleep(this.crawlInterval)') <
+      merge.loadSeriesData.indexOf('await API.getNovelSeriesData(')
+  )
+  assert.match(
+    merge.loadGlossaryData,
+    /getNovelGlossarys.getGlossarys\(\s*this.seriesId,\s*this.crawlInterval/
+  )
+  assert.match(merge.sleep, /if \(this.slowMode\)/)
+  assert.match(merge.sleep, /Utils.sleep\(time\)/)
+})

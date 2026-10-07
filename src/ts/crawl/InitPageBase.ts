@@ -782,7 +782,7 @@ abstract class InitPageBase {
     // 如果存在下一个作品，则继续抓取
     if (store.idList.length > 0) {
       // 如果下一个作品是小说，先检查缓存里是否有它的数据
-      // 如果有缓存数据就不需要添加间隔时间，因为小说会使用缓存的数据，不必发送请求
+      // 缓存小说不发送请求，也不需要申请元数据许可
       const nextIDData = store.idList[0]
       if (nextIDData && nextIDData.type === 'novels') {
         const cache = cacheWorkData.get(nextIDData.id, 'novel')
@@ -791,11 +791,7 @@ abstract class InitPageBase {
         }
       }
 
-      // 如果要实际发送请求，则根据慢速抓取设置，决定是否添加间隔时间
-      if (states.slowCrawlMode) {
-        await Utils.sleep(settings.slowCrawlDealy)
-        if (!ownsCrawl(generation)) return
-      }
+      // 未缓存作品的元数据请求间隔由共享协调器统一控制，getWorksData 会在请求前申请许可
       this.getWorksData(undefined, generation)
     } else {
       // 没有剩余作品，统计此后有多少个完成的请求

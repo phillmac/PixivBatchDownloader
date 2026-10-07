@@ -8,7 +8,6 @@ import { bookmark } from '../Bookmark'
 import { Tools } from '../Tools'
 import { msgBox } from '../MsgBox'
 import { settings } from '../setting/Settings'
-import { Utils } from '../utils/Utils'
 import { states } from '../store/States'
 import { store } from '../store/Store'
 
@@ -170,9 +169,7 @@ class BookmarkAllWorks {
             continue
           }
 
-          // 如果作品数量大于一定数量，则启用慢速抓取，以免在获取作品数据时发生 429 错误
-          const delay = this.idList.length >= 120 ? settings.slowCrawlDealy : 0
-          await Utils.sleep(delay)
+          // 作品元数据请求间隔由共享协调器统一控制，请求前申请许可
           if (!client || !(await client.permit(() => true))) return
           let data
           if (id.type === 'novels') {
