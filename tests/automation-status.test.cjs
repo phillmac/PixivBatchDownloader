@@ -47,6 +47,52 @@ function harness(
     deduplication: true,
   }
   const pageType = { type: 2 }
+  let knownOverlapSnapshot = null
+  let knownOverlapArm = null
+  const knownOverlap = {
+    configureKnownOverlap(url, ids, requiredConsecutive = 3) {
+      if (ids === null) {
+        knownOverlapArm = null
+        knownOverlapSnapshot = null
+        return { armed: false, knownCount: 0, requiredConsecutive }
+      }
+      knownOverlapArm = { url, ids: [...new Set(ids)], requiredConsecutive }
+      knownOverlapSnapshot = null
+      return {
+        armed: true,
+        url,
+        knownCount: knownOverlapArm.ids.length,
+        requiredConsecutive,
+      }
+    },
+    startKnownOverlap(url) {
+      if (!knownOverlapArm || knownOverlapArm.url !== url) return null
+      knownOverlapSnapshot = {
+        url,
+        knownCount: knownOverlapArm.ids.length,
+        requiredConsecutive: knownOverlapArm.requiredConsecutive,
+        scannedCount: 0,
+        unknownCount: 0,
+        knownSeenCount: 0,
+        currentConsecutive: 0,
+        boundaryReached: false,
+        boundaryIds: [],
+        stopReason: null,
+        armedAt: 'armed',
+        startedAt: 'started',
+        finishedAt: null,
+      }
+      return { ...knownOverlapSnapshot, boundaryIds: [] }
+    },
+    getKnownOverlapSnapshot(url) {
+      if (!knownOverlapSnapshot || (url && knownOverlapSnapshot.url !== url))
+        return null
+      return {
+        ...knownOverlapSnapshot,
+        boundaryIds: [...knownOverlapSnapshot.boundaryIds],
+      }
+    },
+  }
   const states = {
     busy: false,
     bookmarkMode: false,
@@ -85,6 +131,7 @@ function harness(
       crawlComplete: 'crawlComplete',
       crawlEmpty: 'crawlEmpty',
       stopCrawl: 'stopCrawl',
+      bookmarkModeStart: 'bookmarkModeStart',
       managedCrawlTerminal: 'managedCrawlTerminal',
       getIdListReadyForFilter: 'getIdListReadyForFilter',
       getIdListFinished: 'getIdListFinished',
@@ -161,6 +208,7 @@ function harness(
   })((name) => {
     if (name === '../crawl/CrawlRateClient')
       return { getCrawlRateTelemetry: telemetry }
+    if (name === '../crawl/KnownOverlap') return knownOverlap
     if (name === '../ProfileAssets')
       return {
         getProfileAssetMetadata: profileAssets,
@@ -187,6 +235,7 @@ function harness(
     settings,
     pageType,
     states,
+    knownOverlap,
     controller,
     discardCalls,
     fire(name, begin = true) {
@@ -439,7 +488,13 @@ test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async 
 
 test('crawl discovery stays pre-filter and records independent crawl controls', async () => {
   const h = harness(
-    { busy: true, downloading: false, pause: false, stop: false, resultLength: 0 },
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
     null
   )
   h.settings.crawlNumber[h.pageType.type].value = 1
@@ -471,6 +526,110 @@ test('crawl discovery stays pre-filter and records independent crawl controls', 
   ])
   discovery.items[0].id = 'mutated-return-value'
   assert.equal(h.exports.getAutomationCrawlDiscovery().items[0].id, '101')
+})
+
+test('known overlap can be armed for the current page and is exposed with discovery', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  const armed = h.exports.setAutomationKnownOverlap(
+    'https://www.pixiv.net/en/users/1',
+    ['101', '102', '102'],
+    3
+  )
+  assert.deepEqual(JSON.parse(JSON.stringify(armed)), {
+    armed: true,
+    url: 'https://www.pixiv.net/en/users/1',
+    knownCount: 2,
+    requiredConsecutive: 3,
+  })
+  assert.equal(
+    typeof h.context.__PBD_AUTOMATION_SET_KNOWN_OVERLAP__,
+    'function'
+  )
+
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '999', type: 'illusts' }]
+  h.fire('getIdListReadyForFilter')
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.knownOverlap.knownCount, 2)
+  assert.equal(status.knownOverlap.requiredConsecutive, 3)
+  assert.equal(status.crawlDiscovery.knownOverlap.knownCount, 2)
+
+  const discovery = h.exports.getAutomationCrawlDiscovery()
+  assert.equal(discovery.knownOverlap.knownCount, 2)
+  discovery.knownOverlap.boundaryIds.push('mutated')
+  assert.deepEqual(
+    Array.from(
+      h.exports.getAutomationCrawlDiscovery().knownOverlap.boundaryIds
+    ),
+    []
+  )
+})
+
+test('stop and bookmark mode clear active known-overlap state', async () => {
+  const h = harness(
+    {
+      busy: true,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  const url = 'https://www.pixiv.net/en/users/1'
+  h.exports.setAutomationKnownOverlap(url, ['101', '102', '103'], 3)
+  h.fire('crawlStart')
+  assert.ok((await h.exports.getAutomationStatus()).knownOverlap)
+  h.fire('stopCrawl')
+  assert.equal((await h.exports.getAutomationStatus()).knownOverlap, null)
+
+  h.states.busy = false
+  h.exports.setAutomationKnownOverlap(url, ['101', '102', '103'], 3)
+  h.fire('crawlStart')
+  assert.ok((await h.exports.getAutomationStatus()).knownOverlap)
+  h.fire('bookmarkModeStart')
+  assert.equal((await h.exports.getAutomationStatus()).knownOverlap, null)
+})
+
+test('known overlap rejects mismatched URLs and busy configuration', () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: false,
+      stop: false,
+      resultLength: 0,
+    },
+    null
+  )
+  assert.throws(
+    () =>
+      h.exports.setAutomationKnownOverlap(
+        'https://www.pixiv.net/en/users/2',
+        ['1'],
+        3
+      ),
+    /must match the current page/
+  )
+  h.states.busy = true
+  assert.throws(
+    () =>
+      h.exports.setAutomationKnownOverlap(
+        'https://www.pixiv.net/en/users/1',
+        ['1'],
+        3
+      ),
+    /downloader is busy/
+  )
 })
 
 test('pre-metadata ID list boundary exposes lightweight count and detached IDs', async () => {
@@ -2367,6 +2526,15 @@ function crawlHarness() {
     htmlToText: (x) => x,
     sleep: async () => {},
     splitArray: (a) => [a],
+    sortByProperty:
+      (key, order = 'desc') =>
+      (a, b) => {
+        const left = Number(a[key]) || 0
+        const right = Number(b[key]) || 0
+        if (right < left) return order === 'desc' ? -1 : 1
+        if (right > left) return order === 'desc' ? 1 : -1
+        return 0
+      },
   }
   const log = new Proxy({}, { get: () => noop })
   const modules = {
@@ -2426,6 +2594,8 @@ function crawlHarness() {
     )
     return exports
   }
+  const knownOverlap = load('crawl/KnownOverlap.ts')
+  modules['../crawl/KnownOverlap'] = knownOverlap
   // Keep the same Store object captured by automation; install production methods/defaults.
   const realStore = load('store/Store.ts').store
   Object.setPrototypeOf(h.store, Object.getPrototypeOf(realStore))
@@ -2463,6 +2633,7 @@ function crawlHarness() {
     API,
     filter,
     settings,
+    knownOverlap,
     load,
     start,
     complete: () => complete,
@@ -2531,6 +2702,196 @@ for (const replacement of ['new crawl', 'import']) {
     assert.equal(h.complete(), 0)
   })
 }
+
+test('mixed user overview preserves known IDs without using a cross-type boundary', async () => {
+  const h = crawlHarness()
+  const task = h.start(false)
+  const url = h.context.window.location.href
+  h.knownOverlap.configureKnownOverlap(url, ['100', '99', '98'], 3)
+  h.knownOverlap.startKnownOverlap(url)
+  h.API.getUserWorksByType = async () => [
+    { id: '100', type: 'illusts' },
+    { id: '99', type: 'manga' },
+    { id: '98', type: 'novels' },
+    { id: '50', type: 'novels' },
+  ]
+  const Class = h.load('crawlMixedPage/InitUserPage.ts').InitUserPage
+  const producer = Object.create(Class.prototype)
+  Object.assign(producer, {
+    generation: task.generation,
+    listType: 0,
+    onceNumber: 48,
+    crawlNumber: -1,
+  })
+  producer.checkUserId = async () => true
+  producer.getOffset = () => 0
+  producer.getRequsetNumber = () => 999
+  producer.getIdListFinished = () => {}
+  await producer.getIdList()
+
+  assert.deepEqual(
+    Array.from(h.store.idList, (item) => item.id),
+    ['50', '98', '99', '100']
+  )
+  const snapshot = h.knownOverlap.getKnownOverlapSnapshot(url)
+  assert.equal(snapshot.boundaryReached, false)
+  assert.equal(snapshot.stopReason, 'source-exhausted')
+  assert.equal(snapshot.knownSeenCount, 3)
+})
+
+test('tagged user crawl applies the overlap boundary before metadata', async () => {
+  const h = crawlHarness()
+  const task = h.start(false)
+  const url = h.context.window.location.href
+  h.knownOverlap.configureKnownOverlap(url, ['100', '99', '98'], 3)
+  h.knownOverlap.startKnownOverlap(url)
+  h.store.tag = 'tag'
+  h.API.getUserWorksByTypeWithTag = async () => ({
+    body: {
+      works: [
+        { id: '200', illustType: 0 },
+        { id: '100', illustType: 0 },
+        { id: '99', illustType: 0 },
+        { id: '98', illustType: 0 },
+        { id: '50', illustType: 0 },
+      ],
+    },
+  })
+  const Class = h.load('crawlMixedPage/InitUserPage.ts').InitUserPage
+  const producer = Object.create(Class.prototype)
+  let finished = 0
+  Object.assign(producer, {
+    generation: task.generation,
+    listType: 2,
+    onceNumber: 48,
+    crawlNumber: -1,
+  })
+  producer.getOffset = () => 0
+  producer.getRequsetNumber = () => 999
+  producer.getIdListFinished = () => {
+    finished++
+  }
+  await producer.getIdListByTag()
+
+  assert.equal(finished, 1)
+  assert.deepEqual(
+    Array.from(h.store.idList, (item) => item.id),
+    ['200', '100', '99', '98']
+  )
+  const snapshot = h.knownOverlap.getKnownOverlapSnapshot(url)
+  assert.equal(snapshot.boundaryReached, true)
+  assert.equal(snapshot.stopReason, 'known-overlap')
+  assert.deepEqual(Array.from(snapshot.boundaryIds), ['100', '99', '98'])
+})
+
+test('descending bookmarks process the boundary-completing work before stopping', async () => {
+  const h = crawlHarness()
+  const task = h.start(false)
+  const url = h.context.window.location.href
+  h.knownOverlap.configureKnownOverlap(url, ['100', '99', '98'], 3)
+  h.knownOverlap.startKnownOverlap(url)
+  h.API.getBookmarkData = async () => ({
+    body: {
+      works: ['200', '100', '99', '98', '50'].map((id) => ({
+        id,
+        aiType: 0,
+        isOriginal: false,
+        tags: [],
+        title: '',
+        bookmarkData: null,
+        createDate: '',
+        userId: '1',
+        xRestrict: 0,
+        illustType: 0,
+      })),
+    },
+  })
+  const Class = h.load('crawlMixedPage/InitBookmarkPage.ts').InitBookmarkPage
+  const producer = Object.create(Class.prototype)
+  const finished = deferred()
+  Object.assign(producer, {
+    generation: task.generation,
+    type: 'illusts',
+    idList: [],
+    offset: 0,
+    isHide: false,
+    order: 'desc',
+    mode: 'all',
+    work_tag: '',
+    bm: '',
+    requsetNumber: 5,
+    onceRequest: 100,
+    filteredNumber: 0,
+  })
+  producer.getIdListFinished = () => finished.resolve()
+  producer.getIdList()
+  await finished.promise
+
+  assert.deepEqual(
+    Array.from(h.store.idList, (item) => item.id),
+    ['200', '100', '99', '98']
+  )
+  const snapshot = h.knownOverlap.getKnownOverlapSnapshot(url)
+  assert.equal(snapshot.boundaryReached, true)
+  assert.deepEqual(Array.from(snapshot.boundaryIds), ['100', '99', '98'])
+})
+
+test('ascending bookmarks preserve known IDs and scan through them instead of early stopping', async () => {
+  const h = crawlHarness()
+  const task = h.start(false)
+  const url = h.context.window.location.href
+  h.knownOverlap.configureKnownOverlap(url, ['100', '99', '98'], 3)
+  h.knownOverlap.startKnownOverlap(url)
+  let calls = 0
+  h.API.getBookmarkData = async () => {
+    calls++
+    if (calls > 1) return { body: { works: [] } }
+    return {
+      body: {
+        works: ['100', '99', '98', '50'].map((id) => ({
+          id,
+          aiType: 0,
+          isOriginal: false,
+          tags: [],
+          title: '',
+          bookmarkData: null,
+          createDate: '',
+          userId: '1',
+          xRestrict: 0,
+          illustType: 0,
+        })),
+      },
+    }
+  }
+  const Class = h.load('crawlMixedPage/InitBookmarkPage.ts').InitBookmarkPage
+  const producer = Object.create(Class.prototype)
+  const finished = deferred()
+  Object.assign(producer, {
+    generation: task.generation,
+    type: 'illusts',
+    idList: [],
+    offset: 0,
+    isHide: false,
+    order: 'asc',
+    mode: 'all',
+    work_tag: '',
+    bm: '',
+    requsetNumber: 4,
+    onceRequest: 100,
+    filteredNumber: 0,
+  })
+  producer.getIdListFinished = () => finished.resolve()
+  producer.getIdList()
+  await finished.promise
+
+  assert.deepEqual(
+    Array.from(h.store.idList, (item) => item.id),
+    ['100', '99', '98', '50']
+  )
+  const snapshot = h.knownOverlap.getKnownOverlapSnapshot(url)
+  assert.equal(snapshot.boundaryReached, false)
+  assert.equal(snapshot.stopReason, 'source-exhausted')
+})
 
 for (const filename of [
   'InitUserPage',

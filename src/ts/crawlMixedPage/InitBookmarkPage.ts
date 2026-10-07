@@ -1,9 +1,14 @@
 import { ownsCrawl } from '../crawl/CrawlGeneration'
+import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
 import { InitPageBase } from '../crawl/InitPageBase'
 import { API } from '../API'
 import { lang } from '../Language'
 import { IDData } from '../store/StoreType'
-import { ArtworkCommonData, BookmarkData } from '../crawl/CrawlResult'
+import {
+  ArtworkCommonData,
+  BookmarkData,
+  NovelCommonData,
+} from '../crawl/CrawlResult'
 import { Config } from '../Config'
 import { store } from '../store/Store'
 import { log } from '../Log'
@@ -312,6 +317,9 @@ One possible reason: You have been banned from Pixiv.`)
       this.idList.length >= this.requsetNumber ||
       this.filteredNumber >= this.requsetNumber
     ) {
+      finishKnownOverlap(
+        data.body.works.length === 0 ? 'source-exhausted' : 'crawl-limit'
+      )
       if (this.idList.length > this.requsetNumber) {
         this.idList.splice(this.requsetNumber, this.idList.length)
       }
@@ -319,9 +327,25 @@ One possible reason: You have been banned from Pixiv.`)
       return this.getIdListFinished(generation)
     }
 
-    for (const workData of data.body.works) {
+    const pageWorks = data.body.works as Array<
+      ArtworkCommonData | NovelCommonData
+    >
+    let overlapBoundaryReached = false
+
+    for (const workData of pageWorks) {
       if (this.filteredNumber >= this.requsetNumber) {
         break
+      }
+
+      // 严格按页面原顺序消费边界；后面的已知作品不能挤掉限额内更早的未知作品。
+      const overlap = consumeKnownOverlap([workData], this.order === 'desc')
+      this.filteredNumber++
+      if (overlap.items.length === 0) {
+        if (overlap.boundaryReached) {
+          overlapBoundaryReached = true
+          break
+        }
+        continue
       }
 
       const filterOpt: FilterOption = {
@@ -336,8 +360,6 @@ One possible reason: You have been banned from Pixiv.`)
         xRestrict: workData.xRestrict,
       }
 
-      this.filteredNumber++
-
       const passesFilter = await filter.check(filterOpt)
       if (!ownsCrawl(generation)) return
       if (passesFilter) {
@@ -351,6 +373,12 @@ One possible reason: You have been banned from Pixiv.`)
           id: workData.id,
         })
       }
+      // The item that completes the overlap is still a normal PPBD candidate.
+      // Stop only after it has passed through the same bookmark filter/storage path.
+      if (overlap.boundaryReached) {
+        overlapBoundaryReached = true
+        break
+      }
     }
 
     this.offset += this.onceRequest
@@ -358,6 +386,11 @@ One possible reason: You have been banned from Pixiv.`)
       lang.transl('_当前有x个作品', this.idList.length.toString()),
       'initBookmarkPageCrawlCount'
     )
+
+    if (overlapBoundaryReached) {
+      store.idList = store.idList.concat(this.idList)
+      return this.getIdListFinished(generation)
+    }
 
     if (states.slowCrawlMode) {
       await Utils.sleep(settings.slowCrawlDealy)

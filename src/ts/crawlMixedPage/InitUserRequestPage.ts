@@ -1,8 +1,10 @@
 import { beginCrawl, ownsCrawl } from '../crawl/CrawlGeneration'
+import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
 import { API } from '../API'
 import { store } from '../store/Store'
+import { IDData } from '../store/StoreType'
 import { EVT } from '../EVT'
 import { log } from '../Log'
 import { Tools } from '../Tools'
@@ -158,11 +160,26 @@ class InitUserRequestPage extends InitPageBase {
     // 然后根据约稿 ID 获得作品 ID 列表
     // 由于约稿 ID 可能很多，所以需要分批请求，每批最多可以携带 50 个 ID
     const splitIds = Utils.splitArray(requetIds, 50)
+    let requestWorks: IDData[] = []
     for (const ids of splitIds) {
       const idList = await API.getRequestWorksIdList(ids)
       if (!ownsCrawl(generation)) return
       if (states.stopCrawl) break
-      store.idList = store.idList.concat(idList)
+      requestWorks = requestWorks.concat(idList)
+    }
+
+    // 图片和小说使用独立 ID 时间序列；混合页面不能从跨类型数字排序推导时间边界。
+    // 单类型页面可按作品 ID 最新到最旧使用提前终止；混合页面只观察已知 ID，不提前终止。
+    const allowBoundary = worksType !== 'all'
+    if (allowBoundary) {
+      requestWorks.sort(Utils.sortByProperty('id'))
+    }
+    const overlap = consumeKnownOverlap(requestWorks, allowBoundary)
+    store.idList = store.idList.concat(overlap.items)
+    if (!overlap.boundaryReached) {
+      finishKnownOverlap(
+        this.crawlNumber === -1 ? 'source-exhausted' : 'crawl-limit'
+      )
     }
 
     this.getIdListFinished(generation)
