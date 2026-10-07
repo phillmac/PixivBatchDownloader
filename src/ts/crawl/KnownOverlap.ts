@@ -81,7 +81,7 @@ export function configureKnownOverlap(
 
 export function startKnownOverlap(url: string) {
   const normalized = normalizeUrl(url)
-  if (!arm || arm.url !== normalized || arm.knownIds.size === 0) {
+  if (!arm || arm.url !== normalized) {
     activeKnownIds = null
     snapshot = null
     consecutiveIds = []
