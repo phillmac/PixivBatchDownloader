@@ -331,7 +331,7 @@ export async function getAutomationStatus() {
 
 /** 从当前用户主页 URL 读取自动化资源查询所绑定的用户 ID。 */
 function automationProfileUserId() {
-  const match = window.location.href.match(/\/users\/(\d+)/)
+  const match = window.location.pathname.match(/\/users\/(\d+)(?:\/|$)/)
   if (!match?.[1]) {
     throw new Error(
       'automation profile assets require a Pixiv user-profile page'

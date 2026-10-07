@@ -32,7 +32,12 @@ function harness(
     dataUrl: 'data:image/png;base64,AA==',
   })
 ) {
-  const location = { href: 'https://www.pixiv.net/en/users/1' }
+  const location = {
+    href: 'https://www.pixiv.net/en/users/1',
+    get pathname() {
+      return new URL(this.href).pathname
+    },
+  }
   const store = { URLWhenCrawlStart: location.href, idList: [] }
   const states = {
     busy: false,
@@ -267,13 +272,20 @@ test('profile asset data query validates kind before making a fetch request', as
   assert.equal(calls, 0)
 })
 
-test('profile asset automation query rejects non-profile pages', async () => {
+test('profile asset automation query rejects non-profile and partial user paths', async () => {
   const h = harness({ busy: false, downloading: false, resultLength: 0 }, null)
-  h.context.window.location.href = 'https://www.pixiv.net/en/'
-  await assert.rejects(
-    () => h.exports.getAutomationProfileAssets(),
-    /require a Pixiv user-profile page/
-  )
+  for (const href of [
+    'https://www.pixiv.net/en/',
+    'https://www.pixiv.net/en/?next=/users/123',
+    'https://www.pixiv.net/en/#/users/123',
+    'https://www.pixiv.net/en/users/123abc',
+  ]) {
+    h.context.window.location.href = href
+    await assert.rejects(
+      () => h.exports.getAutomationProfileAssets(),
+      /require a Pixiv user-profile page/
+    )
+  }
 })
 
 test('durable task with unloaded live results reports RESTORING', async () => {
