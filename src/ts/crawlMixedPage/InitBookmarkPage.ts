@@ -1,3 +1,4 @@
+import { getBookmarkQuery } from './BookmarkQuery'
 import { registerAutomationCrawl } from '../download/AutomationCommandBindings'
 import { ownsCrawl } from '../crawl/CrawlGeneration'
 import { consumeKnownOverlap, finishKnownOverlap } from '../crawl/KnownOverlap'
@@ -236,34 +237,19 @@ class InitBookmarkPage extends InitPageBase {
       return
     }
 
-    if (window.location.pathname.includes('/novel')) {
-      this.type = 'novels'
-    }
-
-    const onceNumber = window.location.pathname.includes('/novels') ? 30 : 48
-    const nowPage = Utils.getURLSearchField(location.href, 'p')
-    if (nowPage) {
-      this.offset = (Number.parseInt(nowPage) - 1) * onceNumber
-    }
-    if (this.offset < 0) {
-      this.offset = 0
-    }
-
-    if (this.crawlNumber === -1) {
-      this.requsetNumber = Config.worksNumberLimit
-    } else {
-      this.requsetNumber = onceNumber * this.crawlNumber
-    }
-
-    store.tag = Tools.getTagFromURL()
-    this.isHide = Utils.getURLSearchField(location.href, 'rest') === 'hide'
-    this.order = (Utils.getURLSearchField(location.href, 'order') || 'desc') as
-      'desc' | 'asc'
-    this.mode = (Utils.getURLSearchField(location.href, 'mode') || 'all') as
-      'all' | 'safe' | 'r18'
-    this.work_tag = Utils.getURLSearchField(location.href, 'work_tag') || ''
-    this.bm =
-      Utils.getURLSearchField(location.href, 'bm').replaceAll('-', '') || ''
+    const query = getBookmarkQuery()
+    this.type = query.type
+    this.offset = query.offset
+    this.requsetNumber =
+      this.crawlNumber === -1
+        ? Config.worksNumberLimit
+        : query.uiPageSize * this.crawlNumber
+    store.tag = query.tag
+    this.isHide = query.rest === 'hide'
+    this.order = query.order
+    this.mode = query.mode
+    this.work_tag = query.work_tag
+    this.bm = query.bm
 
     log.log(lang.transl('_正在抓取'))
     if (this.crawlNumber === -1) {

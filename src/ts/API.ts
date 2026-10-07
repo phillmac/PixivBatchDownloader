@@ -148,9 +148,13 @@ class API {
     order: 'desc' | 'asc' = 'desc',
     mode: 'all' | 'safe' | 'r18' = 'all',
     work_tag: string = '',
-    bm: string = ''
+    bm: string = '',
+    limit: number = 100
   ): Promise<BookmarkData> {
-    const url = `https://www.pixiv.net/ajax/user/${userId}/${type}/bookmarks?tag=${tag}&offset=${offset}&limit=100&rest=${
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError('bookmark limit must be between 1 and 100')
+    }
+    const url = `https://www.pixiv.net/ajax/user/${userId}/${type}/bookmarks?tag=${tag}&offset=${offset}&limit=${limit}&rest=${
       hide ? 'hide' : 'show'
     }&order=${order}&mode=${mode}&work_tag=${work_tag}&bm=${bm}&rdm=${Math.random()}`
 
