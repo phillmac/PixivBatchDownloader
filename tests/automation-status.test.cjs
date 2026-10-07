@@ -7,7 +7,22 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function harness(controller, durable, telemetry = async () => null) {
+function harness(
+  controller,
+  durable,
+  telemetry = async () => null,
+  profileAssets = async (userId) => ({
+    userId,
+    name: 'Test User',
+    avatar: {
+      sourceUrl: 'https://i.pximg.net/user-profile/test_170.png',
+      downloadUrl: 'https://i.pximg.net/user-profile/test.png',
+      versionKey: 'https://i.pximg.net/user-profile/test.png',
+      isDefault: false,
+    },
+    background: null,
+  })
+) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
   const store = { URLWhenCrawlStart: location.href, idList: [] }
   const states = {
@@ -123,6 +138,8 @@ function harness(controller, durable, telemetry = async () => null) {
   })((name) => {
     if (name === '../crawl/CrawlRateClient')
       return { getCrawlRateTelemetry: telemetry }
+    if (name === '../ProfileAssets')
+      return { getProfileAssetMetadata: profileAssets }
     if (name === './ManagedCrawlAutomation') return managed
     if (name === './DownloadDiagnostics')
       return { downloadDiagnostics: diagnostics }
@@ -148,6 +165,50 @@ function harness(controller, durable, telemetry = async () => null) {
     },
   }
 }
+
+test('profile asset metadata is exposed through a separate automation query', async () => {
+  let requestedUserId = null
+  const h = harness(
+    { busy: false, downloading: false, resultLength: 0 },
+    null,
+    async () => null,
+    async (userId) => {
+      requestedUserId = userId
+      return {
+        userId,
+        name: 'Profile User',
+        avatar: {
+          sourceUrl: 'https://i.pximg.net/user-profile/avatar_170.png',
+          downloadUrl: 'https://i.pximg.net/user-profile/avatar.png',
+          versionKey: 'https://i.pximg.net/user-profile/avatar.png',
+          isDefault: false,
+        },
+        background: {
+          sourceUrl: 'https://i.pximg.net/background/profile.png',
+          versionKey: 'https://i.pximg.net/background/profile.png',
+          isPrivate: false,
+        },
+      }
+    }
+  )
+
+  const value = await h.exports.getAutomationProfileAssets()
+  assert.equal(requestedUserId, '1')
+  assert.equal(value.schemaVersion, 1)
+  assert.equal(value.userId, '1')
+  assert.equal(value.name, 'Profile User')
+  assert.equal(value.page.url, 'https://www.pixiv.net/en/users/1')
+  assert.equal(typeof h.context.__PBD_AUTOMATION_PROFILE_ASSETS__, 'function')
+})
+
+test('profile asset automation query rejects non-profile pages', async () => {
+  const h = harness({ busy: false, downloading: false, resultLength: 0 }, null)
+  h.context.window.location.href = 'https://www.pixiv.net/en/'
+  await assert.rejects(
+    () => h.exports.getAutomationProfileAssets(),
+    /require a Pixiv user-profile page/
+  )
+})
 
 test('durable task with unloaded live results reports RESTORING', async () => {
   const h = harness(
