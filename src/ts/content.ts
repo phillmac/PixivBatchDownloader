@@ -1,3 +1,4 @@
+import './setting/AutomationSettings'
 /*
  * project: Powerful Pixiv Downloader
  * author:  xuejianxianzun; 雪见仙尊

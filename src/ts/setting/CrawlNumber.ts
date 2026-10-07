@@ -1,7 +1,7 @@
 import { pageType, PageName } from '../PageType'
 import { EVT } from '../EVT'
 import { msgBox } from '../MsgBox'
-import { setSetting, settings } from './Settings'
+import { settingPersistence, settings } from './Settings'
 import { lang } from '../Language'
 import { Tools } from '../Tools'
 import { hideOptions } from './HideOptions'
@@ -97,8 +97,10 @@ class CrawlNumber {
         item.input.value = v.toString()
         // 更新设置
         if (v !== cfg.value) {
-          cfg.value = v
-          setSetting('crawlNumber', settings.crawlNumber)
+          settingPersistence.setCrawlNumberForPage(pageType.type, {
+            ...cfg,
+            value: v,
+          })
         }
       })
 
