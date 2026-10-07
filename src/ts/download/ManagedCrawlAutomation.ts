@@ -90,11 +90,8 @@ export function getManagedCrawlMode() {
     ? operation.mode
     : null
 }
-/** 决定抓取阶段是否应用下载记录过滤；托管模式覆盖用户的持久设置。 */
+/** 下载记录过滤是独立抓取控制；托管 full/incremental 模式不覆盖用户设置。 */
 export function shouldFilterDownloadedWorks(settingEnabled: boolean) {
-  const mode = getManagedCrawlMode()
-  if (mode === 'full') return false
-  if (mode === 'incremental') return true
   return settingEnabled
 }
 /** 终止的部分队列不允许下载，已完成队列保持可下载。 */

@@ -19,6 +19,8 @@ import { EVT } from '../EVT'
 import { store } from '../store/Store'
 import { states } from '../store/States'
 import { IDTypeString } from '../store/StoreType'
+import { settings } from '../setting/Settings'
+import { pageType } from '../PageType'
 
 /** 自动化客户端可观察的下载器生命周期阶段。 */
 export type AutomationPhase =
@@ -46,6 +48,20 @@ type CrawlIdGateRejectReason = 'count-exceeded' | 'novel-series-size-unknown'
 type CrawlIdGate = { maxCount: number }
 
 /** 在详细作品数据抓取开始前捕获的作品 ID 列表。 */
+type CrawlControlSnapshot = {
+  crawlNumber: { value: number; unit: 'pages' | 'works' | 'none' }
+  onlyUndownloaded: boolean
+  downloadDeduplication: boolean
+}
+
+/** 页面 ID 枚举结束、公共过滤器运行前的发现快照。 */
+type CrawlDiscoverySnapshot = LifecycleObservation & {
+  count: number
+  items: AutomationIdEntry[]
+  controls: CrawlControlSnapshot
+}
+
+/** 公共过滤器运行后、详细元数据抓取前的作品 ID 列表。 */
 type CrawlIdListSnapshot = LifecycleObservation & {
   count: number
   items: AutomationIdEntry[]
@@ -71,6 +87,9 @@ const lifecycle = {
 
 /** 当前内容脚本生命周期内最近一次抓取到的预元数据作品 ID 列表。 */
 let crawlIdListSnapshot: CrawlIdListSnapshot | null = null
+
+/** 当前内容脚本生命周期内最近一次公共过滤前的发现列表。 */
+let crawlDiscoverySnapshot: CrawlDiscoverySnapshot | null = null
 
 /** 仅应用于下一次正常抓取的自动化 ID 数量门限。 */
 let crawlIdGate: CrawlIdGate | null = null
@@ -114,6 +133,31 @@ function resetDownloadLifecycle() {
 /** 返回抓取队列绑定的原始 URL，而不是事件触发时的 SPA 路由。 */
 function crawlTaskUrl() {
   return normalizeUrl(store.URLWhenCrawlStart || window.location.href)
+}
+
+/** 捕获公共过滤器运行前的 ID 列表和三个独立抓取控制。 */
+function captureCrawlDiscovery() {
+  const taskUrl = lifecycle.crawlStarted?.url
+  if (states.bookmarkMode || states.stopCrawl || !taskUrl) {
+    return
+  }
+
+  const cfg = settings.crawlNumber[pageType.type]
+  const unit: CrawlControlSnapshot['crawlNumber']['unit'] = cfg?.page
+    ? 'pages'
+    : cfg?.work
+      ? 'works'
+      : 'none'
+  crawlDiscoverySnapshot = {
+    ...observe(taskUrl),
+    count: store.idList.length,
+    items: store.idList.map((item) => ({ id: item.id, type: item.type })),
+    controls: {
+      crawlNumber: { value: cfg?.value ?? 0, unit },
+      onlyUndownloaded: settings.DonotCrawlAlreadyDownloadedWorks,
+      downloadDeduplication: settings.deduplication,
+    },
+  }
 }
 
 /** 在 ID 列表过滤完成、详细作品数据抓取开始前保存快照并同步执行自动化门限。 */
@@ -194,6 +238,7 @@ export function setAutomationCrawlIdGate(maxCount: number | null) {
 /** 记录真实下载器事件，避免从页面标题反推状态。 */
 window.addEventListener(EVT.list.crawlStart, () => {
   lifecycle.crawlStarted = observe(window.location.href)
+  crawlDiscoverySnapshot = null
   crawlIdListSnapshot = null
   lifecycle.crawlCompleted = null
   lifecycle.crawlStopped = null
@@ -213,6 +258,7 @@ window.addEventListener(EVT.list.resultChange, () => {
 window.addEventListener(EVT.list.crawlEmpty, () => {
   lifecycle.crawlEmpty = observe(crawlTaskUrl())
 })
+window.addEventListener(EVT.list.getIdListReadyForFilter, captureCrawlDiscovery)
 window.addEventListener(EVT.list.getIdListFinished, captureCrawlIdList)
 window.addEventListener(EVT.list.stopCrawl, () => {
   lifecycle.crawlStopped = observe(crawlTaskUrl())
@@ -276,6 +322,20 @@ export async function getAutomationStatus() {
   const liveResultsBoundToCurrent = crawlObservedForCurrent || resumedForCurrent
   const stoppedForCurrent =
     stop && lifecycle.downloadStopped?.url === currentUrl
+  const crawlDiscovery =
+    crawlDiscoverySnapshot?.url === currentUrl
+      ? {
+          capturedAt: crawlDiscoverySnapshot.at,
+          url: crawlDiscoverySnapshot.url,
+          count: crawlDiscoverySnapshot.count,
+          controls: {
+            crawlNumber: { ...crawlDiscoverySnapshot.controls.crawlNumber },
+            onlyUndownloaded: crawlDiscoverySnapshot.controls.onlyUndownloaded,
+            downloadDeduplication:
+              crawlDiscoverySnapshot.controls.downloadDeduplication,
+          },
+        }
+      : null
   const crawlIdList =
     crawlIdListSnapshot?.url === currentUrl
       ? {
@@ -317,6 +377,7 @@ export async function getAutomationStatus() {
     managedOperation: getManagedCrawl(),
     managedArm: getManagedCrawlArm(),
     requiresReload: managedCrawlRequiresReload(),
+    crawlDiscovery,
     crawlIdList,
     crawlRate,
     lifecycle: Object.fromEntries(
@@ -386,6 +447,27 @@ export async function getAutomationProfileAssetData(
   }
 }
 
+/** 返回当前页面最近一次公共过滤前 ID 发现列表的独立只读快照。 */
+export function getAutomationCrawlDiscovery() {
+  const currentUrl = normalizeUrl(window.location.href)
+  if (!crawlDiscoverySnapshot || crawlDiscoverySnapshot.url !== currentUrl) {
+    return null
+  }
+  return {
+    schemaVersion: 1,
+    capturedAt: crawlDiscoverySnapshot.at,
+    url: crawlDiscoverySnapshot.url,
+    count: crawlDiscoverySnapshot.count,
+    controls: {
+      crawlNumber: { ...crawlDiscoverySnapshot.controls.crawlNumber },
+      onlyUndownloaded: crawlDiscoverySnapshot.controls.onlyUndownloaded,
+      downloadDeduplication:
+        crawlDiscoverySnapshot.controls.downloadDeduplication,
+    },
+    items: crawlDiscoverySnapshot.items.map((item) => ({ ...item })),
+  }
+}
+
 /** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
 export function getAutomationCrawlIdList() {
   const currentUrl = normalizeUrl(window.location.href)
@@ -407,6 +489,7 @@ const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
   __PBD_AUTOMATION_PROFILE_ASSETS__?: typeof getAutomationProfileAssets
   __PBD_AUTOMATION_PROFILE_ASSET_DATA__?: typeof getAutomationProfileAssetData
+  __PBD_AUTOMATION_CRAWL_DISCOVERY__?: typeof getAutomationCrawlDiscovery
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
   __PBD_AUTOMATION_ARM_CRAWL__?: typeof armManagedCrawl
@@ -416,6 +499,8 @@ automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_PROFILE_ASSETS__ = getAutomationProfileAssets
 automationGlobal.__PBD_AUTOMATION_PROFILE_ASSET_DATA__ =
   getAutomationProfileAssetData
+automationGlobal.__PBD_AUTOMATION_CRAWL_DISCOVERY__ =
+  getAutomationCrawlDiscovery
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
 automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl

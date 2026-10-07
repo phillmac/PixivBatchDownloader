@@ -39,6 +39,14 @@ function harness(
     },
   }
   const store = { URLWhenCrawlStart: location.href, idList: [] }
+  const settings = {
+    crawlNumber: {
+      2: { work: false, page: true, value: -1 },
+    },
+    DonotCrawlAlreadyDownloadedWorks: false,
+    deduplication: true,
+  }
+  const pageType = { type: 2 }
   const states = {
     busy: false,
     bookmarkMode: false,
@@ -78,6 +86,7 @@ function harness(
       crawlEmpty: 'crawlEmpty',
       stopCrawl: 'stopCrawl',
       managedCrawlTerminal: 'managedCrawlTerminal',
+      getIdListReadyForFilter: 'getIdListReadyForFilter',
       getIdListFinished: 'getIdListFinished',
       resultChange: 'resultChange',
       downloadStart: 'downloadStart',
@@ -164,6 +173,8 @@ function harness(
     if (name === '../EVT') return { EVT }
     if (name === '../store/Store') return { store }
     if (name === '../store/States') return { states }
+    if (name === '../setting/Settings') return { settings }
+    if (name === '../PageType') return { pageType }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   return {
@@ -173,6 +184,8 @@ function harness(
     EVT,
     context,
     store,
+    settings,
+    pageType,
     states,
     controller,
     discardCalls,
@@ -422,6 +435,42 @@ test('lifecycle observations are URL-scoped across Pixiv SPA navigation', async 
     moved.lifecycle.crawlCompleted.url,
     'https://www.pixiv.net/en/users/1'
   )
+})
+
+test('crawl discovery stays pre-filter and records independent crawl controls', async () => {
+  const h = harness(
+    { busy: true, downloading: false, pause: false, stop: false, resultLength: 0 },
+    null
+  )
+  h.settings.crawlNumber[h.pageType.type].value = 1
+  h.settings.DonotCrawlAlreadyDownloadedWorks = true
+  h.settings.deduplication = false
+  h.fire('crawlStart')
+  h.store.idList = [
+    { id: '101', type: 'illusts' },
+    { id: '202', type: 'manga' },
+  ]
+  h.fire('getIdListReadyForFilter')
+  h.store.idList = [{ id: '202', type: 'manga' }]
+  h.fire('getIdListFinished')
+
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.crawlDiscovery.count, 2)
+  assert.deepEqual(JSON.parse(JSON.stringify(status.crawlDiscovery.controls)), {
+    crawlNumber: { value: 1, unit: 'pages' },
+    onlyUndownloaded: true,
+    downloadDeduplication: false,
+  })
+  assert.equal('items' in status.crawlDiscovery, false)
+  assert.equal(status.crawlIdList.count, 1)
+
+  const discovery = h.exports.getAutomationCrawlDiscovery()
+  assert.deepEqual(JSON.parse(JSON.stringify(discovery.items)), [
+    { id: '101', type: 'illusts' },
+    { id: '202', type: 'manga' },
+  ])
+  discovery.items[0].id = 'mutated-return-value'
+  assert.equal(h.exports.getAutomationCrawlDiscovery().items[0].id, '101')
 })
 
 test('pre-metadata ID list boundary exposes lightweight count and detached IDs', async () => {
@@ -2017,16 +2066,15 @@ test('checkpoint does not recreate metadata deleted by another tab', async () =>
   assert.equal(h.putManyCalls.length, 0)
 })
 
-test('managed crawl mode explicitly overrides downloaded-record filtering', async () => {
+test('managed crawl mode leaves downloaded-record filtering independent', async () => {
   const full = harness({ busy: false }, null)
   const url = full.context.window.location.href
-  assert.equal(full.managed.shouldFilterDownloadedWorks(true), true)
   const fullArm = full.context.__PBD_AUTOMATION_ARM_CRAWL__(url, 'full')
   assert.equal(fullArm.mode, 'full')
-  assert.equal(full.managed.shouldFilterDownloadedWorks(true), true)
   full.fire('crawlStart')
   assert.equal(full.managed.getManagedCrawlMode(), 'full')
-  assert.equal(full.managed.shouldFilterDownloadedWorks(true), false)
+  assert.equal(full.managed.shouldFilterDownloadedWorks(true), true)
+  assert.equal(full.managed.shouldFilterDownloadedWorks(false), false)
 
   const incremental = harness({ busy: false }, null)
   const incrementalArm = incremental.context.__PBD_AUTOMATION_ARM_CRAWL__(
@@ -2036,7 +2084,8 @@ test('managed crawl mode explicitly overrides downloaded-record filtering', asyn
   assert.equal(incrementalArm.mode, 'incremental')
   incremental.fire('crawlStart')
   assert.equal(incremental.managed.getManagedCrawlMode(), 'incremental')
-  assert.equal(incremental.managed.shouldFilterDownloadedWorks(false), true)
+  assert.equal(incremental.managed.shouldFilterDownloadedWorks(true), true)
+  assert.equal(incremental.managed.shouldFilterDownloadedWorks(false), false)
 
   const invalid = harness({ busy: false }, null)
   assert.throws(
