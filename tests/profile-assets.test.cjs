@@ -7,7 +7,14 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function loadModule(profile) {
+function loadModule(
+  profile,
+  {
+    getImg = async () => null,
+    sleep = async () => {},
+    blobToDataURL = async () => 'data:application/octet-stream;base64,AA==',
+  } = {}
+) {
   const file = path.join(root, 'src/ts/ProfileAssets.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: {
@@ -30,6 +37,8 @@ function loadModule(profile) {
         },
       }
     }
+    if (name === './utils/GetImage') return { getImg }
+    if (name === './utils/Utils') return { Utils: { sleep, blobToDataURL } }
     throw new Error(`unexpected require ${name}`)
   }, exports)
   return exports
@@ -119,5 +128,135 @@ test('Pixiv profile error responses fail instead of exposing partial metadata', 
   await assert.rejects(
     () => mod.getProfileAssetMetadata('123'),
     /profile unavailable/
+  )
+})
+
+test('asset payload fetches the exact versioned avatar through the quiet image helper', async () => {
+  const calls = []
+  const fakeBlob = { size: 321, type: 'image/png' }
+  const mod = loadModule(
+    profile({
+      userId: '123',
+      name: 'Payload User',
+      imageBig: 'https://i.pximg.net/user-profile/avatar_170.png',
+      background: null,
+    }),
+    {
+      getImg: async (...args) => {
+        calls.push(args)
+        return fakeBlob
+      },
+      blobToDataURL: async (blob) => {
+        assert.equal(blob, fakeBlob)
+        return 'data:image/png;base64,AAAA'
+      },
+    }
+  )
+
+  const value = await mod.getProfileAssetPayload(
+    '123',
+    'avatar',
+    'https://i.pximg.net/user-profile/avatar.png'
+  )
+  assert.equal(value.kind, 'avatar')
+  assert.equal(value.byteLength, 321)
+  assert.equal(value.contentType, 'image/png')
+  assert.equal(value.dataUrl, 'data:image/png;base64,AAAA')
+  assert.deepEqual(calls, [
+    ['https://i.pximg.net/user-profile/avatar.png', false],
+  ])
+})
+
+test('missing profile background returns null without fetching image bytes', async () => {
+  let calls = 0
+  const mod = loadModule(
+    profile({
+      userId: '123',
+      name: 'No Background',
+      imageBig: 'https://s.pximg.net/common/images/no_profile.png',
+      background: null,
+    }),
+    {
+      getImg: async () => {
+        calls += 1
+        return { size: 1, type: 'image/png' }
+      },
+    }
+  )
+
+  assert.equal(await mod.getProfileAssetPayload('123', 'background'), null)
+  assert.equal(calls, 0)
+})
+
+test('version mismatch fails before fetching asset content', async () => {
+  let calls = 0
+  const mod = loadModule(
+    profile({
+      userId: '123',
+      name: 'Changed User',
+      imageBig: 'https://i.pximg.net/user-profile/new_170.png',
+      background: null,
+    }),
+    {
+      getImg: async () => {
+        calls += 1
+        return { size: 1, type: 'image/png' }
+      },
+    }
+  )
+
+  await assert.rejects(
+    () =>
+      mod.getProfileAssetPayload(
+        '123',
+        'avatar',
+        'https://i.pximg.net/user-profile/old.png'
+      ),
+    /version changed/
+  )
+  assert.equal(calls, 0)
+})
+
+test('asset payload retries failed browser fetches but stops after the configured bound', async () => {
+  let calls = 0
+  const sleeps = []
+  const mod = loadModule(
+    profile({
+      userId: '123',
+      name: 'Retry User',
+      imageBig: 'https://i.pximg.net/user-profile/retry_170.png',
+      background: null,
+    }),
+    {
+      getImg: async () => {
+        calls += 1
+        return calls === 3 ? { size: 9, type: 'image/png' } : null
+      },
+      sleep: async (ms) => sleeps.push(ms),
+    }
+  )
+
+  const value = await mod.getProfileAssetPayload('123', 'avatar')
+  assert.equal(value.byteLength, 9)
+  assert.equal(calls, 3)
+  assert.deepEqual(sleeps, [250, 500])
+})
+
+test('asset payload rejects oversized browser responses', async () => {
+  const mod = loadModule(
+    profile({
+      userId: '123',
+      name: 'Large User',
+      imageBig: 'https://i.pximg.net/user-profile/large_170.png',
+      background: null,
+    }),
+    {
+      getImg: async () => ({ size: 16 * 1024 * 1024 + 1, type: 'image/png' }),
+    }
+  )
+
+  await assert.rejects(
+    () => mod.getProfileAssetPayload('123', 'avatar'),
+    /exceeds automation size limit/
   )
 })

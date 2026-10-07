@@ -21,6 +21,15 @@ function harness(
       isDefault: false,
     },
     background: null,
+  }),
+  profileAssetData = async (userId, kind, versionKey) => ({
+    userId,
+    kind,
+    sourceUrl: versionKey,
+    versionKey,
+    contentType: 'image/png',
+    byteLength: 1,
+    dataUrl: 'data:image/png;base64,AA==',
   })
 ) {
   const location = { href: 'https://www.pixiv.net/en/users/1' }
@@ -139,7 +148,10 @@ function harness(
     if (name === '../crawl/CrawlRateClient')
       return { getCrawlRateTelemetry: telemetry }
     if (name === '../ProfileAssets')
-      return { getProfileAssetMetadata: profileAssets }
+      return {
+        getProfileAssetMetadata: profileAssets,
+        getProfileAssetPayload: profileAssetData,
+      }
     if (name === './ManagedCrawlAutomation') return managed
     if (name === './DownloadDiagnostics')
       return { downloadDiagnostics: diagnostics }
@@ -199,6 +211,60 @@ test('profile asset metadata is exposed through a separate automation query', as
   assert.equal(value.name, 'Profile User')
   assert.equal(value.page.url, 'https://www.pixiv.net/en/users/1')
   assert.equal(typeof h.context.__PBD_AUTOMATION_PROFILE_ASSETS__, 'function')
+})
+
+test('profile asset data query passes kind and version to the browser-side fetcher', async () => {
+  let args = null
+  const h = harness(
+    { busy: false, downloading: false, resultLength: 0 },
+    null,
+    async () => null,
+    undefined,
+    async (...value) => {
+      args = value
+      return {
+        userId: value[0],
+        kind: value[1],
+        sourceUrl: value[2],
+        versionKey: value[2],
+        contentType: 'image/png',
+        byteLength: 4,
+        dataUrl: 'data:image/png;base64,AAAA',
+      }
+    }
+  )
+
+  const value = await h.exports.getAutomationProfileAssetData(
+    'avatar',
+    'https://i.pximg.net/avatar.png'
+  )
+  assert.deepEqual(args, ['1', 'avatar', 'https://i.pximg.net/avatar.png'])
+  assert.equal(value.userId, '1')
+  assert.equal(value.kind, 'avatar')
+  assert.equal(value.asset.byteLength, 4)
+  assert.equal(
+    typeof h.context.__PBD_AUTOMATION_PROFILE_ASSET_DATA__,
+    'function'
+  )
+})
+
+test('profile asset data query validates kind before making a fetch request', async () => {
+  let calls = 0
+  const h = harness(
+    { busy: false, downloading: false, resultLength: 0 },
+    null,
+    async () => null,
+    undefined,
+    async () => {
+      calls += 1
+      return null
+    }
+  )
+  await assert.rejects(
+    () => h.exports.getAutomationProfileAssetData('invalid'),
+    /must be avatar or background/
+  )
+  assert.equal(calls, 0)
 })
 
 test('profile asset automation query rejects non-profile pages', async () => {

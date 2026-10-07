@@ -1,5 +1,9 @@
 import { getCrawlRateTelemetry } from '../crawl/CrawlRateClient'
-import { getProfileAssetMetadata } from '../ProfileAssets'
+import {
+  getProfileAssetMetadata,
+  getProfileAssetPayload,
+  ProfileAssetKind,
+} from '../ProfileAssets'
 import {
   skipManagedCrawl,
   armManagedCrawl,
@@ -353,6 +357,35 @@ export async function getAutomationProfileAssets() {
   }
 }
 
+/** 获取一个用户资源的编码内容；调用方可用版本键防止把旧元数据和新资源混用。 */
+export async function getAutomationProfileAssetData(
+  kind: ProfileAssetKind,
+  expectedVersionKey?: string
+) {
+  if (kind !== 'avatar' && kind !== 'background') {
+    throw new TypeError('profile asset kind must be avatar or background')
+  }
+  const requestedUserId = automationProfileUserId()
+  const asset = await getProfileAssetPayload(
+    requestedUserId,
+    kind,
+    expectedVersionKey
+  )
+  const currentUserId = automationProfileUserId()
+  if (currentUserId !== requestedUserId) {
+    return getAutomationProfileAssetData(kind, expectedVersionKey)
+  }
+
+  return {
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
+    page: { url: normalizeUrl(window.location.href) },
+    userId: requestedUserId,
+    kind,
+    asset,
+  }
+}
+
 /** 返回当前页面最近一次预元数据作品 ID 列表的独立只读快照。 */
 export function getAutomationCrawlIdList() {
   const currentUrl = normalizeUrl(window.location.href)
@@ -373,6 +406,7 @@ export function getAutomationCrawlIdList() {
 const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
   __PBD_AUTOMATION_PROFILE_ASSETS__?: typeof getAutomationProfileAssets
+  __PBD_AUTOMATION_PROFILE_ASSET_DATA__?: typeof getAutomationProfileAssetData
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
   __PBD_AUTOMATION_ARM_CRAWL__?: typeof armManagedCrawl
@@ -380,6 +414,8 @@ const automationGlobal = globalThis as typeof globalThis & {
 }
 automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_PROFILE_ASSETS__ = getAutomationProfileAssets
+automationGlobal.__PBD_AUTOMATION_PROFILE_ASSET_DATA__ =
+  getAutomationProfileAssetData
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList
 automationGlobal.__PBD_AUTOMATION_SET_CRAWL_ID_GATE__ = setAutomationCrawlIdGate
 automationGlobal.__PBD_AUTOMATION_ARM_CRAWL__ = armManagedCrawl
