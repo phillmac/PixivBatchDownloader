@@ -33,6 +33,8 @@ class EVENT {
     crawlTag: 'crawlTag',
     /** 当检查到错误的设置时触发 */
     wrongSetting: 'wrongSetting',
+    /** 当页面抓取器完成 ID 枚举、公共过滤器尚未运行时触发 */
+    getIdListReadyForFilter: 'getIdListReadyForFilter',
     /** 当获取作品的 id 列表完成时触发 */
     getIdListFinished: 'getIdListFinished',
     /** 获取了作品的 id 列表，需要下载这些 id 列表时使用 */
@@ -233,6 +235,7 @@ class EVENT {
       | 'stopCrawl'
       | 'managedCrawlTerminal'
       | 'wrongSetting'
+      | 'getIdListReadyForFilter'
       | 'getIdListFinished'
       | 'crawlComplete'
       | 'crawlEmpty'

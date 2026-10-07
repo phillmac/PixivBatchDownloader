@@ -389,6 +389,10 @@ abstract class InitPageBase {
     states.slowCrawlMode = false
     this.resetGetIdListStatus()
 
+    // 自动化需要区分“页面发现了哪些作品”和“哪些作品通过了公共过滤器”。
+    // 此事件发生在 downloaded-record 等公共过滤器之前，不改变正常抓取流程。
+    EVT.fire('getIdListReadyForFilter')
+
     // 在抓取作品详细数据之前，预先对 id 进行检查，如果不符合要求则直接剔除它
     // 现在这里能够检查这些过滤条件：
     // 1. 检查 id 是否符合 id 范围条件
