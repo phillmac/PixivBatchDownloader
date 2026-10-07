@@ -1,3 +1,4 @@
+import { registerAutomationCrawlStop } from '../download/AutomationCommandBindings'
 import { EVT } from '../EVT'
 import { lang } from '../Language'
 import { log } from '../Log'
@@ -9,6 +10,7 @@ class StopCrawl {
   constructor() {
     this.addBtn()
     this.bindEvents()
+    registerAutomationCrawlStop(() => this.stop())
   }
   private btn!: HTMLButtonElement
 
@@ -23,10 +25,13 @@ class StopCrawl {
     )
     this.hide()
 
-    this.btn.addEventListener('click', () => {
-      EVT.fire('stopCrawl')
-      states.stopCrawl = true
-    })
+    this.btn.addEventListener('click', () => this.stop())
+  }
+
+  /** 点击与自动化共用的原生停止行为。 */
+  private stop() {
+    EVT.fire('stopCrawl')
+    states.stopCrawl = true
   }
 
   private bindEvents() {
