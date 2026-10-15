@@ -1,4 +1,5 @@
 import { ownsCrawl } from '../crawl/CrawlGeneration'
+import { SearchListPageBudget } from '../crawl/SearchListPageBudget'
 // 初始化小说搜索页
 import { InitPageBase } from '../crawl/InitPageBase'
 import { lang } from '../Language'
@@ -40,7 +41,8 @@ class InitSearchNovelPage extends InitPageBase {
   private option: SearchOption = {}
   private readonly worksNoPerPage = 30 // 每个页面有多少个作品
   private needCrawlPageCount = 0 // 一共有有多少个列表页面
-  private sendCrawlTaskCount = 0 // 已经抓取了多少个列表页面
+  private pageBudget?: SearchListPageBudget
+  private crawlUrl = ''
   private readonly allOption = [
     'q',
     'order',
@@ -170,13 +172,42 @@ class InitSearchNovelPage extends InitPageBase {
 
   protected initAny() {
     window.addEventListener(EVT.list.crawlTag, this.crawlTag)
+    window.addEventListener(EVT.list.pageSwitch, this.stopForNavigation)
   }
 
   protected destroy() {
+    // A type-changing Pixiv navigation destroys this instance before its
+    // pageSwitch listener runs; stop in-flight list collection here as well.
+    this.stopForNavigation()
     Tools.clearSlot('crawlBtns')
     Tools.clearSlot('otherBtns')
 
     window.removeEventListener(EVT.list.crawlTag, this.crawlTag)
+    window.removeEventListener(EVT.list.pageSwitch, this.stopForNavigation)
+  }
+
+  /** Pixiv uses same-document navigation, which does not start a new crawl generation. */
+  private stopForNavigation = () => {
+    if (
+      !this.crawlUrl ||
+      !ownsCrawl(this.generation) ||
+      window.location.href === this.crawlUrl ||
+      states.stopCrawl
+    )
+      return
+    this.pageBudget?.cancel()
+    this.crawlUrl = ''
+    states.stopCrawl = true
+    EVT.fire('stopCrawl')
+  }
+
+  private isCurrentSearchCrawl(generation = this.generation): boolean {
+    if (!ownsCrawl(generation) || states.stopCrawl) return false
+    if (this.crawlUrl !== window.location.href) {
+      this.stopForNavigation()
+      return false
+    }
+    return true
   }
 
   /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
@@ -184,6 +215,7 @@ class InitSearchNovelPage extends InitPageBase {
     const generation = this.generation
     if (!ownsCrawl(generation)) return
 
+    this.crawlUrl = window.location.href
     this.setSlowCrawl()
     this.initFetchURL()
 
@@ -195,9 +227,9 @@ class InitSearchNovelPage extends InitPageBase {
     let data
     try {
       data = await this.getSearchData(1)
-      if (!ownsCrawl(generation)) return
+      if (!this.isCurrentSearchCrawl(generation)) return
     } catch {
-      if (!ownsCrawl(generation)) return
+      if (!this.isCurrentSearchCrawl(generation)) return
       EVT.fire('stopCrawl')
       return
     }
@@ -243,7 +275,12 @@ class InitSearchNovelPage extends InitPageBase {
       return this.noResult(generation)
     }
 
-    this.getIdList()
+    this.pageBudget = new SearchListPageBudget(
+      this.startpageNo,
+      this.needCrawlPageCount,
+      this.crawlUrl
+    )
+    this.getIdList(undefined, this.startpageNo === 1 ? data : undefined)
   }
 
   protected getWantPage() {
@@ -331,11 +368,11 @@ class InitSearchNovelPage extends InitPageBase {
   /** 使用本轮抓取所有权，防止旧回调影响新任务。 */
   private async delayReTry(p: number) {
     const generation = this.generation
-    if (!ownsCrawl(generation)) return
+    if (!this.isCurrentSearchCrawl(generation)) return
 
     log.error(lang.transl('_下载器会在几分钟后重试'))
     await Utils.sleep(Config.retryTime)
-    if (!ownsCrawl(generation)) return
+    if (!this.isCurrentSearchCrawl(generation)) return
     this.getIdList(p)
   }
 
@@ -361,37 +398,42 @@ class InitSearchNovelPage extends InitPageBase {
   }
 
   /** 仅当出错重试时，才会传递参数 p。此时直接使用传入的 p，而不是继续让 p 增加；使用本轮抓取所有权。 */
-  protected async getIdList(p?: number): Promise<void> {
+  protected async getIdList(
+    retryPage?: number,
+    initialData?: Awaited<ReturnType<typeof this.getSearchData>>
+  ): Promise<void> {
     const generation = this.generation
-    if (!ownsCrawl(generation)) return
+    if (!this.isCurrentSearchCrawl(generation)) return
+    const budget = this.pageBudget
+    if (!budget || !budget.accepts(window.location.href)) return
+    const p = budget.claim(retryPage)
+    if (p === undefined) return // already in flight, completed, or beyond limit
 
-    if (states.stopCrawl) {
-      return this.getIdListFinished(generation)
-    }
-
-    if (p === undefined) {
-      p = this.startpageNo + this.sendCrawlTaskCount
-      this.sendCrawlTaskCount++
-    }
-
-    // 获取列表页的数据
     let data
     try {
-      data = await this.getSearchData(p)
-      if (!ownsCrawl(generation)) return
+      data = initialData ?? (await this.getSearchData(p))
+      if (
+        !this.isCurrentSearchCrawl(generation) ||
+        !budget.accepts(window.location.href)
+      )
+        return
       if (data.total === 0) {
+        budget.abandon(p)
         console.log(`page ${p}: total 0`)
         this.tipEmptyResult()
         return this.delayReTry(p)
       }
     } catch {
-      if (!ownsCrawl(generation)) return
+      budget.abandon(p)
+      if (!this.isCurrentSearchCrawl(generation)) return
       return this.delayReTry(p)
     }
 
-    if (states.stopCrawl) {
-      return this.getIdListFinished(generation)
-    }
+    if (
+      !this.isCurrentSearchCrawl(generation) ||
+      !budget.accepts(window.location.href)
+    )
+      return
 
     const worksData = data.data
     // 注意：由于此时用户启用了“整合系列作品”，所以每项数据可能是单篇完结小说，也可能是系列小说，需要注意区分
@@ -416,7 +458,11 @@ class InitSearchNovelPage extends InitPageBase {
       }
 
       const passesFilter = await filter.check(filterOpt)
-      if (!ownsCrawl(generation)) return
+      if (
+        !this.isCurrentSearchCrawl(generation) ||
+        !budget.accepts(window.location.href)
+      )
+        return
       if (passesFilter) {
         // 如果这份数据是单篇小说
         if (novelId) {
@@ -435,7 +481,8 @@ class InitSearchNovelPage extends InitPageBase {
       }
     }
 
-    this.listPageFinished++
+    if (!this.isCurrentSearchCrawl(generation) || !budget.complete(p)) return
+    this.listPageFinished = budget.finishedCount
 
     // 每抓取 10 页，取出最后一个作品的 id，检查其是否符合要求
     // 如果不符合要求，就不再抓取剩余列表页
@@ -452,7 +499,11 @@ class InitSearchNovelPage extends InitPageBase {
         const novelId = this.getNovelId(lastWork)
         if (novelId) {
           const check = await this.checkVipWork(novelId, 'novels', generation)
-          if (!ownsCrawl(generation) || states.stopCrawl) return
+          if (
+            !this.isCurrentSearchCrawl(generation) ||
+            !budget.accepts(window.location.href)
+          )
+            return
           if (check) {
             log.log(lang.transl('_后续作品低于最低收藏数量要求跳过后续作品'))
             log.log(lang.transl('_列表页抓取完成'))
@@ -472,29 +523,28 @@ class InitSearchNovelPage extends InitPageBase {
       this.getIdListLogKey
     )
 
-    if (this.sendCrawlTaskCount + 1 <= this.needCrawlPageCount) {
-      // 继续发送抓取任务（+1 是因为 sendCrawlTaskCount 从 0 开始）
+    if (budget.canScheduleNext()) {
       if (states.slowCrawlMode) {
         await Utils.sleep(settings.slowCrawlDealy)
-        if (!ownsCrawl(generation)) return
+        if (
+          !this.isCurrentSearchCrawl(generation) ||
+          !budget.accepts(window.location.href)
+        )
+          return
       }
       this.getIdList()
-    } else {
-      // 抓取任务已经全部发送
-      if (this.listPageFinished === this.needCrawlPageCount) {
-        // 抓取任务全部完成
-        log.log(lang.transl('_列表页抓取完成'))
-
-        // idListWithPageNo.store(pageType.type)
-
-        this.getIdListFinished(generation)
-      }
+    } else if (budget.isComplete()) {
+      budget.cancel() // make repeated completion callbacks harmless
+      log.log(lang.transl('_列表页抓取完成'))
+      this.getIdListFinished(generation)
     }
   }
 
   protected resetGetIdListStatus() {
     this.listPageFinished = 0
-    this.sendCrawlTaskCount = 0
+    this.pageBudget?.cancel()
+    this.pageBudget = undefined
+    this.crawlUrl = ''
   }
 
   // 搜索页把下载任务按收藏数从高到低下载
