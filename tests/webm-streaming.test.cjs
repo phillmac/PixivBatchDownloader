@@ -7,7 +7,12 @@ const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
 
-function harness({ failFrame = null, stallFrameOnce = null, fastTimeout = false } = {}) {
+function harness({
+  failFrame = null,
+  stallFrameOnce = null,
+  fastTimeout = false,
+  workerFault = null,
+} = {}) {
   const messages = []
   const events = []
   let outstanding = 0
@@ -26,12 +31,24 @@ function harness({ failFrame = null, stallFrameOnce = null, fastTimeout = false 
       terminatedWorkers++
     }
     postMessage(message) {
-      messages.push({ type: message.type, index: message.index, delay: message.delay })
+      messages.push({
+        type: message.type,
+        index: message.index,
+        delay: message.delay,
+      })
       queueMicrotask(() => {
+        if (message.type === 'start' && workerFault) {
+          const ev = new Event(workerFault)
+          ev.message = 'worker crashed'
+          this.dispatchEvent(ev)
+          return
+        }
         if (message.type === 'start') {
-          this.dispatchEvent(new MessageEvent('message', {
-            data: { id: message.id, type: 'ready' },
-          }))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: { id: message.id, type: 'ready' },
+            })
+          )
           return
         }
         if (message.type === 'frame') {
@@ -41,26 +58,42 @@ function harness({ failFrame = null, stallFrameOnce = null, fastTimeout = false 
             return
           }
           if (message.index === failFrame) {
-            this.dispatchEvent(new MessageEvent('message', {
-              data: { id: message.id, type: 'error', error: 'frame failed' },
-            }))
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: { id: message.id, type: 'error', error: 'frame failed' },
+              })
+            )
           } else {
-            this.dispatchEvent(new MessageEvent('message', {
-              data: { id: message.id, type: 'frame-complete', index: message.index },
-            }))
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: {
+                  id: message.id,
+                  type: 'frame-complete',
+                  index: message.index,
+                },
+              })
+            )
           }
           return
         }
         if (message.type === 'finish') {
-          this.dispatchEvent(new MessageEvent('message', {
-            data: { id: message.id, type: 'result', result: new Blob(['webm']) },
-          }))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: {
+                id: message.id,
+                type: 'result',
+                result: new Blob(['webm']),
+              },
+            })
+          )
           return
         }
         if (message.type === 'cancel') {
-          this.dispatchEvent(new MessageEvent('message', {
-            data: { id: message.id, type: 'cancelled' },
-          }))
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: { id: message.id, type: 'cancelled' },
+            })
+          )
         }
       })
     }
@@ -68,12 +101,16 @@ function harness({ failFrame = null, stallFrameOnce = null, fastTimeout = false 
 
   const Tools = {
     getJPGContentIndex: () => [0, 10, 20],
-    extractImageFrameBlob: (_buffer, _indexes, index) => new Blob([String(index)]),
-    extractImage: async () => { throw new Error('full-frame decoder should not run') },
+    extractImageFrameBlob: (_buffer, _indexes, index) =>
+      new Blob([String(index)]),
+    extractImage: async () => {
+      throw new Error('full-frame decoder should not run')
+    },
   }
   const context = vm.createContext({
     Blob,
     EventTarget,
+    Event,
     MessageEvent,
     Worker: FakeWorker,
     OffscreenCanvas: class {},
@@ -105,7 +142,9 @@ function harness({ failFrame = null, stallFrameOnce = null, fastTimeout = false 
 
   const mocks = {
     'webextension-polyfill': {
-      default: { runtime: { getURL: (file) => `chrome-extension://test/${file}` } },
+      default: {
+        runtime: { getURL: (file) => `chrome-extension://test/${file}` },
+      },
     },
     '../EVT': { EVT: { fire: (name) => events.push(name) } },
     '../Tools': { Tools },
@@ -142,16 +181,14 @@ test('WebM decodes and transfers one frame at a time', async () => {
   const h = harness()
   let started
   const info = {
-    frames: [
-      { delay: 80 },
-      { delay: 90 },
-      { delay: 100 },
-    ],
+    frames: [{ delay: 80 }, { delay: 90 }, { delay: 100 }],
   }
   const result = await h.toWebM.convertFromZip(
     new Blob(['fake-zip']),
     info,
-    (details) => { started = details }
+    (details) => {
+      started = details
+    }
   )
   assert.equal(result.size, 4)
   assert.equal(started.frameCount, 3)
@@ -167,7 +204,11 @@ test('WebM decodes and transfers one frame at a time', async () => {
   )
   assert.deepEqual(
     h.messages.filter((x) => x.type === 'frame').map((x) => [x.index, x.delay]),
-    [[0, 80], [1, 90], [2, 100]]
+    [
+      [0, 80],
+      [1, 90],
+      [2, 100],
+    ]
   )
   assert.deepEqual(h.events, ['convertSuccess'])
 })
@@ -188,14 +229,12 @@ test('WebM streaming cancels the worker job after a frame failure', async () => 
   assert.deepEqual(h.events, [])
 })
 
-
 test('WebM rejects inconsistent ZIP and metadata frame counts', async () => {
   const h = harness()
   await assert.rejects(
-    h.toWebM.convertFromZip(
-      new Blob(['fake-zip']),
-      { frames: [{ delay: 80 }, { delay: 90 }] }
-    ),
+    h.toWebM.convertFromZip(new Blob(['fake-zip']), {
+      frames: [{ delay: 80 }, { delay: 90 }],
+    }),
     /metadata count mismatch/
   )
   assert.equal(h.getDecoded(), 0)
@@ -205,10 +244,9 @@ test('WebM rejects inconsistent ZIP and metadata frame counts', async () => {
 test('WebM rejects a missing frame delay instead of substituting zero', async () => {
   const h = harness()
   await assert.rejects(
-    h.toWebM.convertFromZip(
-      new Blob(['fake-zip']),
-      { frames: [{ delay: 80 }, {}, { delay: 100 }] }
-    ),
+    h.toWebM.convertFromZip(new Blob(['fake-zip']), {
+      frames: [{ delay: 80 }, {}, { delay: 100 }],
+    }),
     /Invalid WebM frame delay at index 1/
   )
   assert.equal(h.getDecoded(), 0)
@@ -230,3 +268,17 @@ test('WebM timeout terminates the in-flight worker before retry', async () => {
   assert.equal(h.getCreatedWorkers(), 2)
   assert.equal(h.getOutstanding(), 0)
 })
+
+for (const workerFault of ['error', 'messageerror']) {
+  test(`WebM propagates ${workerFault}, terminates the worker and releases decoded frames`, async () => {
+    const h = harness({ workerFault })
+    await assert.rejects(
+      h.toWebM.convertFromZip(new Blob(['fake-zip']), {
+        frames: [{ delay: 80 }, { delay: 90 }, { delay: 100 }],
+      }),
+      new RegExp(`Whammy worker ${workerFault} waiting for ready`)
+    )
+    assert.equal(h.getTerminatedWorkers(), 1)
+    assert.equal(h.getOutstanding(), 0)
+  })
+}

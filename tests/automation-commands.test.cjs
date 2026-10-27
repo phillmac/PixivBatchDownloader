@@ -408,3 +408,65 @@ test('token invalidation prevents a timed-out asynchronous command from starting
   )
   assert.equal(h.bindings.getAutomationCommandBindings().token, freshToken)
 })
+
+for (const command of ['download.pause', 'download.stop']) {
+  test(`${command} cancels a pending internal retry through the owned command API`, async () => {
+    const h = harness()
+    h.store.result.push({ id: '1' })
+    h.status.phase = 'PAUSED_RESUMABLE'
+    h.status.controller = { pause: true, pauseReason: 'retry-errors' }
+    const receipt = await h.api.runAutomationCommand(await h.request(command))
+    assert.equal(receipt.outcome, 'accepted')
+    assert.deepEqual(h.calls, [command.split('.')[1]])
+  })
+  test(`${command} still refuses an arbitrary paused download`, async () => {
+    const h = harness()
+    h.store.result.push({ id: '1' })
+    h.status.phase = 'PAUSED_RESUMABLE'
+    h.status.controller = { pause: true, pauseReason: 'user' }
+    const receipt = await h.api.runAutomationCommand(await h.request(command))
+    assert.equal(receipt.reason, 'not-downloading')
+    assert.deepEqual(h.calls, [])
+  })
+}
+
+test('explicit retry cancellation revokes a previously prepared start permission', async () => {
+  const h = harness()
+  h.store.result.push({ id: '1' })
+  h.status.phase = 'PAUSED_RESUMABLE'
+  h.status.controller = { pause: true, pauseReason: 'retry-errors' }
+  h.prepared(true)
+  const request = await h.request('download.start')
+  h.status.controller.pauseReason = 'user'
+  h.fire('downloadPauseReasonChange')
+  const receipt = await h.api.runAutomationCommand(request)
+  assert.equal(receipt.outcome, 'refused')
+  assert.equal(receipt.reason, 'stale-token')
+  assert.deepEqual(h.calls, [])
+})
+
+test('a stale retry reason without a paused controller cannot authorize pause or stop', async () => {
+  for (const command of ['download.pause', 'download.stop']) {
+    const h = harness()
+    h.store.result.push({ id: '1' })
+    h.status.phase = 'READY'
+    h.status.controller = { pause: false, pauseReason: 'retry-errors' }
+    const receipt = await h.api.runAutomationCommand(await h.request(command))
+    assert.equal(receipt.reason, 'not-downloading')
+    assert.deepEqual(h.calls, [])
+  }
+})
+
+test('retry stop cannot clear another operation busy state', async () => {
+  const h = harness()
+  h.store.result.push({ id: '1' })
+  h.status.phase = 'BOOKMARKING'
+  h.status.controller = { pause: true, pauseReason: 'retry-errors' }
+  h.states.busy = true
+  const receipt = await h.api.runAutomationCommand(
+    await h.request('download.stop')
+  )
+  assert.equal(receipt.reason, 'not-downloading')
+  assert.equal(h.states.busy, true)
+  assert.deepEqual(h.calls, [])
+})

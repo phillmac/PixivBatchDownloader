@@ -330,6 +330,14 @@ class Download {
         this.leaseLossRetry++
         if (this.leaseLossRetry >= Config.retryMax) {
           console.error('Global download lease repeatedly lost:', error)
+          downloadDiagnostics.enter(
+            this.diagnosticId,
+            'global-lease-retry-max',
+            {
+              retry: this.leaseLossRetry,
+              error: downloadDiagnostics.errorDetails(error),
+            }
+          )
           progressBar.errorColor(this.progressBarIndex, true)
           this.error = true
           EVT.fire('downloadError', arg.id)
@@ -418,7 +426,9 @@ class Download {
         const tip = lang.transl('_状态码为0的错误提示')
         log.error(tip)
         msgBox.error(tip)
-        return EVT.fire('requestPauseDownload')
+        return EVT.fire('requestPauseDownload', {
+          reason: 'status-zero-fast-retries',
+        })
       }
     }
 
@@ -564,6 +574,13 @@ class Download {
                 ? error.toLogHTML(lang.transl('_APNG失败诊断'))
                 : '')
           )
+          downloadDiagnostics.enter(this.diagnosticId, 'conversion-error', {
+            artworkId: result.idNum,
+            format,
+            error: downloadDiagnostics.errorDetails(error),
+            apngReport:
+              error instanceof APNGConversionError ? error.report : undefined,
+          })
           this.error = true
           // 转换动图出错时，只要出错 1 次就会暂时跳过它，等下载完其他文件再重试它
           EVT.fire('downloadError', result.id)

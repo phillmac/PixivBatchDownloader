@@ -12,7 +12,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   Config: () => (/* binding */ Config)
 /* harmony export */ });
-/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
 
 // 定义一些预设配置和运行时的常量
@@ -105,6 +105,237 @@ class Config {
 
 /***/ },
 
+/***/ "./src/ts/crawl/CrawlRatePolicy.ts"
+/*!*****************************************!*\
+  !*** ./src/ts/crawl/CrawlRatePolicy.ts ***!
+  \*****************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   CRAWL_RATE_PORT: () => (/* binding */ CRAWL_RATE_PORT),
+/* harmony export */   FAST_ALLOWANCE_WORKS: () => (/* binding */ FAST_ALLOWANCE_WORKS),
+/* harmony export */   FAST_TO_PACED_THRESHOLD: () => (/* binding */ FAST_TO_PACED_THRESHOLD),
+/* harmony export */   PACED_INTERVAL_MS: () => (/* binding */ PACED_INTERVAL_MS),
+/* harmony export */   SESSION_TTL_MS: () => (/* binding */ SESSION_TTL_MS),
+/* harmony export */   UNKNOWN_ACCOUNT: () => (/* binding */ UNKNOWN_ACCOUNT),
+/* harmony export */   expireCrawls: () => (/* binding */ expireCrawls),
+/* harmony export */   finishCrawl: () => (/* binding */ finishCrawl),
+/* harmony export */   permitCrawl: () => (/* binding */ permitCrawl),
+/* harmony export */   readCrawlRateState: () => (/* binding */ readCrawlRateState),
+/* harmony export */   registerCrawl: () => (/* binding */ registerCrawl),
+/* harmony export */   snapshotCrawl: () => (/* binding */ snapshotCrawl)
+/* harmony export */ });
+/** 快速抓取预算；与 v1 的模式切换阈值保持独立。 */
+const FAST_ALLOWANCE_WORKS = 100;
+/** v1 单次抓取超过此数量时立即采用限速模式。 */
+const FAST_TO_PACED_THRESHOLD = 50;
+/** 同一账号的限速作品请求启动间隔。 */
+const PACED_INTERVAL_MS = 1800;
+/** 长时间未注册或申请许可的会话失效；保留账号屏障。 */
+const SESSION_TTL_MS = 5 * 60 * 1000;
+/** PPBD 元数据限速专用端口。 */
+const CRAWL_RATE_PORT = 'ppbd-crawl-rate';
+/** 无法识别登录账号时仍共用稳定作用域。 */
+const UNKNOWN_ACCOUNT = 'unknown-account';
+/** 在持有 worker 串行锁时注册；重连不能重置预算或模式。 */
+function registerCrawl(state, id, account, tabId, workCount, now = Date.now()) {
+    expireCrawls(state, now);
+    if (state.sessions[id]) {
+        const existing = state.sessions[id];
+        if (existing.account !== account || existing.tabId !== tabId)
+            throw new Error('Crawl session ownership mismatch');
+        existing.workCount = Math.max(existing.workCount, workCount);
+        if (workCount > FAST_TO_PACED_THRESHOLD)
+            promoteCrawl(existing, 'work-count-threshold');
+        existing.expiresAt = now + SESSION_TTL_MS;
+    }
+    else {
+        state.sessions[id] = {
+            account,
+            tabId,
+            paced: workCount > FAST_TO_PACED_THRESHOLD ||
+                (state.nextAt[account] || 0) > now ||
+                Object.values(state.sessions).some((s) => s.account === account),
+            workCount,
+            reason: workCount > FAST_TO_PACED_THRESHOLD
+                ? 'work-count-threshold'
+                : Object.values(state.sessions).some((s) => s.account === account)
+                    ? 'concurrent-crawl'
+                    : (state.nextAt[account] || 0) > now
+                        ? 'recent-account-activity'
+                        : 'sole-fast-crawl',
+            started: 0,
+            expiresAt: now + SESSION_TTL_MS,
+        };
+    }
+    // 并发或重连注册时，同账号所有存活会话立即进入限速模式。
+    const sessions = Object.values(state.sessions).filter((session) => session.account === account);
+    if (sessions.length > 1) {
+        for (const session of sessions)
+            promoteCrawl(session, 'concurrent-crawl');
+    }
+}
+/** 不预订未来许可；实际授予时持久化下一次最早启动时间。 */
+function permitCrawl(state, id, now) {
+    expireCrawls(state, now);
+    const session = state.sessions[id];
+    if (!session)
+        throw new Error('Crawl session no longer active');
+    session.expiresAt = now + SESSION_TTL_MS;
+    if (session.started >= FAST_ALLOWANCE_WORKS)
+        promoteCrawl(session, 'fast-allowance-exhausted');
+    const next = Math.max(state.nextAt[session.account] || 0, (state.lastAt[session.account] ?? -PACED_INTERVAL_MS) + PACED_INTERVAL_MS);
+    if (session.paced) {
+        const waiting = (state.waiting[session.account] ||= []);
+        if (!waiting.includes(id))
+            waiting.push(id);
+        if (next > now || waiting[0] !== id)
+            return { granted: false, retryAfterMs: Math.max(0, next - now) };
+        waiting.shift();
+        if (!waiting.length)
+            delete state.waiting[session.account];
+    }
+    session.started++;
+    state.lastAt[session.account] = now;
+    state.nextAt[session.account] = now + PACED_INTERVAL_MS;
+    return { granted: true, retryAfterMs: 0 };
+}
+/** 完成或关闭标签页时撤销会话和等待位置，保留账号屏障。 */
+function finishCrawl(state, id) {
+    delete state.sessions[id];
+    pruneWaiting(state);
+}
+/** 清除已撤销、跨账号或非限速会话，保持存活会话的顺序。 */
+function pruneWaiting(state) {
+    for (const [account, ids] of Object.entries(state.waiting)) {
+        const live = ids.filter((id) => state.sessions[id]?.account === account && state.sessions[id].paced);
+        if (live.length)
+            state.waiting[account] = live;
+        else
+            delete state.waiting[account];
+    }
+}
+/** 过期仅撤销会话，不能删除最近许可留下的账号屏障。 */
+function expireCrawls(state, now) {
+    for (const [id, session] of Object.entries(state.sessions)) {
+        if (session.expiresAt <= now)
+            delete state.sessions[id];
+    }
+    pruneWaiting(state);
+}
+/** 检查持久化对象，拒绝损坏状态以免绕过账号屏障。 */
+function readCrawlRateState(value, now) {
+    if (value === undefined)
+        return { sessions: {}, nextAt: {}, lastAt: {}, waiting: {} };
+    if (!isRecord(value) || !isRecord(value.sessions))
+        throw new Error('Invalid crawl rate state');
+    const nextAt = readTimes(value.nextAt);
+    // 旧版本没有 lastAt 时从已持久化的 nextAt 恢复。
+    const lastAt = value.lastAt === undefined ? {} : readTimes(value.lastAt);
+    const sessions = Object.create(null);
+    for (const [id, entry] of Object.entries(value.sessions)) {
+        if (!isRecord(entry) ||
+            typeof entry.account !== 'string' ||
+            !Number.isInteger(entry.tabId) ||
+            typeof entry.tabId !== 'number' ||
+            typeof entry.paced !== 'boolean' ||
+            typeof entry.started !== 'number' ||
+            !Number.isSafeInteger(entry.started) ||
+            entry.started < 0 ||
+            (entry.workCount !== undefined &&
+                (typeof entry.workCount !== 'number' ||
+                    !Number.isFinite(entry.workCount) ||
+                    entry.workCount < 0)) ||
+            (entry.reason !== undefined && typeof entry.reason !== 'string') ||
+            (entry.expiresAt !== undefined &&
+                (typeof entry.expiresAt !== 'number' ||
+                    !Number.isFinite(entry.expiresAt))))
+            throw new Error('Invalid crawl rate session');
+        sessions[id] = {
+            account: entry.account,
+            tabId: entry.tabId,
+            // 旧记录缺少遥测字段时无法证明快速资格，保守恢复为限速。
+            paced: entry.paced || entry.workCount === undefined || !entry.reason,
+            workCount: typeof entry.workCount === 'number' ? entry.workCount : entry.started,
+            reason: entry.workCount !== undefined &&
+                typeof entry.reason === 'string' &&
+                entry.reason
+                ? entry.reason
+                : 'legacy-state-unknown',
+            started: entry.started,
+            expiresAt: typeof entry.expiresAt === 'number'
+                ? entry.expiresAt
+                : now + SESSION_TTL_MS,
+        };
+    }
+    // 旧状态尚无队列；损坏的队列必须拒绝，不能跳过等待者。
+    const waiting = Object.create(null);
+    if (value.waiting !== undefined) {
+        if (!isRecord(value.waiting))
+            throw new Error('Invalid crawl rate queue');
+        for (const [account, ids] of Object.entries(value.waiting)) {
+            if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string'))
+                throw new Error('Invalid crawl rate queue');
+            waiting[account] = [...new Set(ids)];
+        }
+    }
+    const state = { sessions, nextAt, lastAt, waiting };
+    expireCrawls(state, now);
+    return state;
+}
+/** unknown 对象缩窄后才能读取字段。 */
+function isRecord(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+/** 复制时间屏障并验证所有值。 */
+function readTimes(value) {
+    if (!isRecord(value))
+        throw new Error('Invalid crawl rate timestamps');
+    const result = Object.create(null);
+    for (const [account, time] of Object.entries(value)) {
+        if (typeof time !== 'number' || !Number.isFinite(time) || time < 0)
+            throw new Error('Invalid crawl rate timestamp');
+        result[account] = time;
+    }
+    return result;
+}
+/** 保持限速模式；显式数量/额度原因优先于并发和近期活动。 */
+function promoteCrawl(session, reason) {
+    const explicit = (value) => value === 'work-count-threshold' || value === 'fast-allowance-exhausted';
+    if (!session.paced ||
+        (!explicit(session.reason) &&
+            (explicit(reason) || reason === 'concurrent-crawl')))
+        session.reason = reason;
+    session.paced = true;
+}
+/** 只读会话和账号聚合；清理过期记录但不续期或预订许可。 */
+function snapshotCrawl(state, id, tabId, now) {
+    expireCrawls(state, now);
+    const session = state.sessions[id];
+    if (!session || session.tabId !== tabId)
+        throw new Error('Crawl session ownership lost');
+    const sessions = Object.values(state.sessions).filter((s) => s.account === session.account);
+    return {
+        policy: {
+            accountId: session.account,
+            workCount: session.workCount,
+            fastAllowanceWorks: FAST_ALLOWANCE_WORKS,
+            switchThresholdWorks: FAST_TO_PACED_THRESHOLD,
+            pacedIntervalMs: PACED_INTERVAL_MS,
+            mode: session.paced ? 'paced' : 'fast',
+            reason: session.reason,
+        },
+        activeCrawls: sessions.length,
+        pacedCrawls: sessions.filter((s) => s.paced).length,
+        waitingCrawls: state.waiting[session.account]?.length || 0,
+    };
+}
+
+
+/***/ },
+
 /***/ "./src/ts/serviceWorker/CheckDownloadCount.ts"
 /*!****************************************************!*\
   !*** ./src/ts/serviceWorker/CheckDownloadCount.ts ***!
@@ -113,7 +344,7 @@ class Config {
 
 "use strict";
 __webpack_require__.r(__webpack_exports__);
-/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
 
 // 这是一个 SW 脚本
@@ -194,6 +425,128 @@ async function sendWarningToAllTabs() {
 
 /***/ },
 
+/***/ "./src/ts/serviceWorker/CrawlRateCoordinator.ts"
+/*!******************************************************!*\
+  !*** ./src/ts/serviceWorker/CrawlRateCoordinator.ts ***!
+  \******************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var _crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../crawl/CrawlRatePolicy */ "./src/ts/crawl/CrawlRatePolicy.ts");
+
+
+/** 仅 PPBD 使用的持久化键。 */
+const storageKey = 'ppbdCrawlRateV1';
+/** 全部读改写操作共用串行锁，许可返回前必须持久化成功。 */
+let queue = Promise.resolve();
+/** session 不可用时退回 local；每次操作重新读取，避免失败污染缓存。 */
+let storage = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage).session || (webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage).local;
+/** 执行可恢复的存储操作。 */
+async function useStorage(op) {
+    try {
+        return await op(storage);
+    }
+    catch (error) {
+        if (storage === (webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage).local)
+            throw error;
+        storage = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage).local;
+        return op(storage);
+    }
+}
+/** 读取状态并串行持久化；存储失败绝不授予许可。 */
+function mutate(op) {
+    const result = queue.then(async () => {
+        // local 镜像作为恢复基准，防止重启后 session 再次可用而遗漏旧 fallback 屏障。
+        const localData = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.get(storageKey);
+        const sessionData = await useStorage((area) => area.get(storageKey));
+        const data = localData[storageKey] !== undefined ? localData : sessionData;
+        const state = (0,_crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.readCrawlRateState)(data[storageKey], Date.now());
+        const reply = op(state);
+        await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.set({ [storageKey]: state });
+        await useStorage((area) => area.set({ [storageKey]: state }));
+        return reply;
+    });
+    queue = result.catch(() => undefined);
+    return result;
+}
+/** 导航/关闭撤销旧标签页全部会话；保留账号时间屏障。 */
+function removeTab(tabId) {
+    void mutate((state) => {
+        for (const [id, session] of Object.entries(state.sessions)) {
+            if (session.tabId === tabId)
+                (0,_crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.finishCrawl)(state, id);
+        }
+    }).catch(console.warn);
+}
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().tabs.onRemoved.addListener(removeTab);
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().tabs.onUpdated.addListener((tabId, change) => {
+    if (change.status === 'loading' || change.discarded)
+        removeTab(tabId);
+});
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.onConnect.addListener((port) => {
+    if (port.name !== _crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.CRAWL_RATE_PORT)
+        return;
+    const tabId = port.sender?.tab?.id;
+    if (tabId === undefined)
+        return port.disconnect();
+    let connected = true;
+    port.onDisconnect.addListener(() => {
+        connected = false;
+    });
+    port.onMessage.addListener((message) => {
+        if (!message || typeof message !== 'object')
+            return;
+        const msg = message;
+        if (typeof msg.id !== 'string' ||
+            !msg.id ||
+            typeof msg.request !== 'string')
+            return;
+        const id = msg.id;
+        const result = mutate((state) => {
+            if (!connected)
+                throw new Error('Crawl document disconnected');
+            if (msg.action === 'register') {
+                if (typeof msg.workCount !== 'number' ||
+                    !Number.isFinite(msg.workCount) ||
+                    msg.workCount < 1)
+                    throw new Error('Invalid work count');
+                const account = typeof msg.account === 'string' && /^\d+$/.test(msg.account)
+                    ? msg.account
+                    : _crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.UNKNOWN_ACCOUNT;
+                (0,_crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.registerCrawl)(state, id, account, tabId, msg.workCount, Date.now());
+                return { granted: true };
+            }
+            if (state.sessions[id]?.tabId !== tabId)
+                throw new Error('Crawl session ownership lost');
+            if (msg.action === 'status')
+                return { snapshot: (0,_crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.snapshotCrawl)(state, id, tabId, Date.now()) };
+            if (msg.action === 'finish') {
+                (0,_crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.finishCrawl)(state, id);
+                return { granted: true };
+            }
+            if (msg.action !== 'permit')
+                throw new Error('Unknown crawl action');
+            return (0,_crawl_CrawlRatePolicy__WEBPACK_IMPORTED_MODULE_1__.permitCrawl)(state, id, Date.now());
+        });
+        void result.then((reply) => {
+            if (connected)
+                port.postMessage({ ...reply, request: msg.request });
+        }, () => {
+            if (connected)
+                port.postMessage({
+                    error: 'Crawl coordinator unavailable',
+                    request: msg.request,
+                });
+        });
+    });
+});
+
+
+/***/ },
+
 /***/ "./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts"
 /*!***********************************************************!*\
   !*** ./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts ***!
@@ -205,7 +558,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   downloadWorkerDiagnostics: () => (/* binding */ downloadWorkerDiagnostics)
 /* harmony export */ });
-/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
 
 /** 每个标签页保留的最近 worker 诊断事件数量。 */
@@ -343,7 +696,7 @@ const downloadWorkerDiagnostics = new DownloadWorkerDiagnostics();
 
 "use strict";
 __webpack_require__.r(__webpack_exports__);
-/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
 /* harmony import */ var _backgroundAPI__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./backgroundAPI */ "./src/ts/serviceWorker/backgroundAPI.ts");
 
@@ -686,6 +1039,62 @@ new ManageFollowing();
 
 /***/ },
 
+/***/ "./src/ts/serviceWorker/SettingPersistence.ts"
+/*!****************************************************!*\
+  !*** ./src/ts/serviceWorker/SettingPersistence.ts ***!
+  \****************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   handleSettingPatch: () => (/* binding */ handleSettingPatch)
+/* harmony export */ });
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
+/* harmony import */ var _setting_SettingPersistence__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ../setting/SettingPersistence */ "./src/ts/setting/SettingPersistence.ts");
+
+
+
+/** 跨标签页串行合并设置，避免整个旧副本覆盖其他设置。 */
+let queue = Promise.resolve();
+/** 由唯一的 runtime 消息分发器调用，避免多个异步监听器争抢响应。 */
+function handleSettingPatch(message) {
+    if (!message || typeof message !== 'object')
+        return;
+    const msg = message;
+    if (msg.msg !== _setting_SettingPersistence__WEBPACK_IMPORTED_MODULE_2__.SETTING_PATCH_MESSAGE)
+        return;
+    const result = queue.then(async () => {
+        if (!msg.patch ||
+            typeof msg.patch !== 'object' ||
+            Array.isArray(msg.patch)) {
+            throw new Error('Invalid settings patch');
+        }
+        const patch = msg.patch;
+        const crawlPage = msg.crawlPage;
+        if (crawlPage !== undefined &&
+            (!Number.isInteger(crawlPage) || typeof crawlPage !== 'number')) {
+            throw new Error('Invalid crawl page');
+        }
+        const data = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.get(_Config__WEBPACK_IMPORTED_MODULE_1__.Config.settingStoreName);
+        const next = (0,_setting_SettingPersistence__WEBPACK_IMPORTED_MODULE_2__.mergeSettingPatch)((data[_Config__WEBPACK_IMPORTED_MODULE_1__.Config.settingStoreName] || {}), patch, crawlPage);
+        await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.set({ [_Config__WEBPACK_IMPORTED_MODULE_1__.Config.settingStoreName]: next });
+        const verified = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.get(_Config__WEBPACK_IMPORTED_MODULE_1__.Config.settingStoreName);
+        if ((0,_setting_SettingPersistence__WEBPACK_IMPORTED_MODULE_2__.canonicalSettingValue)(verified[_Config__WEBPACK_IMPORTED_MODULE_1__.Config.settingStoreName]) !==
+            (0,_setting_SettingPersistence__WEBPACK_IMPORTED_MODULE_2__.canonicalSettingValue)(next)) {
+            throw new Error('Settings persistence verification failed');
+        }
+        return { persisted: true };
+    });
+    queue = result.catch(() => undefined);
+    return result;
+}
+
+
+/***/ },
+
 /***/ "./src/ts/serviceWorker/backgroundAPI.ts"
 /*!***********************************************!*\
   !*** ./src/ts/serviceWorker/backgroundAPI.ts ***!
@@ -731,10 +1140,54 @@ class backgroundAPI {
 
 /***/ },
 
-/***/ "./node_modules/webextension-polyfill/dist/browser-polyfill.js"
-/*!*********************************************************************!*\
-  !*** ./node_modules/webextension-polyfill/dist/browser-polyfill.js ***!
-  \*********************************************************************/
+/***/ "./src/ts/setting/SettingPersistence.ts"
+/*!**********************************************!*\
+  !*** ./src/ts/setting/SettingPersistence.ts ***!
+  \**********************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   SETTING_PATCH_MESSAGE: () => (/* binding */ SETTING_PATCH_MESSAGE),
+/* harmony export */   canonicalSettingValue: () => (/* binding */ canonicalSettingValue),
+/* harmony export */   mergeSettingPatch: () => (/* binding */ mergeSettingPatch)
+/* harmony export */ });
+/** 设置存储协议；所有内容脚本的写入由后台串行处理。 */
+const SETTING_PATCH_MESSAGE = 'ppbd_setting_patch';
+/** 合并设置补丁，保留未修改的设置与其他页面的抓取限制。 */
+function mergeSettingPatch(stored, patch, crawlPage) {
+    const next = { ...stored, ...patch };
+    if (patch.crawlNumber !== undefined) {
+        next.crawlNumber = {
+            ...stored.crawlNumber,
+            ...(crawlPage === undefined
+                ? patch.crawlNumber
+                : { [crawlPage]: patch.crawlNumber }),
+        };
+    }
+    return next;
+}
+/** storage 对象键顺序不属于值语义；验证时使用稳定的序列化顺序。 */
+function canonicalSettingValue(value) {
+    return JSON.stringify(value, (_key, item) => {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+            const object = item;
+            return Object.fromEntries(Object.keys(object)
+                .sort()
+                .map((key) => [key, object[key]]));
+        }
+        return item;
+    });
+}
+
+
+/***/ },
+
+/***/ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js"
+/*!**********************************************************************************************!*\
+  !*** ../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js ***!
+  \**********************************************************************************************/
 (module, exports) {
 
 var __WEBPACK_AMD_DEFINE_FACTORY__, __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;(function (global, factory) {
@@ -2034,30 +2487,34 @@ let __webpack_exports__ = {};
   !*** ./src/ts/serviceWorker/background.ts ***!
   \********************************************/
 __webpack_require__.r(__webpack_exports__);
-/* harmony import */ var _ManageFollowing__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./ManageFollowing */ "./src/ts/serviceWorker/ManageFollowing.ts");
-/* harmony import */ var _CheckDownloadCount__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./CheckDownloadCount */ "./src/ts/serviceWorker/CheckDownloadCount.ts");
-/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
-/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_2__);
-/* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
-/* harmony import */ var _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ./DownloadWorkerDiagnostics */ "./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts");
+/* harmony import */ var _SettingPersistence__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./SettingPersistence */ "./src/ts/serviceWorker/SettingPersistence.ts");
+/* harmony import */ var _CrawlRateCoordinator__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./CrawlRateCoordinator */ "./src/ts/serviceWorker/CrawlRateCoordinator.ts");
+/* harmony import */ var _ManageFollowing__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./ManageFollowing */ "./src/ts/serviceWorker/ManageFollowing.ts");
+/* harmony import */ var _CheckDownloadCount__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./CheckDownloadCount */ "./src/ts/serviceWorker/CheckDownloadCount.ts");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
+/* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_4__);
+/* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
+/* harmony import */ var _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! ./DownloadWorkerDiagnostics */ "./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts");
+
+
 
 
 
 
 
 // 当点击扩展图标时，显示/隐藏下载面板
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().action.onClicked.addListener(function (tab) {
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().action.onClicked.addListener(function (tab) {
     // 如果在本程序没有权限的页面上点击扩展图标，url 始终是 undefined，此时不发送消息
     if (!tab.url) {
         return;
     }
-    webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.sendMessage(tab.id, {
+    webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().tabs.sendMessage(tab.id, {
         msg: 'click_icon',
     });
 });
 // 当扩展被安装、被更新、或者浏览器升级时，初始化数据
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onInstalled.addListener(() => {
-    webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.set({ batchNo: {}, idList: {} });
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().runtime.onInstalled.addListener(() => {
+    webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage.local.set({ batchNo: {}, idList: {} });
 });
 // 存储每个下载任务的数据，这是因为下载完成的顺序和前台发送的顺序可能不一致，所以需要把数据保存起来以供使用
 const dlData = {};
@@ -2069,15 +2526,15 @@ let idList = {};
 // 如果不进行持久化存储，如果前台任务处于下载途中，后台 SW 被回收了，那么变量也会被清除。之后前台传递过来的可能还是同一批下载里的任务，但是后台却丢失了记录。这可能会导致下载出现重复文件等异常。
 // 实际上，下载时后台 SW 会持续存在很长时间，不会轻易被回收的。持久化存储只是为了以防万一
 async function setData(data) {
-    return webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.set(data);
+    return webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage.local.set(data);
 }
 /** 立即持久化 worker 侧异常，避免 MV3 worker 休眠后丢失证据。 */
 async function persistDownloadWorkerIncident(tabId, reason, details = {}) {
-    const worker = await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.snapshot(tabId, {
+    const worker = await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.snapshot(tabId, {
         memoryBatchNo: batchNo[tabId],
         memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
     });
-    await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.persist(tabId, {
+    await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, {
         schemaVersion: 1,
         diagnosticsVersion: 'download-hang-v1',
         source: 'service-worker',
@@ -2104,9 +2561,9 @@ let activeGlobalDownloadLease;
 /** 串行化租约读写，避免两个标签页同时修改 session storage。 */
 let globalDownloadLeaseOperationQueue = Promise.resolve();
 /** 当前用于持久化租约的存储区域；旧浏览器没有 session 时退回 local。 */
-let globalDownloadLeaseStorageArea = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).session || (webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).local;
+let globalDownloadLeaseStorageArea = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage).session || (webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage).local;
 /** 标记租约是否已经退回 local storage，避免失败后重复尝试 session。 */
-let globalDownloadLeaseUsesLocalStorage = !(webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).session;
+let globalDownloadLeaseUsesLocalStorage = !(webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage).session;
 /**
  * 执行一次租约存储操作。session 不可用或运行时拒绝时改用 local；
  * local 中残留的租约仍受 45 秒 TTL 限制，不会永久阻塞下一次浏览器会话。
@@ -2119,7 +2576,7 @@ async function useGlobalDownloadLeaseStorage(operation) {
         if (globalDownloadLeaseUsesLocalStorage)
             throw error;
         globalDownloadLeaseUsesLocalStorage = true;
-        globalDownloadLeaseStorageArea = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage).local;
+        globalDownloadLeaseStorageArea = (webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage).local;
         console.warn('storage.session unavailable; using storage.local for lease', error);
         return operation(globalDownloadLeaseStorageArea);
     }
@@ -2244,12 +2701,12 @@ async function clearGlobalDownloadLeaseForTab(tabId) {
         }
     });
 }
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onRemoved.addListener((tabId) => {
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().tabs.onRemoved.addListener((tabId) => {
     clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
         console.warn('Failed to clear global download lease for closed tab', error);
     });
 });
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onUpdated.addListener((tabId, changeInfo) => {
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().tabs.onUpdated.addListener((tabId, changeInfo) => {
     // 完整导航/刷新和 discarded 都会卸载旧文档，旧 content script 无法保证 finally 能执行。
     if (changeInfo.discarded === true || changeInfo.status === 'loading') {
         clearGlobalDownloadLeaseForTab(tabId).catch((error) => {
@@ -2257,7 +2714,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.onUpdated.addL
         });
     }
 });
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onConnect.addListener((port) => {
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().runtime.onConnect.addListener((port) => {
     if (port.name !== globalDownloadLeasePortName)
         return;
     const tabId = port.sender?.tab?.id;
@@ -2293,16 +2750,19 @@ function isDownloadDiagnosticMessage(msg) {
 function isMsg(msg) {
     return !!msg.msg;
 }
-webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.addListener(async function (msg, sender) {
+webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().runtime.onMessage.addListener(async function (msg, sender) {
     const tabId = sender.tab?.id;
+    const settingPatch = (0,_SettingPersistence__WEBPACK_IMPORTED_MODULE_0__.handleSettingPatch)(msg);
+    if (settingPatch)
+        return settingPatch;
     if (isDownloadDiagnosticMessage(msg)) {
         if (msg.msg === 'get_download_worker_diagnostics') {
             if (tabId === undefined)
                 return { unavailable: true, reason: 'no-tab-id' };
-            const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.get(['batchNo', 'idList']);
+            const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage.local.get(['batchNo', 'idList']);
             const storedBatchNo = stored.batchNo;
             const storedIdList = stored.idList;
-            return _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.snapshot(tabId, {
+            return _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.snapshot(tabId, {
                 memoryBatchNo: batchNo[tabId],
                 memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
                 storedBatchNo: storedBatchNo?.[tabId],
@@ -2311,7 +2771,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
         }
         if (tabId === undefined)
             return { stored: false, reason: 'no-tab-id' };
-        await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.persist(tabId, msg.report);
+        await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, msg.report);
         return { stored: true };
     }
     // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
@@ -2326,14 +2786,14 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
     const conflictAction = msg.conflictAction || 'overwrite';
     // 下载作品的文件
     if (msg.msg === 'save_work_file') {
-        _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'save-request-received', {
+        _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'save-request-received', {
             workId: msg.id,
             fileName: msg.fileName,
         });
         // 当处于初始状态时，或者变量被回收了，就从存储中读取数据储存在变量中
         // 之后每当要使用这两个数据时，从变量读取，而不是从存储中获得。这样就解决了数据不同步的问题，而且性能更高
         if (Object.keys(batchNo).length === 0) {
-            const data = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().storage.local.get(['batchNo', 'idList']);
+            const data = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage.local.get(['batchNo', 'idList']);
             batchNo = data.batchNo;
             idList = data.idList;
         }
@@ -2351,8 +2811,8 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
             setData({ idList });
             // 开始下载
             const _url = await getFileURL(msg);
-            _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-create-pending', { workId: msg.id, fileName: msg.fileName });
-            webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().downloads
+            _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-create-pending', { workId: msg.id, fileName: msg.fileName });
+            webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().downloads
                 .download({
                 url: _url,
                 filename: msg.fileName,
@@ -2360,7 +2820,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
                 saveAs: false,
             })
                 .then((id) => {
-                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-created', {
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-created', {
                     workId: msg.id,
                     fileName: msg.fileName,
                     browserDownloadId: id,
@@ -2377,7 +2837,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
                 };
             })
                 .catch((error) => {
-                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-create-rejected', {
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'browser-download-create-rejected', {
                     workId: msg.id,
                     fileName: msg.fileName,
                     error: String(error),
@@ -2387,7 +2847,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
             });
         }
         else {
-            _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'save-request-deduplicated', {
+            _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.enter(tabId, msg.diagnosticId, 'save-request-deduplicated', {
                 workId: msg.id,
                 fileName: msg.fileName,
                 idListLength: idList[tabId].length,
@@ -2407,7 +2867,7 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
         msg.msg === 'save_novel_embedded_image' ||
         msg.msg === 'save_novel_series_file') {
         const _url = await getFileURL(msg);
-        webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().downloads
+        webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().downloads
             .download({
             url: _url,
             filename: msg.fileName,
@@ -2439,8 +2899,8 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().runtime.onMessage.a
             },
             err: '',
         };
-        _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.finish(tabId, msg.diagnosticId, 'a-download-simulated-complete', { workId: msg.id, fileName: msg.fileName });
-        webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.sendMessage(tabId, data).catch((error) => {
+        _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.finish(tabId, msg.diagnosticId, 'a-download-simulated-complete', { workId: msg.id, fileName: msg.fileName });
+        webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().tabs.sendMessage(tabId, data).catch((error) => {
             console.error('回发 downloaded 消息失败', error);
             void persistDownloadWorkerIncident(tabId, 'result-message-rejected', {
                 workId: msg.id,
@@ -2489,8 +2949,8 @@ const UUIDRegexp = /[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}
 // 监听下载变化事件
 // 每个下载会触发两次 onChanged 事件
 // Firefox Android 不支持 downloads API（注册监听器时会抛出 "Not implemented" 错误），所以不注册该监听器
-if (!_Config__WEBPACK_IMPORTED_MODULE_3__.Config.downloadsAPIDisabled) {
-    webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().downloads.onChanged.addListener(async function (detail) {
+if (!_Config__WEBPACK_IMPORTED_MODULE_5__.Config.downloadsAPIDisabled) {
+    webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().downloads.onChanged.addListener(async function (detail) {
         // 根据 detail.id 取出保存的数据
         const _dlData = dlData[detail.id];
         if (_dlData) {
@@ -2507,7 +2967,7 @@ if (!_Config__WEBPACK_IMPORTED_MODULE_3__.Config.downloadsAPIDisabled) {
             }
             if (detail.state && detail.state.current === 'complete') {
                 msg = 'downloaded';
-                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.finish(_dlData.tabId, _dlData.diagnosticId, 'browser-download-complete', {
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.finish(_dlData.tabId, _dlData.diagnosticId, 'browser-download-complete', {
                     browserDownloadId: detail.id,
                     browserSetFilename: _dlData.browserSetFilename,
                 });
@@ -2515,7 +2975,7 @@ if (!_Config__WEBPACK_IMPORTED_MODULE_3__.Config.downloadsAPIDisabled) {
             if (detail.error && detail.error.current) {
                 msg = 'download_err';
                 err = detail.error.current;
-                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_4__.downloadWorkerDiagnostics.finish(_dlData.tabId, _dlData.diagnosticId, 'browser-download-error', { browserDownloadId: detail.id, error: err });
+                _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.finish(_dlData.tabId, _dlData.diagnosticId, 'browser-download-error', { browserDownloadId: detail.id, error: err });
                 // 当保存一个文件出错时，从任务记录列表里删除它，以便前台重试下载
                 const idIndex = idList[_dlData.tabId].findIndex((val) => val === _dlData.id);
                 idList[_dlData.tabId][idIndex] = '';
@@ -2524,7 +2984,7 @@ if (!_Config__WEBPACK_IMPORTED_MODULE_3__.Config.downloadsAPIDisabled) {
             if (msg) {
                 // 返回信息
                 if (!_dlData.noReply) {
-                    webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs
+                    webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().tabs
                         .sendMessage(_dlData.tabId, { msg, data: _dlData, err })
                         .catch((error) => {
                         console.error('回发 downloaded 消息失败', error);
@@ -2552,7 +3012,7 @@ async function clearData() {
     for (const key of Object.keys(idList)) {
         const tabId = parseInt(key);
         try {
-            await webextension_polyfill__WEBPACK_IMPORTED_MODULE_2___default().tabs.get(tabId);
+            await webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().tabs.get(tabId);
         }
         catch (error) {
             // 如果建立下载任务的标签页已经不存在，则会触发错误，如：

@@ -39,7 +39,7 @@ class CheckWarningMessage {
         msgBox.error(
           lang.transl('_过度访问警告') + '<br>' + lang.transl('_下载已暂停')
         )
-        return EVT.fire('requestPauseDownload')
+        return EVT.fire('requestPauseDownload', { reason: 'pixiv-warning' })
       }
     }
   }

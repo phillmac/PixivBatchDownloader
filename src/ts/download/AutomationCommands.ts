@@ -185,7 +185,14 @@ export async function runAutomationCommand(request: CommandRequest) {
     )
       return refused('not-startable')
     if (!store.result.length) return refused('empty-queue')
-  } else if (!states.downloading || phase !== 'DOWNLOADING') {
+  } else if (
+    (!states.downloading || phase !== 'DOWNLOADING') &&
+    !(
+      snapshot.status.controller?.pause === true &&
+      snapshot.status.controller?.pauseReason === 'retry-errors' &&
+      (request.command === 'download.pause' || !states.busy)
+    )
+  ) {
     return refused('not-downloading')
   }
   consumeAutomationCommandToken()

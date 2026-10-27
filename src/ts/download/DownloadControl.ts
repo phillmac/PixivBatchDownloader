@@ -41,7 +41,7 @@ class DownloadControl {
     this.bindEvents()
     registerAutomationDownload({
       start: () => this.startDownload(),
-      pause: () => this.pauseDownload(),
+      pause: () => this.pauseDownload('automation'),
       stop: () => this.stopDownload(),
       prepared: () => this.automationPrepared,
     })
@@ -53,6 +53,7 @@ class DownloadControl {
       remainingDownload: store.remainingDownload,
       resultLength: store.result.length,
       pause: this.pause,
+      pauseReason: this.pauseReason,
       stop: this.stop,
       busy: states.busy,
       downloading: states.downloading,
@@ -64,6 +65,7 @@ class DownloadControl {
       remainingDownload: store.remainingDownload,
       resultLength: store.result.length,
       pause: this.pause,
+      pauseReason: this.pauseReason,
       stop: this.stop,
       busy: states.busy,
       downloading: states.downloading,
@@ -129,6 +131,9 @@ class DownloadControl {
 
   private pause = false // 是否已经暂停下载
 
+  /** 最近一次暂停原因；仅在暂停状态期间保留，供自动化诊断读取。 */
+  private pauseReason: string | null = null
+
   private crawlIdListTimer: undefined | number = undefined
 
   private checkDownloadTimeoutTimer: undefined | number = undefined
@@ -165,6 +170,7 @@ class DownloadControl {
         // 当恢复了未完成的抓取数据时，将下载状态设置为暂停
         if (!states.busy) this.automationPrepared = false
         this.pause = ev.type === 'resume'
+        this.pauseReason = this.pause ? 'resume' : null
         //  resultChange 事件不需要打开下载面板，这是因为手动排除功能可能会频繁触发此事件，如果显示下载面板，那么会频繁打断用户的操作，影响用户体验。
         const openPanel = ev.type !== 'resultChange'
         // 让开始下载的方法进入事件队列，以便让其他模块里监听上述事件的代码先执行完毕
@@ -185,10 +191,14 @@ class DownloadControl {
       this.downloadError(id)
     })
 
-    window.addEventListener(EVT.list.requestPauseDownload, (ev) => {
-      // 请求暂停下载
-      this.pauseDownload()
-    })
+    window.addEventListener(
+      EVT.list.requestPauseDownload,
+      (ev: CustomEventInit) => {
+        // 请求暂停下载；保留调用方原因，避免自动化把内部重试暂停误判成异常。
+        const reason = ev.detail?.data?.reason
+        this.pauseDownload(typeof reason === 'string' ? reason : 'requested')
+      }
+    )
 
     // 如果下载器让浏览器保存文件到本地，但是之后没有收到回应（不知道文件是否有成功保存），这会导致下载进度卡住
     // 常见原因：浏览器显示了另存为窗口，但用户一直没有处理（即另存为窗口一直显示），所以浏览器不会告诉下载器文件的保存结果，导致等待超时
@@ -244,7 +254,7 @@ class DownloadControl {
         msgBox.once(this.uuidTip, lang.transl('_uuid'), 'show')
 
         // 一旦检测到文件名异常，就会暂停下载
-        this.pauseDownload()
+        this.pauseDownload('filename-uuid')
       }
 
       // 检测扩展名是 .jfif 的情况
@@ -394,7 +404,7 @@ class DownloadControl {
       'primary',
       'warning'
     ).addEventListener('click', () => {
-      this.pauseDownload()
+      this.pauseDownload('user')
     })
 
     Tools.addBtn(
@@ -595,8 +605,8 @@ class DownloadControl {
     }
   }
 
-  // 暂停下载
-  private pauseDownload() {
+  /** 暂停下载并保留原因；明确暂停会取消延迟自动重试。 */
+  private pauseDownload(reason = 'user') {
     if (store.result.length === 0) {
       return
     }
@@ -606,10 +616,22 @@ class DownloadControl {
       return
     }
 
+    if (
+      this.pause &&
+      this.pauseReason === 'retry-errors' &&
+      reason !== 'retry-errors'
+    ) {
+      this.pauseReason = reason
+      // 已暂停，只需取消重试；重复事件会清除批量收藏等其他任务的 busy 状态。
+      EVT.fire('downloadPauseReasonChange')
+      return
+    }
+
     if (this.pause === false) {
       // 如果正在下载中
       if (states.busy) {
         this.pause = true
+        this.pauseReason = reason
         downloadDiagnostics.finishAll('download-paused')
         log.warning('⏸️' + lang.transl('_下载已暂停'))
         // 输出空字符串，起到占据一个空行的效果，使得日志看起来更清晰
@@ -635,6 +657,7 @@ class DownloadControl {
     // 输出空字符串，起到占据一个空行的效果，使得日志看起来更清晰
     log.log('')
     this.pause = false
+    this.pauseReason = null
 
     EVT.fire('downloadStop')
   }
@@ -791,19 +814,32 @@ class DownloadControl {
   // 在有下载出错的情况下，是否已经完成了下载
   private async checkCompleteWithError() {
     if (
+      !this.pause &&
+      !this.stop &&
+      states.downloading &&
       this.errorIdList.length > 0 &&
       this.downloaded + this.errorIdList.length === store.result.length
     ) {
       // 进入暂停状态，等待一段时间后自动开始下载，重试下载出错的文件
-      this.pauseDownload()
+      const taskBatch = this.taskBatch
+      this.pauseDownload('retry-errors')
       log.log(lang.transl('_稍后会重试下载失败的文件'))
       await Utils.sleep(2000)
-      this.startDownload()
+      // 用户/自动化暂停、停止或队列替换后，旧重试不能启动当前队列。
+      if (
+        this.pause &&
+        this.pauseReason === 'retry-errors' &&
+        !this.stop &&
+        this.taskBatch === taskBatch
+      ) {
+        this.startDownload()
+      }
     }
   }
 
   private reset() {
     this.pause = false
+    this.pauseReason = null
     this.stop = false
     this.errorIdList = []
     this.downloaded = 0

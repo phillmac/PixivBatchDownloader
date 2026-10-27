@@ -206,3 +206,44 @@ test('report keeps the page snapshot captured before worker lookup completes', a
   assert.equal(report.activeTasks[0].workId, 'delayed-worker')
   assert.equal(d.pageSnapshot().activeTasks.length, 0)
 })
+
+test('ugoira and lease terminal failures record the cause before downloadError retry handling', () => {
+  const source = fs.readFileSync(
+    path.join(root, 'src/ts/download/Download.ts'),
+    'utf8'
+  )
+  const conversion = source.indexOf("'conversion-error'")
+  const conversionRetry = source.indexOf("EVT.fire('downloadError', result.id)")
+  assert.ok(conversion >= 0)
+  assert.ok(conversionRetry > conversion)
+  assert.match(source, /artworkId:\s*result\.idNum/)
+  assert.match(source, /format,/)
+  assert.match(source, /downloadDiagnostics\.errorDetails\(error\)/)
+
+  const lease = source.indexOf("'global-lease-retry-max'")
+  const leaseRetry = source.indexOf("EVT.fire('downloadError', arg.id)")
+  assert.ok(lease >= 0)
+  assert.ok(leaseRetry > lease)
+})
+
+test('Whammy streaming wait propagates worker error and messageerror immediately', () => {
+  const source = fs.readFileSync(
+    path.join(root, 'src/ts/ConvertUgoira/ToWebMUseWhammy.ts'),
+    'utf8'
+  )
+  assert.match(source, /addEventListener\('error', errorHandler\)/)
+  assert.match(
+    source,
+    /addEventListener\('messageerror', messageErrorHandler\)/
+  )
+  assert.match(source, /Whammy worker error waiting for \$\{expectedType\}/)
+  assert.match(
+    source,
+    /Whammy worker messageerror waiting for \$\{expectedType\}/
+  )
+  assert.match(source, /removeEventListener\('error', errorHandler\)/)
+  assert.match(
+    source,
+    /removeEventListener\('messageerror', messageErrorHandler\)/
+  )
+})
