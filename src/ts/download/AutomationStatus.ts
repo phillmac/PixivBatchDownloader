@@ -1,4 +1,5 @@
 import { getCrawlRateTelemetry } from '../crawl/CrawlRateClient'
+import { getAutomationQueueIdentity } from './AutomationCommandBindings'
 import {
   configureKnownOverlap,
   getKnownOverlapSnapshot,
@@ -41,6 +42,10 @@ export type AutomationPhase =
 
 /** 单个真实下载器事件的观察记录。 */
 type LifecycleObservation = { at: string; url: string }
+/** 暂停生命周期及控制器提供的明确原因。 */
+type DownloadPauseObservation = LifecycleObservation & { reason: string | null }
+/** Resume 实际恢复的队列代次，区别于恢复之后再次修改结果。 */
+type ResumeObservation = LifecycleObservation & { queueIdentity: string }
 
 /** 自动化客户端读取的精简作品 ID 条目。 */
 type AutomationIdEntry = { id: string; type: IDTypeString }
@@ -61,6 +66,7 @@ type CrawlControlSnapshot = {
 
 /** 页面 ID 枚举结束、公共过滤器运行前的发现快照。 */
 type CrawlDiscoverySnapshot = LifecycleObservation & {
+  queueIdentity: string | null
   count: number
   items: AutomationIdEntry[]
   controls: CrawlControlSnapshot
@@ -86,9 +92,9 @@ const lifecycle = {
   crawlEmpty: null as LifecycleObservation | null,
   downloadStarted: null as LifecycleObservation | null,
   downloadCompleted: null as LifecycleObservation | null,
-  downloadPaused: null as LifecycleObservation | null,
+  downloadPaused: null as DownloadPauseObservation | null,
   downloadStopped: null as LifecycleObservation | null,
-  resumed: null as LifecycleObservation | null,
+  resumed: null as ResumeObservation | null,
 }
 
 /** 当前内容脚本生命周期内最近一次抓取到的预元数据作品 ID 列表。 */
@@ -156,6 +162,7 @@ function captureCrawlDiscovery() {
       : 'none'
   crawlDiscoverySnapshot = {
     ...observe(taskUrl),
+    queueIdentity: null,
     count: store.idList.length,
     items: store.idList.map((item) => ({ id: item.id, type: item.type })),
     controls: {
@@ -271,7 +278,21 @@ window.addEventListener(EVT.list.crawlStart, () => {
 })
 window.addEventListener(EVT.list.crawlComplete, () => {
   lifecycle.crawlCompleted = observe(crawlTaskUrl())
+  if (
+    crawlDiscoverySnapshot?.url === lifecycle.crawlCompleted.url &&
+    crawlDiscoverySnapshot.queueIdentity === null
+  ) {
+    // 一个发现快照只能绑定其首次完成的队列，不能为后续替换队列重新背书。
+    crawlDiscoverySnapshot.queueIdentity = getAutomationQueueIdentity()
+  }
   resetDownloadLifecycle()
+})
+// 导入随后也会触发 crawlComplete；先清除旧抓取证明，避免同 URL/同数量误认。
+window.addEventListener(EVT.list.importResultLoaded, () => {
+  crawlDiscoverySnapshot = null
+  crawlIdListSnapshot = null
+  lifecycle.crawlStarted = null
+  lifecycle.crawlEmpty = null
 })
 window.addEventListener(EVT.list.resultChange, () => {
   if (states.busy) return
@@ -310,15 +331,30 @@ window.addEventListener(EVT.list.downloadComplete, () => {
   lifecycle.downloadCompleted = observe(downloadTaskUrl())
   activeDownloadUrl = null
 })
-window.addEventListener(EVT.list.downloadPause, () => {
-  lifecycle.downloadPaused = observe(downloadTaskUrl())
-})
+for (const event of [
+  EVT.list.downloadPause,
+  EVT.list.downloadPauseReasonChange,
+]) {
+  window.addEventListener(event, () => {
+    const controller = downloadDiagnostics.automationSnapshot()
+    lifecycle.downloadPaused = {
+      ...observe(downloadTaskUrl()),
+      reason:
+        typeof controller.pauseReason === 'string'
+          ? controller.pauseReason
+          : null,
+    }
+  })
+}
 window.addEventListener(EVT.list.downloadStop, () => {
   lifecycle.downloadStopped = observe(downloadTaskUrl())
   activeDownloadUrl = null
 })
 window.addEventListener(EVT.list.resume, () => {
-  lifecycle.resumed = observe()
+  lifecycle.resumed = {
+    ...observe(),
+    queueIdentity: getAutomationQueueIdentity(),
+  }
 })
 
 /** 返回供外部自动化读取的稳定下载器状态。 */
@@ -358,6 +394,7 @@ export async function getAutomationStatus() {
           capturedAt: crawlDiscoverySnapshot.at,
           url: crawlDiscoverySnapshot.url,
           count: crawlDiscoverySnapshot.count,
+          queueIdentity: crawlDiscoverySnapshot.queueIdentity,
           controls: {
             crawlNumber: { ...crawlDiscoverySnapshot.controls.crawlNumber },
             onlyUndownloaded: crawlDiscoverySnapshot.controls.onlyUndownloaded,
@@ -410,6 +447,7 @@ export async function getAutomationStatus() {
     schemaVersion: 1,
     capturedAt: new Date().toISOString(),
     phase,
+    queueIdentity: getAutomationQueueIdentity(),
     page: { url: currentUrl },
     controller,
     managedOperation: getManagedCrawl(),
@@ -486,6 +524,11 @@ export async function getAutomationProfileAssetData(
   }
 }
 
+/** 返回当前页面完整下载诊断快照；仅在显式诊断请求时构造。 */
+export function getAutomationDownloadDiagnostics() {
+  return downloadDiagnostics.pageSnapshot()
+}
+
 /** 返回当前页面最近一次公共过滤前 ID 发现列表的独立只读快照。 */
 export function getAutomationCrawlDiscovery() {
   const currentUrl = normalizeUrl(window.location.href)
@@ -497,6 +540,7 @@ export function getAutomationCrawlDiscovery() {
     capturedAt: crawlDiscoverySnapshot.at,
     url: crawlDiscoverySnapshot.url,
     count: crawlDiscoverySnapshot.count,
+    queueIdentity: crawlDiscoverySnapshot.queueIdentity,
     controls: {
       crawlNumber: { ...crawlDiscoverySnapshot.controls.crawlNumber },
       onlyUndownloaded: crawlDiscoverySnapshot.controls.onlyUndownloaded,
@@ -534,6 +578,7 @@ const automationGlobal = globalThis as typeof globalThis & {
   __PBD_AUTOMATION_STATUS__?: typeof getAutomationStatus
   __PBD_AUTOMATION_PROFILE_ASSETS__?: typeof getAutomationProfileAssets
   __PBD_AUTOMATION_PROFILE_ASSET_DATA__?: typeof getAutomationProfileAssetData
+  __PBD_AUTOMATION_DOWNLOAD_DIAGNOSTICS__?: typeof getAutomationDownloadDiagnostics
   __PBD_AUTOMATION_CRAWL_DISCOVERY__?: typeof getAutomationCrawlDiscovery
   __PBD_AUTOMATION_CRAWL_ID_LIST__?: typeof getAutomationCrawlIdList
   __PBD_AUTOMATION_SET_CRAWL_ID_GATE__?: typeof setAutomationCrawlIdGate
@@ -545,6 +590,8 @@ automationGlobal.__PBD_AUTOMATION_STATUS__ = getAutomationStatus
 automationGlobal.__PBD_AUTOMATION_PROFILE_ASSETS__ = getAutomationProfileAssets
 automationGlobal.__PBD_AUTOMATION_PROFILE_ASSET_DATA__ =
   getAutomationProfileAssetData
+automationGlobal.__PBD_AUTOMATION_DOWNLOAD_DIAGNOSTICS__ =
+  getAutomationDownloadDiagnostics
 automationGlobal.__PBD_AUTOMATION_CRAWL_DISCOVERY__ =
   getAutomationCrawlDiscovery
 automationGlobal.__PBD_AUTOMATION_CRAWL_ID_LIST__ = getAutomationCrawlIdList

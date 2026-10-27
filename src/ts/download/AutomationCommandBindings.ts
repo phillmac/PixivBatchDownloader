@@ -15,6 +15,13 @@ let stopCrawl: (() => void) | null = null
 const documentId = crypto.getRandomValues(new Uint32Array(4)).join('-')
 /** 生命周期事件使旧许可失效；同一许可最多执行一次命令。 */
 let revision = 0
+/** 结果队列代次独立于下载开始/暂停事件，自动重试不更换队列身份。 */
+let queueRevision = 0
+
+/** 文档和结果队列的只读身份；同 URL/同数量替换也会改变身份。 */
+export function getAutomationQueueIdentity() {
+  return `${documentId}:${queueRevision}`
+}
 
 /** 页面控制器初始化完毕后登记原生方法，不保存 DOM 元素。 */
 export function registerAutomationCrawl(
@@ -58,8 +65,16 @@ for (const event of [
   EVT.list.resume,
   EVT.list.downloadStart,
   EVT.list.downloadPause,
+  EVT.list.downloadPauseReasonChange,
   EVT.list.downloadStop,
   EVT.list.downloadComplete,
 ]) {
   window.addEventListener(event, () => revision++)
+}
+for (const event of [
+  EVT.list.crawlComplete,
+  EVT.list.resultChange,
+  EVT.list.resume,
+]) {
+  window.addEventListener(event, () => queueRevision++)
 }

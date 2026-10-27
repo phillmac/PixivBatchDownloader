@@ -139,6 +139,7 @@ function harness(
       downloadStart: 'downloadStart',
       downloadComplete: 'downloadComplete',
       downloadPause: 'downloadPause',
+      downloadPauseReasonChange: 'downloadPauseReasonChange',
       downloadStop: 'downloadStop',
       resume: 'resume',
     },
@@ -158,7 +159,33 @@ function harness(
       listeners.set(name, callbacks)
     },
   }
-  const context = vm.createContext({ console, Date, window, queueMicrotask })
+  const context = vm.createContext({
+    console,
+    Date,
+    window,
+    queueMicrotask,
+    crypto: { getRandomValues: (values) => values.fill(1) },
+  })
+  const bindings = {}
+  const bindingsCode = ts.transpileModule(
+    fs.readFileSync(
+      path.join(root, 'src/ts/download/AutomationCommandBindings.ts'),
+      'utf8'
+    ),
+    {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+      },
+    }
+  ).outputText
+  vm.runInContext(`(function(require,exports){${bindingsCode}\n})`, context)(
+    (key) => {
+      if (key === '../EVT') return { EVT }
+      throw new Error(key)
+    },
+    bindings
+  )
   const file = path.join(root, 'src/ts/download/AutomationStatus.ts')
   const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: {
@@ -206,6 +233,7 @@ function harness(
   vm.runInContext(`(function(require, exports) {${compiled}\n})`, context, {
     filename: file,
   })((name) => {
+    if (name === './AutomationCommandBindings') return bindings
     if (name === '../crawl/CrawlRateClient')
       return { getCrawlRateTelemetry: telemetry }
     if (name === '../crawl/KnownOverlap') return knownOverlap
@@ -227,6 +255,7 @@ function harness(
   }, exports)
   return {
     exports,
+    bindings,
     managed,
     generation,
     EVT,
@@ -381,6 +410,158 @@ test('restored paused task reports PAUSED_RESUMABLE', async () => {
     'PAUSED_RESUMABLE'
   )
 })
+
+test('paused lifecycle preserves the explicit PPBD pause reason', async () => {
+  const h = harness(
+    {
+      busy: false,
+      downloading: false,
+      pause: true,
+      pauseReason: 'retry-errors',
+      stop: false,
+      resultLength: 7,
+    },
+    { total: 7 }
+  )
+  h.fire('resume')
+  h.fire('downloadPause')
+  const status = await h.exports.getAutomationStatus()
+  assert.equal(status.phase, 'PAUSED_RESUMABLE')
+  assert.equal(status.controller.pauseReason, 'retry-errors')
+  assert.equal(status.lifecycle.downloadPaused.reason, 'retry-errors')
+  h.controller.pauseReason = 'user'
+  h.fire('downloadPauseReasonChange')
+  const canceled = await h.exports.getAutomationStatus()
+  assert.equal(canceled.lifecycle.downloadPaused.reason, 'user')
+  assert.equal(canceled.controller.pauseReason, 'user')
+})
+
+test('queue identity survives download retry but changes on same-count result replacement', async () => {
+  const h = harness({ busy: false, downloading: false, resultLength: 1 }, null)
+  h.store.idList = [{ id: '1', type: 'illusts' }]
+  h.fire('crawlStart')
+  h.fire('getIdListReadyForFilter')
+  h.fire('crawlComplete')
+  const original = await h.exports.getAutomationStatus()
+  const discovered = h.exports.getAutomationCrawlDiscovery()
+  assert.equal(discovered.queueIdentity, original.queueIdentity)
+  h.fire('downloadStart')
+  h.controller.pause = true
+  h.controller.pauseReason = 'retry-errors'
+  h.fire('downloadPause')
+  h.fire('downloadStart')
+  assert.equal(
+    (await h.exports.getAutomationStatus()).queueIdentity,
+    original.queueIdentity
+  )
+  h.fire('resultChange')
+  const replacement = await h.exports.getAutomationStatus()
+  assert.equal(
+    replacement.controller.resultLength,
+    original.controller.resultLength
+  )
+  assert.notEqual(replacement.queueIdentity, original.queueIdentity)
+  assert.equal(
+    h.exports.getAutomationCrawlDiscovery().queueIdentity,
+    original.queueIdentity
+  )
+  h.fire('resume')
+  const resumed = await h.exports.getAutomationStatus()
+  assert.notEqual(resumed.queueIdentity, replacement.queueIdentity)
+  assert.equal(resumed.lifecycle.resumed.queueIdentity, resumed.queueIdentity)
+})
+
+test('full page download diagnostics are exposed only through the explicit query', () => {
+  const h = harness(
+    { busy: false, downloading: false, pause: false, resultLength: 0 },
+    null
+  )
+  assert.throws(
+    () => h.exports.getAutomationDownloadDiagnostics(),
+    /automation status must not build the full diagnostic snapshot/
+  )
+})
+
+for (const command of ['download.pause', 'download.stop']) {
+  test(`${command} cancels a live retry when Resume has not persisted the queue`, async () => {
+    const h = harness(
+      {
+        busy: false,
+        downloading: false,
+        pause: true,
+        pauseReason: 'retry-errors',
+        stop: false,
+        resultLength: 1,
+      },
+      null
+    )
+    h.store.result = [{ id: '1' }]
+    h.states.settingInitialized = true
+    h.states.downloading = false
+    h.fire('crawlComplete')
+    const before = await h.exports.getAutomationStatus()
+    assert.equal(before.phase, 'READY')
+    assert.equal(before.durable, null)
+    h.context.crypto = { getRandomValues: (values) => values.fill(1) }
+    h.context.URL = URL
+    const load = (file, dependencies) => {
+      const exports = {}
+      const code = ts.transpileModule(
+        fs.readFileSync(path.join(root, file), 'utf8'),
+        {
+          compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2022,
+          },
+        }
+      ).outputText
+      vm.runInContext(`(function(require,exports){${code}\n})`, h.context)(
+        (key) => {
+          if (!(key in dependencies)) throw new Error(key)
+          return dependencies[key]
+        },
+        exports
+      )
+      return exports
+    }
+    const bindings = h.bindings
+    const calls = []
+    bindings.registerAutomationDownload({
+      prepared: () => true,
+      start: () => calls.push('start'),
+      pause: () => {
+        calls.push('pause')
+        h.controller.pauseReason = 'automation'
+        h.fire('downloadPauseReasonChange')
+      },
+      stop: () => {
+        calls.push('stop')
+        h.controller.pause = false
+        h.controller.stop = true
+        h.fire('downloadStop')
+      },
+    })
+    const commands = load('src/ts/download/AutomationCommands.ts', {
+      '../PageType': {
+        pageType: h.pageType,
+        PageName: { UserHome: 2, Bookmark: 4, UserRequest: 25 },
+      },
+      '../store/States': { states: h.states },
+      '../store/Store': { store: h.store },
+      './AutomationStatus': h.exports,
+      './AutomationCommandBindings': bindings,
+      './ManagedCrawlAutomation': h.managed,
+    })
+    const ready = await commands.getAutomationCommands()
+    const receipt = await commands.runAutomationCommand({
+      command,
+      url: ready.url,
+      token: ready.token,
+    })
+    assert.equal(receipt.outcome, 'accepted')
+    assert.deepEqual(calls, [command.split('.')[1]])
+  })
+}
 
 test('live controller phases win over durable state', async () => {
   let h = harness(
@@ -3284,4 +3465,52 @@ test('automation telemetry lookup receives the current managed operation identit
   h.fire('crawlStart')
   await h.exports.getAutomationStatus()
   assert.equal(selected, arm.operationId)
+})
+
+test('same-size imported queues never inherit the previous crawl discovery or ID-list proof', async () => {
+  const h = harness({ busy: false, downloading: false, resultLength: 1 }, null)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '1', type: 'illusts' }]
+  h.fire('getIdListReadyForFilter')
+  h.fire('getIdListFinished')
+  h.fire('crawlComplete')
+  const original = await h.exports.getAutomationStatus()
+  assert.equal(original.crawlDiscovery.queueIdentity, original.queueIdentity)
+  assert.equal(original.crawlIdList.count, 1)
+  h.store.idList = [{ id: '2', type: 'illusts' }]
+  // ImportResult dispatches these two events in this order on the same URL.
+  h.fire('importResultLoaded')
+  h.fire('crawlComplete')
+  const imported = await h.exports.getAutomationStatus()
+  assert.notEqual(imported.queueIdentity, original.queueIdentity)
+  assert.equal(imported.phase, 'READY')
+  assert.equal(imported.crawlDiscovery, null)
+  assert.equal(imported.crawlIdList, null)
+  // A late ID event without a new crawlStart cannot resurrect the old proof.
+  h.fire('getIdListReadyForFilter')
+  assert.equal((await h.exports.getAutomationStatus()).crawlDiscovery, null)
+  h.fire('crawlStart')
+  h.fire('getIdListReadyForFilter')
+  h.fire('crawlComplete')
+  const fresh = await h.exports.getAutomationStatus()
+  assert.equal(fresh.crawlDiscovery.count, 1)
+  assert.equal(fresh.crawlDiscovery.queueIdentity, fresh.queueIdentity)
+})
+
+test('repeated completion cannot rebind discovery after a same-size result replacement', async () => {
+  const h = harness({ busy: false, downloading: false, resultLength: 1 }, null)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '1', type: 'illusts' }]
+  h.fire('getIdListReadyForFilter')
+  h.fire('crawlComplete')
+  const original = await h.exports.getAutomationStatus()
+  h.store.idList = [{ id: '2', type: 'illusts' }]
+  h.fire('resultChange')
+  h.fire('crawlComplete')
+  const replacement = await h.exports.getAutomationStatus()
+  assert.equal(replacement.crawlDiscovery.queueIdentity, original.queueIdentity)
+  assert.notEqual(
+    replacement.crawlDiscovery.queueIdentity,
+    replacement.queueIdentity
+  )
 })

@@ -66,6 +66,13 @@ controller was DOWNLOADING. No deployment/reload occurred during that state.
 Later preflight found only idle pages and no runner process; external tab changes
 were not caused by task commands and their exact timing remains unknown.
 
+## Recovered follow-ups (27 October 2026)
+
+The native retry, queue-generation and tagged-bookmark contracts were reconciled
+in [reverse-bookmark-reconciliation.md](reverse-bookmark-reconciliation.md).
+That document supersedes the original DOWNLOADING-only pause restriction below
+for an explicitly identified native retry pause; normal manual pauses remain distinct.
+
 ## Narrow PPBD-owned API
 
 The read and invocation promise globals live in the PPBD isolated content-script world:

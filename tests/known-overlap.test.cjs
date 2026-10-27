@@ -189,3 +189,18 @@ test('URL mismatch does not activate an armed overlap set', () => {
   )
   assert.equal(m.getKnownOverlapSnapshot(), null)
 })
+
+test('explicit empty boundary records real exhaustion without enabling an early stop', () => {
+  const m = loadModule()
+  const url = 'https://www.pixiv.net/users/1/bookmarks/artworks?p=21'
+  m.configureKnownOverlap(url, [], 3)
+  assert.equal(m.startKnownOverlap(url).knownCount, 0)
+  const result = m.consumeKnownOverlap([{ id: '40' }, { id: '39' }])
+  assert.equal(result.boundaryReached, false)
+  assert.equal(result.items.length, 2)
+  assert.equal(
+    m.finishKnownOverlap('source-exhausted').stopReason,
+    'source-exhausted'
+  )
+  assert.equal(m.startKnownOverlap(url), null)
+})

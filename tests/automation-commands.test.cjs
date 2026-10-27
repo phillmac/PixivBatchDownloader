@@ -408,3 +408,105 @@ test('token invalidation prevents a timed-out asynchronous command from starting
   )
   assert.equal(h.bindings.getAutomationCommandBindings().token, freshToken)
 })
+
+for (const command of ['download.pause', 'download.stop']) {
+  test(`${command} cancels a pending internal retry through the owned command API`, async () => {
+    const h = harness()
+    h.store.result.push({ id: '1' })
+    h.status.phase = 'PAUSED_RESUMABLE'
+    h.status.controller = { pause: true, pauseReason: 'retry-errors' }
+    const receipt = await h.api.runAutomationCommand(await h.request(command))
+    assert.equal(receipt.outcome, 'accepted')
+    assert.deepEqual(h.calls, [command.split('.')[1]])
+  })
+  test(`${command} still refuses an arbitrary paused download`, async () => {
+    const h = harness()
+    h.store.result.push({ id: '1' })
+    h.status.phase = 'PAUSED_RESUMABLE'
+    h.status.controller = { pause: true, pauseReason: 'user' }
+    const receipt = await h.api.runAutomationCommand(await h.request(command))
+    assert.equal(receipt.reason, 'not-downloading')
+    assert.deepEqual(h.calls, [])
+  })
+}
+
+test('explicit retry cancellation revokes a previously prepared start permission', async () => {
+  const h = harness()
+  h.store.result.push({ id: '1' })
+  h.status.phase = 'PAUSED_RESUMABLE'
+  h.status.controller = { pause: true, pauseReason: 'retry-errors' }
+  h.prepared(true)
+  const request = await h.request('download.start')
+  h.status.controller.pauseReason = 'user'
+  h.fire('downloadPauseReasonChange')
+  const receipt = await h.api.runAutomationCommand(request)
+  assert.equal(receipt.outcome, 'refused')
+  assert.equal(receipt.reason, 'stale-token')
+  assert.deepEqual(h.calls, [])
+})
+
+test('a stale retry reason without a paused controller cannot authorize pause or stop', async () => {
+  for (const command of ['download.pause', 'download.stop']) {
+    const h = harness()
+    h.store.result.push({ id: '1' })
+    h.status.phase = 'READY'
+    h.status.controller = { pause: false, pauseReason: 'retry-errors' }
+    const receipt = await h.api.runAutomationCommand(await h.request(command))
+    assert.equal(receipt.reason, 'not-downloading')
+    assert.deepEqual(h.calls, [])
+  }
+})
+
+test('retry stop cannot clear another operation busy state', async () => {
+  const h = harness()
+  h.store.result.push({ id: '1' })
+  h.status.phase = 'BOOKMARKING'
+  h.status.controller = { pause: true, pauseReason: 'retry-errors' }
+  h.states.busy = true
+  const receipt = await h.api.runAutomationCommand(
+    await h.request('download.stop')
+  )
+  assert.equal(receipt.reason, 'not-downloading')
+  assert.equal(h.states.busy, true)
+  assert.deepEqual(h.calls, [])
+})
+
+test('tag-filtered artwork and novel bookmark routes support owned crawl commands', async () => {
+  for (const collection of ['artworks', 'novels']) {
+    for (const tag of ['R-18', 'novels', 'foo%26bar%23baz', 'path%2Ftag']) {
+      const h = harness()
+      h.window.location.href = `https://www.pixiv.net/en/users/1/bookmarks/${collection}/${tag}?rest=show`
+      h.pageType.type = 4
+      h.managed.arm.url = h.window.location.href
+      h.store.URLWhenCrawlStart = h.window.location.href
+      h.registerCrawl()
+      assert.equal((await h.api.getAutomationCommands()).crawlReady, true)
+      assert.equal(
+        (await h.api.runAutomationCommand(await h.request('crawl.start')))
+          .outcome,
+        'accepted'
+      )
+      assert.deepEqual(h.calls, ['crawl'])
+    }
+  }
+})
+
+test('tag-route support does not authorize collections or unrelated bookmark paths', async () => {
+  for (const suffix of [
+    'collections/tag',
+    'artworks/tag/extra',
+    'artworks-extra/tag',
+  ]) {
+    const h = harness()
+    h.window.location.href = `https://www.pixiv.net/users/1/bookmarks/${suffix}`
+    h.pageType.type = 4
+    h.managed.arm.url = h.window.location.href
+    h.registerCrawl()
+    assert.equal((await h.api.getAutomationCommands()).crawlReady, false)
+    assert.equal(
+      (await h.api.runAutomationCommand(await h.request('crawl.start'))).reason,
+      'unsupported-page'
+    )
+    assert.deepEqual(h.calls, [])
+  }
+})

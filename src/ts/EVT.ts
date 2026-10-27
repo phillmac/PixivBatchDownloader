@@ -58,6 +58,8 @@ class EVENT {
     downloadStart: 'downloadStart',
     /** 下载状态变成暂停时触发 */
     downloadPause: 'downloadPause',
+    /** 已暂停的下载原因改变时触发，不改变其他任务的忙碌状态 */
+    downloadPauseReasonChange: 'downloadPauseReasonChange',
     /** 请求暂停下载 */
     requestPauseDownload: 'requestPauseDownload',
     /** 下载状态变成停止时触发 */
@@ -244,6 +246,7 @@ class EVENT {
       | 'downloadCancel'
       | 'downloadStart'
       | 'downloadPause'
+      | 'downloadPauseReasonChange'
       | 'requestPauseDownload'
       | 'downloadStop'
       | 'saveFileError'
@@ -301,6 +304,8 @@ class EVENT {
   ): void
 
   // 对于需要携带数据的事件进行重载
+
+  public fire(type: 'requestPauseDownload', data: { reason: string }): void
 
   public fire(
     type: 'downloadError' | 'crawlTag' | 'getPageTheme',

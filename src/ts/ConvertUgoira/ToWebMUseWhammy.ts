@@ -247,6 +247,26 @@ class ToWebM {
       const cleanup = () => {
         window.clearTimeout(timeoutId)
         worker.removeEventListener('message', handler)
+        worker.removeEventListener('error', errorHandler)
+        worker.removeEventListener('messageerror', messageErrorHandler)
+      }
+      const errorHandler = (ev: ErrorEvent) => {
+        cleanup()
+        this.resetWorker(worker)
+        reject(
+          new Error(
+            `Whammy worker error waiting for ${expectedType}: ${
+              ev.message || 'unknown worker error'
+            }${ev.filename ? ` at ${ev.filename}:${ev.lineno}:${ev.colno}` : ''}`
+          )
+        )
+      }
+      const messageErrorHandler = () => {
+        cleanup()
+        this.resetWorker(worker)
+        reject(
+          new Error(`Whammy worker messageerror waiting for ${expectedType}`)
+        )
       }
       const handler = (ev: MessageEvent) => {
         if (!ev.data || ev.data.id !== id) return
@@ -260,6 +280,8 @@ class ToWebM {
         resolve(ev.data)
       }
       worker.addEventListener('message', handler)
+      worker.addEventListener('error', errorHandler)
+      worker.addEventListener('messageerror', messageErrorHandler)
       try {
         worker.postMessage({ id, ...message }, transfer)
       } catch (error) {

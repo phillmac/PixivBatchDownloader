@@ -138,7 +138,8 @@ class API {
   }
 
   /** 获取收藏数据
-   * 这个 api 返回的作品列表顺序遵从 order 参数。默认的 desc 是按照收藏时间从新到旧排序的 */
+   * 这个 api 返回的作品列表顺序遵从 order 参数。默认的 desc 是按照收藏时间从新到旧排序的
+   * tag 是已解码的原始标签，在此统一编码；work_tag 保留现有的预编码契约。 */
   static async getBookmarkData(
     userId: string,
     type: 'illusts' | 'novels' = 'illusts',
@@ -148,9 +149,13 @@ class API {
     order: 'desc' | 'asc' = 'desc',
     mode: 'all' | 'safe' | 'r18' = 'all',
     work_tag: string = '',
-    bm: string = ''
+    bm: string = '',
+    limit: number = 100
   ): Promise<BookmarkData> {
-    const url = `https://www.pixiv.net/ajax/user/${userId}/${type}/bookmarks?tag=${tag}&offset=${offset}&limit=100&rest=${
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError('bookmark limit must be between 1 and 100')
+    }
+    const url = `https://www.pixiv.net/ajax/user/${userId}/${type}/bookmarks?tag=${encodeURIComponent(tag)}&offset=${offset}&limit=${limit}&rest=${
       hide ? 'hide' : 'show'
     }&order=${order}&mode=${mode}&work_tag=${work_tag}&bm=${bm}&rdm=${Math.random()}`
 
