@@ -24922,10 +24922,19 @@ window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_7__.EVT.list.crawlStart, (
 });
 window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_7__.EVT.list.crawlComplete, () => {
     lifecycle.crawlCompleted = observe(crawlTaskUrl());
-    if (crawlDiscoverySnapshot?.url === lifecycle.crawlCompleted.url) {
+    if (crawlDiscoverySnapshot?.url === lifecycle.crawlCompleted.url &&
+        crawlDiscoverySnapshot.queueIdentity === null) {
+        // 一个发现快照只能绑定其首次完成的队列，不能为后续替换队列重新背书。
         crawlDiscoverySnapshot.queueIdentity = (0,_AutomationCommandBindings__WEBPACK_IMPORTED_MODULE_1__.getAutomationQueueIdentity)();
     }
     resetDownloadLifecycle();
+});
+// 导入随后也会触发 crawlComplete；先清除旧抓取证明，避免同 URL/同数量误认。
+window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_7__.EVT.list.importResultLoaded, () => {
+    crawlDiscoverySnapshot = null;
+    crawlIdListSnapshot = null;
+    lifecycle.crawlStarted = null;
+    lifecycle.crawlEmpty = null;
 });
 window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_7__.EVT.list.resultChange, () => {
     if (_store_States__WEBPACK_IMPORTED_MODULE_9__.states.busy)

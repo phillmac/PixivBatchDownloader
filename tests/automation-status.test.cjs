@@ -3466,3 +3466,51 @@ test('automation telemetry lookup receives the current managed operation identit
   await h.exports.getAutomationStatus()
   assert.equal(selected, arm.operationId)
 })
+
+test('same-size imported queues never inherit the previous crawl discovery or ID-list proof', async () => {
+  const h = harness({ busy: false, downloading: false, resultLength: 1 }, null)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '1', type: 'illusts' }]
+  h.fire('getIdListReadyForFilter')
+  h.fire('getIdListFinished')
+  h.fire('crawlComplete')
+  const original = await h.exports.getAutomationStatus()
+  assert.equal(original.crawlDiscovery.queueIdentity, original.queueIdentity)
+  assert.equal(original.crawlIdList.count, 1)
+  h.store.idList = [{ id: '2', type: 'illusts' }]
+  // ImportResult dispatches these two events in this order on the same URL.
+  h.fire('importResultLoaded')
+  h.fire('crawlComplete')
+  const imported = await h.exports.getAutomationStatus()
+  assert.notEqual(imported.queueIdentity, original.queueIdentity)
+  assert.equal(imported.phase, 'READY')
+  assert.equal(imported.crawlDiscovery, null)
+  assert.equal(imported.crawlIdList, null)
+  // A late ID event without a new crawlStart cannot resurrect the old proof.
+  h.fire('getIdListReadyForFilter')
+  assert.equal((await h.exports.getAutomationStatus()).crawlDiscovery, null)
+  h.fire('crawlStart')
+  h.fire('getIdListReadyForFilter')
+  h.fire('crawlComplete')
+  const fresh = await h.exports.getAutomationStatus()
+  assert.equal(fresh.crawlDiscovery.count, 1)
+  assert.equal(fresh.crawlDiscovery.queueIdentity, fresh.queueIdentity)
+})
+
+test('repeated completion cannot rebind discovery after a same-size result replacement', async () => {
+  const h = harness({ busy: false, downloading: false, resultLength: 1 }, null)
+  h.fire('crawlStart')
+  h.store.idList = [{ id: '1', type: 'illusts' }]
+  h.fire('getIdListReadyForFilter')
+  h.fire('crawlComplete')
+  const original = await h.exports.getAutomationStatus()
+  h.store.idList = [{ id: '2', type: 'illusts' }]
+  h.fire('resultChange')
+  h.fire('crawlComplete')
+  const replacement = await h.exports.getAutomationStatus()
+  assert.equal(replacement.crawlDiscovery.queueIdentity, original.queueIdentity)
+  assert.notEqual(
+    replacement.crawlDiscovery.queueIdentity,
+    replacement.queueIdentity
+  )
+})

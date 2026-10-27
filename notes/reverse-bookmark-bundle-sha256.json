@@ -1,0 +1,8 @@
+{
+  "js/content.js": "8af67e74d14f0f7c8aecc8ac3eb876cbcfa848f8309e016ca3f108d1708e1e69",
+  "js/background.js": "4b0bcfc2a70487d786e3daaca93c0172c3d2cca04c490af87a4967e352d74f0e",
+  "js/injectScript.js": "3ffc37bc7f561d27a9f6f763587fde9c38ef2e7bd0f7a771437e9c13687335b5",
+  "lib/whammy.worker.js": "fc8fee491a93b733d70aa636d0203565541e9a29a8f7acd24543e09a8cee0011",
+  "lib/ppd-webp.js": "8b62ea52784e8820bb9185abcd853f5d175ac002d7b700254575a1e3c545ef89",
+  "lib/ppd-webp.worker.js": "83b71bc0bf71087225625d04f43b50e60f0ab4c95a7b565f50f370d723d17eb0"
+}

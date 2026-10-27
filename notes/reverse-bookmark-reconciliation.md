@@ -43,6 +43,16 @@ stop requires the retry not be busy. Neither acceptance means that all in-flight
 files have drained. The runner must validate the status attached to the exact
 one-shot command token, not merely a prior free-standing status poll.
 
+## Additional independent-review correction
+
+A review reproduced stale discovery proof after `importResultLoaded` followed
+by `crawlComplete`: a same-size replacement queue on the same URL could inherit
+the old discovery IDs under a new queue identity. Imports now clear discovery,
+pre-metadata ID-list and old crawl-start/empty state. A discovery snapshot binds
+only to its first completed queue; a repeated completion cannot reassign that
+proof after result replacement. Regression tests cover imported queues, late ID
+events, a legitimate new crawl, and repeated completion after resultChange.
+
 ## Bundle coherence
 
 Run the full Node suite, `tsc --noEmit`, `npm run ts`, and `node pack.js`.
@@ -51,9 +61,11 @@ The recovered EU incident involved new streaming conversion code paired with
 an old Whammy worker. Verify the ZIP and dist copies of content/background/inject
 bundles and Whammy/WebP workers; the static workers must also match their source.
 
-The 27 October reconciliation passed 257 Node tests, type checking, webpack,
+The 27 October reconciliation passed 259 Node tests, type checking, webpack,
 packaging and diff checks. The ZIP/dist/source-worker byte equality was checked.
-Exact logs and SHA-256 manifests are retained on the jump box under
+The six core bundle/worker hashes are also committed in
+`notes/reverse-bookmark-bundle-sha256.json`. Exact logs and SHA-256 manifests
+are retained on the jump box under
 `~/orchestration-logs/artifacts/pixiv-reconcile-20261027/`.
 
 ## Remaining release gates
@@ -67,3 +79,12 @@ be treated as a completed download or authoritative full membership.
 The Dotfiles memory-abort ownership fix and navigation-readiness reconciliation
 are companion requirements. Do not deploy only this extension or only an old
 runner based on a branch name; use exact reviewed source and artifact hashes.
+
+## Final review outcome
+
+The first full-source independent review identified the imported-queue P2 above.
+After its fix, a separate read-only cross-review found no remaining actionable
+findings in that correction or the companion runner reconciliation. Both new
+PPBD regressions passed independently. The complete 259-test suite and rebuilt
+package passed on the parent host. GitHub review, CI and authorized live smoke
+remain separate gates before merge/deployment.

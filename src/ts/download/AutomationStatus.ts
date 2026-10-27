@@ -278,10 +278,21 @@ window.addEventListener(EVT.list.crawlStart, () => {
 })
 window.addEventListener(EVT.list.crawlComplete, () => {
   lifecycle.crawlCompleted = observe(crawlTaskUrl())
-  if (crawlDiscoverySnapshot?.url === lifecycle.crawlCompleted.url) {
+  if (
+    crawlDiscoverySnapshot?.url === lifecycle.crawlCompleted.url &&
+    crawlDiscoverySnapshot.queueIdentity === null
+  ) {
+    // 一个发现快照只能绑定其首次完成的队列，不能为后续替换队列重新背书。
     crawlDiscoverySnapshot.queueIdentity = getAutomationQueueIdentity()
   }
   resetDownloadLifecycle()
+})
+// 导入随后也会触发 crawlComplete；先清除旧抓取证明，避免同 URL/同数量误认。
+window.addEventListener(EVT.list.importResultLoaded, () => {
+  crawlDiscoverySnapshot = null
+  crawlIdListSnapshot = null
+  lifecycle.crawlStarted = null
+  lifecycle.crawlEmpty = null
 })
 window.addEventListener(EVT.list.resultChange, () => {
   if (states.busy) return
