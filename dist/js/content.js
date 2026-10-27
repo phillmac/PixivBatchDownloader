@@ -94,12 +94,13 @@ class API {
         return attemptRequest();
     }
     /** 获取收藏数据
-     * 这个 api 返回的作品列表顺序遵从 order 参数。默认的 desc 是按照收藏时间从新到旧排序的 */
+     * 这个 api 返回的作品列表顺序遵从 order 参数。默认的 desc 是按照收藏时间从新到旧排序的
+     * tag 是已解码的原始标签，在此统一编码；work_tag 保留现有的预编码契约。 */
     static async getBookmarkData(userId, type = 'illusts', tag, offset, hide = false, order = 'desc', mode = 'all', work_tag = '', bm = '', limit = 100) {
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
             throw new RangeError('bookmark limit must be between 1 and 100');
         }
-        const url = `https://www.pixiv.net/ajax/user/${userId}/${type}/bookmarks?tag=${tag}&offset=${offset}&limit=${limit}&rest=${hide ? 'hide' : 'show'}&order=${order}&mode=${mode}&work_tag=${work_tag}&bm=${bm}&rdm=${Math.random()}`;
+        const url = `https://www.pixiv.net/ajax/user/${userId}/${type}/bookmarks?tag=${encodeURIComponent(tag)}&offset=${offset}&limit=${limit}&rest=${hide ? 'hide' : 'show'}&order=${order}&mode=${mode}&work_tag=${work_tag}&bm=${bm}&rdm=${Math.random()}`;
         return this.fetch(url);
     }
     /** 添加收藏 */
@@ -19573,12 +19574,13 @@ __webpack_require__.r(__webpack_exports__);
 /** 收藏抓取与只读自动化共用的 URL 解释。 */
 function getBookmarkQuery(url = location.href) {
     const parsed = new URL(url);
-    const userId = parsed.pathname.match(/\/users\/(\d+)\/bookmarks\//)?.[1];
-    if (!userId ||
-        !/\/bookmarks\/(artworks|novels)(\/|$)/.test(parsed.pathname)) {
+    const collection = parsed.pathname.match(/\/users\/(\d+)\/bookmarks\/(artworks|novels)(?:\/|$)/);
+    if (!collection) {
         throw new Error('expected a real artwork or novel Bookmark page');
     }
-    const type = parsed.pathname.includes('/novels') ? 'novels' : 'illusts';
+    const userId = collection[1];
+    // 标签可能也叫 novels；只使用收藏类型的路径段判断接口和分页大小。
+    const type = collection[2] === 'novels' ? 'novels' : 'illusts';
     const uiPageSize = type === 'novels' ? 30 : 48;
     const page = Math.max(1, Number.parseInt(_utils_Utils__WEBPACK_IMPORTED_MODULE_1__.Utils.getURLSearchField(url, 'p')) || 1);
     const query = {
@@ -24526,7 +24528,7 @@ function profilePageType() {
         return null;
     if (/^\/(?:en\/)?users\/\d+\/request(?:\/(?:artworks|novels|sent(?:\/(?:artworks|novels))?))?$/.test(url.pathname))
         return _PageType__WEBPACK_IMPORTED_MODULE_0__.PageName.UserRequest;
-    if (/^\/(?:en\/)?users\/\d+\/bookmarks\/(?:artworks|novels)\/?$/.test(url.pathname))
+    if (/^\/(?:en\/)?users\/\d+\/bookmarks\/(?:artworks|novels)(?:\/[^/]+)?\/?$/.test(url.pathname))
         return _PageType__WEBPACK_IMPORTED_MODULE_0__.PageName.Bookmark;
     if (/^\/(?:en\/)?users\/\d+(?:\/(?:artworks|illustrations|manga|novels))?\/?$/.test(url.pathname))
         return _PageType__WEBPACK_IMPORTED_MODULE_0__.PageName.UserHome;

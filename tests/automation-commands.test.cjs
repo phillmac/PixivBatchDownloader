@@ -470,3 +470,43 @@ test('retry stop cannot clear another operation busy state', async () => {
   assert.equal(h.states.busy, true)
   assert.deepEqual(h.calls, [])
 })
+
+test('tag-filtered artwork and novel bookmark routes support owned crawl commands', async () => {
+  for (const collection of ['artworks', 'novels']) {
+    for (const tag of ['R-18', 'novels', 'foo%26bar%23baz', 'path%2Ftag']) {
+      const h = harness()
+      h.window.location.href = `https://www.pixiv.net/en/users/1/bookmarks/${collection}/${tag}?rest=show`
+      h.pageType.type = 4
+      h.managed.arm.url = h.window.location.href
+      h.store.URLWhenCrawlStart = h.window.location.href
+      h.registerCrawl()
+      assert.equal((await h.api.getAutomationCommands()).crawlReady, true)
+      assert.equal(
+        (await h.api.runAutomationCommand(await h.request('crawl.start')))
+          .outcome,
+        'accepted'
+      )
+      assert.deepEqual(h.calls, ['crawl'])
+    }
+  }
+})
+
+test('tag-route support does not authorize collections or unrelated bookmark paths', async () => {
+  for (const suffix of [
+    'collections/tag',
+    'artworks/tag/extra',
+    'artworks-extra/tag',
+  ]) {
+    const h = harness()
+    h.window.location.href = `https://www.pixiv.net/users/1/bookmarks/${suffix}`
+    h.pageType.type = 4
+    h.managed.arm.url = h.window.location.href
+    h.registerCrawl()
+    assert.equal((await h.api.getAutomationCommands()).crawlReady, false)
+    assert.equal(
+      (await h.api.runAutomationCommand(await h.request('crawl.start'))).reason,
+      'unsupported-page'
+    )
+    assert.deepEqual(h.calls, [])
+  }
+})

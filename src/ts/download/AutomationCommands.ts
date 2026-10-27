@@ -42,7 +42,7 @@ function profilePageType() {
   )
     return PageName.UserRequest
   if (
-    /^\/(?:en\/)?users\/\d+\/bookmarks\/(?:artworks|novels)\/?$/.test(
+    /^\/(?:en\/)?users\/\d+\/bookmarks\/(?:artworks|novels)(?:\/[^/]+)?\/?$/.test(
       url.pathname
     )
   )

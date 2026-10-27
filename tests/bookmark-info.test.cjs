@@ -157,3 +157,44 @@ test('navigation during lookup invalidates the captured total', async () => {
   h.context.location.href += '?p=2'
   await assert.rejects(pending, /changed during info/)
 })
+
+test('collection type comes from the collection segment, never the bookmark tag', async () => {
+  for (const tag of ['novels', 'novels-special', 'novels%2Fartworks']) {
+    const h = harness(
+      `https://www.pixiv.net/en/users/1/bookmarks/artworks/${tag}`,
+      1000
+    )
+    const value = await h.info.getAutomationBookmarkInfo()
+    assert.equal(value.bookmarkType, 'artworks')
+    assert.equal(value.type, 'illusts')
+    assert.equal(value.uiPageSize, 48)
+    assert.equal(value.lastPage, 21)
+    assert.equal(h.calls[0][1], 'illusts')
+    assert.equal(h.calls[0][2], decodeURIComponent(tag))
+  }
+  const h = harness(
+    'https://www.pixiv.net/users/1/bookmarks/novels/artworks',
+    61
+  )
+  assert.equal(
+    (await h.info.getAutomationBookmarkInfo()).bookmarkType,
+    'novels'
+  )
+})
+
+test('bookmark info preserves delimiter-containing tags as raw API arguments', async () => {
+  for (const tag of ['foo&rest=hide#bar', '100% + value', '日本語/novels']) {
+    const h = harness(
+      `https://www.pixiv.net/users/1/bookmarks/artworks/${encodeURIComponent(tag)}?rest=show&p=3`
+    )
+    const value = await h.info.getAutomationBookmarkInfo()
+    assert.equal(value.tag, tag)
+    assert.equal(h.calls[0][2], tag)
+    assert.equal(h.calls[0][4], false)
+    assert.equal(
+      value.queryIdentity,
+      h.query.getBookmarkQuery(h.context.location.href.replace('p=3', 'p=2'))
+        .queryIdentity
+    )
+  }
+})
