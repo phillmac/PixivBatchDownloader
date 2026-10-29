@@ -2804,8 +2804,8 @@ async function persistDownloadWorkerIncident(tabId, reason, details = {}) {
             memoryIdList: idList[tabId] || [],
         });
         await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, {
-            schemaVersion: 1,
-            diagnosticsVersion: 'download-hang-v1',
+            schemaVersion: 2,
+            diagnosticsVersion: 'download-hang-v2-bounded',
             source: 'service-worker',
             capturedAt: new Date().toISOString(),
             reason,

@@ -27,7 +27,10 @@ type KnownOverlapArm = {
 let arm: KnownOverlapArm | null = null
 let activeKnownIds: Set<string> | null = null
 let snapshot: KnownOverlapSnapshot | null = null
+/** 当前连续出现、且在本轮抓取中首次观察到的已知 ID。 */
 let consecutiveIds: string[] = []
+/** 本轮抓取已观察的已知 ID；跨响应、未知项和禁用边界的扫描保留记录。 */
+const seenKnownIds = new Set<string>()
 let active = false
 
 function normalizeUrl(url: string) {
@@ -38,6 +41,7 @@ function now() {
   return new Date().toISOString()
 }
 
+/** 为下一次匹配 URL 的抓取配置重叠边界；空集合仍记录源耗尽。 */
 export function configureKnownOverlap(
   url: string,
   ids: string[] | null,
@@ -48,6 +52,7 @@ export function configureKnownOverlap(
     activeKnownIds = null
     snapshot = null
     consecutiveIds = []
+    seenKnownIds.clear()
     active = false
     return { armed: false, knownCount: 0, requiredConsecutive }
   }
@@ -70,6 +75,7 @@ export function configureKnownOverlap(
   }
   snapshot = null
   consecutiveIds = []
+  seenKnownIds.clear()
   active = false
   return {
     armed: true,
@@ -79,7 +85,9 @@ export function configureKnownOverlap(
   }
 }
 
+/** 一次性启用匹配的配置，并重置本轮已知 ID 的观察记录。 */
 export function startKnownOverlap(url: string) {
+  seenKnownIds.clear()
   const normalized = normalizeUrl(url)
   if (!arm || arm.url !== normalized) {
     activeKnownIds = null
@@ -114,6 +122,12 @@ export function startKnownOverlap(url: string) {
   return getKnownOverlapSnapshot(normalized)
 }
 
+/**
+ * 按源顺序保留候选项，仅连续首次出现的不同已知 ID 可以建立边界。
+ * 已知 ID 在本轮抓取中只能投票一次；任何重复项都会清空连续记录，且不作为
+ * 新连续记录的起点。未知项和 allowBoundary=false 同样清空连续记录，
+ * 但不清除已观察 ID，因此跨响应重放不能重新投票或连接前后的连续记录。
+ */
 export function consumeKnownOverlap<T extends { id: string }>(
   items: T[],
   allowBoundary = true
@@ -137,7 +151,9 @@ export function consumeKnownOverlap<T extends { id: string }>(
     result.push(item)
     if (activeKnownIds.has(item.id)) {
       snapshot.knownSeenCount += 1
-      if (!allowBoundary) {
+      const repeated = seenKnownIds.has(item.id)
+      seenKnownIds.add(item.id)
+      if (!allowBoundary || repeated) {
         consecutiveIds = []
         snapshot.currentConsecutive = 0
         continue
@@ -154,6 +170,7 @@ export function consumeKnownOverlap<T extends { id: string }>(
         snapshot.finishedAt = now()
         active = false
         activeKnownIds = null
+        seenKnownIds.clear()
         break
       }
       continue
@@ -171,6 +188,7 @@ export function consumeKnownOverlap<T extends { id: string }>(
   }
 }
 
+/** 记录源耗尽或抓取限额，结束尚未到达重叠边界的扫描。 */
 export function finishKnownOverlap(
   reason: Exclude<KnownOverlapStopReason, 'known-overlap'>
 ) {
@@ -181,6 +199,7 @@ export function finishKnownOverlap(
   snapshot.finishedAt = now()
   active = false
   activeKnownIds = null
+  seenKnownIds.clear()
   return getKnownOverlapSnapshot(snapshot.url)
 }
 

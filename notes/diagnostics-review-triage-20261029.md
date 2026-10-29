@@ -71,3 +71,12 @@ Do not reload the active downloader merely to validate this candidate.
 References: merged PR #3 review threads; MDN runtime.onMessage guidance on async
 listeners; Chrome storage.local serialized-value/key quota documentation. The
 new tests model competing Promise responses rather than merely asserting source text.
+
+
+### Final integrated validation
+
+After integrating merged distinct-overlap PR #24 and the roadmap, the combined
+candidate passed287/287 serial Node tests, TypeScript noEmit, webpack, packaging
+and git diff checks. The generated source-map conflict was resolved by rebuilding
+from merged TypeScript, not hand-editing generated output. ZIP/dist/source-worker
+bytes match for all six core bundles/workers. Runtime deployment remains pending.

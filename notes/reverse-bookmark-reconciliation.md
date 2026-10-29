@@ -1,5 +1,10 @@
 # Reverse bookmark automation — recovered source, 27 October 2026
 
+> **Historical development record.** See [ROADMAP.md](ROADMAP.md) for current
+> priorities and release status. PPBD #21 and the companion Dotfiles changes have
+> since been merged/deployed. Old pending-release statements and worktree names
+> below are retained as provenance, not current operating instructions.
+
 ## Canonical development line
 
 The recovered PPBD source belongs to PR #21 (`feat/bookmark-info-automation`).
