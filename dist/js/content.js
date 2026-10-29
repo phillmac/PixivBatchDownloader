@@ -16671,7 +16671,10 @@ __webpack_require__.r(__webpack_exports__);
 let arm = null;
 let activeKnownIds = null;
 let snapshot = null;
+/** 当前连续出现、且在本轮抓取中首次观察到的已知 ID。 */
 let consecutiveIds = [];
+/** 本轮抓取已观察的已知 ID；跨响应、未知项和禁用边界的扫描保留记录。 */
+const seenKnownIds = new Set();
 let active = false;
 function normalizeUrl(url) {
     return url.split('#')[0];
@@ -16679,12 +16682,14 @@ function normalizeUrl(url) {
 function now() {
     return new Date().toISOString();
 }
+/** 为下一次匹配 URL 的抓取配置重叠边界；空集合仍记录源耗尽。 */
 function configureKnownOverlap(url, ids, requiredConsecutive = 3) {
     if (ids === null) {
         arm = null;
         activeKnownIds = null;
         snapshot = null;
         consecutiveIds = [];
+        seenKnownIds.clear();
         active = false;
         return { armed: false, knownCount: 0, requiredConsecutive };
     }
@@ -16707,6 +16712,7 @@ function configureKnownOverlap(url, ids, requiredConsecutive = 3) {
     };
     snapshot = null;
     consecutiveIds = [];
+    seenKnownIds.clear();
     active = false;
     return {
         armed: true,
@@ -16715,7 +16721,9 @@ function configureKnownOverlap(url, ids, requiredConsecutive = 3) {
         requiredConsecutive,
     };
 }
+/** 一次性启用匹配的配置，并重置本轮已知 ID 的观察记录。 */
 function startKnownOverlap(url) {
+    seenKnownIds.clear();
     const normalized = normalizeUrl(url);
     if (!arm || arm.url !== normalized) {
         activeKnownIds = null;
@@ -16748,6 +16756,12 @@ function startKnownOverlap(url) {
     active = true;
     return getKnownOverlapSnapshot(normalized);
 }
+/**
+ * 按源顺序保留候选项，仅连续首次出现的不同已知 ID 可以建立边界。
+ * 已知 ID 在本轮抓取中只能投票一次；任何重复项都会清空连续记录，且不作为
+ * 新连续记录的起点。未知项和 allowBoundary=false 同样清空连续记录，
+ * 但不清除已观察 ID，因此跨响应重放不能重新投票或连接前后的连续记录。
+ */
 function consumeKnownOverlap(items, allowBoundary = true) {
     if (!activeKnownIds || !snapshot || !active) {
         return {
@@ -16767,7 +16781,9 @@ function consumeKnownOverlap(items, allowBoundary = true) {
         result.push(item);
         if (activeKnownIds.has(item.id)) {
             snapshot.knownSeenCount += 1;
-            if (!allowBoundary) {
+            const repeated = seenKnownIds.has(item.id);
+            seenKnownIds.add(item.id);
+            if (!allowBoundary || repeated) {
                 consecutiveIds = [];
                 snapshot.currentConsecutive = 0;
                 continue;
@@ -16784,6 +16800,7 @@ function consumeKnownOverlap(items, allowBoundary = true) {
                 snapshot.finishedAt = now();
                 active = false;
                 activeKnownIds = null;
+                seenKnownIds.clear();
                 break;
             }
             continue;
@@ -16798,6 +16815,7 @@ function consumeKnownOverlap(items, allowBoundary = true) {
         scannedCount,
     };
 }
+/** 记录源耗尽或抓取限额，结束尚未到达重叠边界的扫描。 */
 function finishKnownOverlap(reason) {
     if (!snapshot || snapshot.stopReason) {
         return getKnownOverlapSnapshot(snapshot?.url);
@@ -16806,6 +16824,7 @@ function finishKnownOverlap(reason) {
     snapshot.finishedAt = now();
     active = false;
     activeKnownIds = null;
+    seenKnownIds.clear();
     return getKnownOverlapSnapshot(snapshot.url);
 }
 function getKnownOverlapSnapshot(url) {
