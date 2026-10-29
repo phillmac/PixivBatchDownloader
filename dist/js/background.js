@@ -336,6 +336,190 @@ function snapshotCrawl(state, id, tabId, now) {
 
 /***/ },
 
+/***/ "./src/ts/download/DiagnosticSerialization.ts"
+/*!****************************************************!*\
+  !*** ./src/ts/download/DiagnosticSerialization.ts ***!
+  \****************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   diagnosticBytes: () => (/* binding */ diagnosticBytes),
+/* harmony export */   diagnosticLimits: () => (/* binding */ diagnosticLimits),
+/* harmony export */   diagnosticRecord: () => (/* binding */ diagnosticRecord),
+/* harmony export */   diagnosticSample: () => (/* binding */ diagnosticSample),
+/* harmony export */   diagnosticText: () => (/* binding */ diagnosticText),
+/* harmony export */   trimDiagnosticEvents: () => (/* binding */ trimDiagnosticEvents)
+/* harmony export */ });
+/** 诊断专用的 UTF-8 JSON 字节预算，不影响下载数据和自动化轮询。 */
+const diagnosticLimits = {
+    detail: 2048,
+    entry: 4096,
+    collection: 24 * 1024,
+    page: 96 * 1024,
+    worker: 96 * 1024,
+    report: 200 * 1024,
+    retention: 512 * 1024,
+    string: 1024,
+    entries: 240,
+};
+/** 计算已经过安全复制的数据的 UTF-8 JSON 字节数。 */
+function diagnosticBytes(value) {
+    try {
+        return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    }
+    catch {
+        return Infinity;
+    }
+}
+/** 按 JSON 编码后的 UTF-8 字节截断文本，且不拆开代理对。 */
+function diagnosticText(text, byteLimit = diagnosticLimits.string) {
+    if (text.length <= byteLimit && diagnosticBytes(text) <= byteLimit)
+        return text;
+    let low = 0;
+    let high = Math.min(text.length, byteLimit);
+    while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (diagnosticBytes(text.slice(0, middle)) + 3 <= byteLimit)
+            low = middle;
+        else
+            high = middle - 1;
+    }
+    if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1]))
+        low--;
+    return text.slice(0, low) + '…';
+}
+/** 深复制诊断对象并限制深度、节点、文本和总字节；不执行自定义 toJSON。 */
+function diagnosticRecord(source, byteLimit = diagnosticLimits.detail) {
+    // 留出固定空间记录截断与序列化失败信息。
+    let remaining = byteLimit - 256;
+    let truncatedValues = 0;
+    let serializationErrors = 0;
+    let nodes = 0;
+    const ancestors = new WeakSet();
+    const copy = (value, depth) => {
+        if (remaining < 8 || ++nodes > 32768 || depth > 8) {
+            truncatedValues++;
+            remaining -= 4;
+            return null;
+        }
+        if (typeof value === 'string') {
+            const text = diagnosticText(value, Math.min(remaining, diagnosticLimits.string));
+            if (text !== value)
+                truncatedValues++;
+            remaining -= diagnosticBytes(text);
+            return text;
+        }
+        if (value === undefined) {
+            remaining -= 4;
+            return null;
+        }
+        if (value === null ||
+            typeof value === 'boolean' ||
+            typeof value === 'number') {
+            remaining -= diagnosticBytes(value);
+            return value;
+        }
+        if (typeof value !== 'object' || ancestors.has(value)) {
+            serializationErrors++;
+            remaining -= 4;
+            return null;
+        }
+        ancestors.add(value);
+        remaining -= 2;
+        const result = Object.create(null);
+        const array = [];
+        try {
+            if (Array.isArray(value)) {
+                for (let i = 0; i < value.length; i++) {
+                    if (remaining < 16 || i >= diagnosticLimits.entries) {
+                        truncatedValues += value.length - i;
+                        break;
+                    }
+                    remaining--;
+                    try {
+                        array.push(copy(value[i], depth + 1));
+                    }
+                    catch {
+                        serializationErrors++;
+                        remaining -= 4;
+                        array.push(null);
+                    }
+                }
+            }
+            else {
+                let count = 0;
+                for (const key in value) {
+                    if (!Object.prototype.hasOwnProperty.call(value, key))
+                        continue;
+                    const keyBytes = key.length > remaining ? Infinity : diagnosticBytes(key);
+                    if (remaining < keyBytes + 16 || ++count > diagnosticLimits.entries) {
+                        truncatedValues++;
+                        break;
+                    }
+                    remaining -= keyBytes + 2;
+                    try {
+                        result[key] = copy(value[key], depth + 1);
+                    }
+                    catch {
+                        serializationErrors++;
+                        remaining -= 4;
+                        result[key] = null;
+                    }
+                }
+            }
+        }
+        catch {
+            serializationErrors++;
+        }
+        ancestors.delete(value);
+        return Array.isArray(value) ? array : result;
+    };
+    const value = copy(source, 0);
+    const result = value && typeof value === 'object' && !Array.isArray(value)
+        ? value
+        : {};
+    result.diagnosticSerialization = {
+        byteLimit,
+        truncatedValues,
+        serializationErrors,
+    };
+    return result;
+}
+/** 从迭代器提取有字节上限的详情，并保留准确的总数和省略数量。 */
+function diagnosticSample(values, total, byteLimit = diagnosticLimits.collection) {
+    const items = [];
+    let bytes = 2;
+    for (const value of values) {
+        const item = diagnosticRecord(value, diagnosticLimits.entry);
+        const size = diagnosticBytes(item) + 1;
+        if (bytes + size > byteLimit || items.length >= diagnosticLimits.entries)
+            break;
+        items.push(item);
+        bytes += size;
+    }
+    return { items, total, omitted: total - items.length };
+}
+/** 原地收缩最近事件环，同时约束条数与序列化字节。 */
+function trimDiagnosticEvents(events) {
+    let bytes = 2;
+    let start = events.length;
+    while (start > 0 && events.length - start < diagnosticLimits.entries) {
+        const size = diagnosticBytes(events[start - 1]) + 1;
+        if (bytes + size > diagnosticLimits.collection)
+            break;
+        bytes += size;
+        start--;
+    }
+    if (start)
+        events.splice(0, start);
+    return start;
+}
+
+
+/***/ },
+
 /***/ "./src/ts/serviceWorker/CheckDownloadCount.ts"
 /*!****************************************************!*\
   !*** ./src/ts/serviceWorker/CheckDownloadCount.ts ***!
@@ -560,9 +744,15 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ });
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../download/DiagnosticSerialization */ "./src/ts/download/DiagnosticSerialization.ts");
 
-/** 每个标签页保留的最近 worker 诊断事件数量。 */
-const EVENT_LIMIT = 240;
+
+/** worker 诊断只保留有限活动任务和最近有事件的标签页。 */
+const ACTIVE_LIMIT = 256;
+/** worker 历史事件最多保留的标签页数。 */
+const TAB_LIMIT = 32;
+/** 待持久化报告最多排队数量，避免存储阻塞时积压。 */
+const PENDING_LIMIT = 8;
 /** 持久化保留的疑似卡住报告数量。 */
 const REPORT_LIMIT = 20;
 /** 疑似卡住报告的 storage.local 键名。 */
@@ -575,53 +765,72 @@ class DownloadWorkerDiagnostics {
     events = new Map();
     /** 串行化持久化报告的队列，防止并发读改写丢失数据。 */
     persistQueue = Promise.resolve();
+    /** 当前等待持久化的报告数量。 */
+    pendingReports = 0;
+    /** 容量限制移除的活动诊断任务总数。 */
+    evictedTasks = 0;
+    /** 各标签页已被事件环省略的记录数量。 */
+    omittedEvents = new Map();
     /** 记录 worker 侧任务进入新的诊断阶段。 */
     enter(tabId, diagnosticId, stage, details = {}) {
         if (!diagnosticId)
             return;
-        const previous = this.active.get(diagnosticId);
+        const key = `${tabId}:${diagnosticId}`;
+        const previous = this.active.get(key);
+        if (!previous && this.active.size >= ACTIVE_LIMIT) {
+            this.active.delete(this.active.keys().next().value);
+            this.evictedTasks++;
+        }
         const task = {
             diagnosticId,
             tabId,
             workId: typeof details.workId === 'string'
-                ? details.workId
+                ? (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(details.workId)
                 : previous?.workId || '',
             fileName: typeof details.fileName === 'string'
-                ? details.fileName
+                ? (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(details.fileName)
                 : previous?.fileName || '',
-            stage,
+            stage: (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(stage),
             stageAt: new Date().toISOString(),
             browserDownloadId: typeof details.browserDownloadId === 'number'
                 ? details.browserDownloadId
                 : previous?.browserDownloadId,
         };
-        this.active.set(diagnosticId, task);
+        this.active.set(key, task);
         const events = this.events.get(tabId) || [];
         events.push({
             at: task.stageAt,
             diagnosticId,
             tabId,
-            stage,
-            details,
+            stage: (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(stage),
+            details: (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)(details),
         });
-        if (events.length > EVENT_LIMIT) {
-            events.splice(0, events.length - EVENT_LIMIT);
-        }
+        this.omittedEvents.set(tabId, (this.omittedEvents.get(tabId) || 0) + (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.trimDiagnosticEvents)(events));
+        this.events.delete(tabId);
         this.events.set(tabId, events);
+        if (this.events.size > TAB_LIMIT) {
+            const oldest = this.events.keys().next().value;
+            this.events.delete(oldest);
+            this.omittedEvents.delete(oldest);
+        }
     }
     /** 记录最终 worker 阶段并移除活动任务。 */
     finish(tabId, diagnosticId, stage, details = {}) {
         if (!diagnosticId)
             return;
         this.enter(tabId, diagnosticId, stage, details);
-        this.active.delete(diagnosticId);
+        this.active.delete(`${tabId}:${diagnosticId}`);
     }
     /** 捕获指定标签页的 worker 状态及已知 Chrome 下载状态。 */
     async snapshot(tabId, bookkeeping = {}) {
-        const active = [...this.active.values()].filter((task) => task.tabId === tabId);
+        const tasks = [...this.active.values()].filter((task) => task.tabId === tabId);
+        const active = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticSample)(tasks.map((task) => ({ ...task })), tasks.length);
+        const recent = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticSample)((this.events.get(tabId) || []).slice().reverse(), (this.events.get(tabId) || []).length);
+        // 在第一次异步查询前复制事件和账目，避免混入查询期间的新状态。
+        const capturedBookkeeping = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)(bookkeeping, _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.collection);
         const downloads = [];
-        for (const task of active) {
-            if (task.browserDownloadId === undefined)
+        for (const task of active.items) {
+            if (typeof task.browserDownloadId !== 'number')
                 continue;
             try {
                 const [item] = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().downloads.search({
@@ -655,26 +864,55 @@ class DownloadWorkerDiagnostics {
                 });
             }
         }
-        return {
+        return (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)({
             capturedAt: new Date().toISOString(),
-            active,
-            recentEvents: (this.events.get(tabId) || []).slice(),
+            active: active.items,
+            activeTotal: active.total,
+            activeOmitted: active.omitted,
+            evictedTasks: this.evictedTasks,
+            recentEvents: recent.items.reverse(),
+            recentEventsOmitted: (this.omittedEvents.get(tabId) || 0) + recent.omitted,
+            bookkeeping: capturedBookkeeping,
             downloads,
-            bookkeeping,
-        };
+        }, _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.worker);
     }
-    /** 串行化 storage.local 的读改写，避免并发异常报告相互覆盖。 */
+    /** 串行化读改写并按 UTF-8 JSON 字节淘汰旧报告；存储失败不影响下载。 */
     persist(tabId, report) {
+        if (this.pendingReports >= PENDING_LIMIT) {
+            return Promise.resolve({ stored: false, reason: 'diagnostic-queue-full' });
+        }
+        const entry = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)({ tabId, storedAt: new Date().toISOString(), report }, _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.report);
+        this.pendingReports++;
         const write = async () => {
-            const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.get(REPORT_STORAGE_KEY);
-            const reports = Array.isArray(stored[REPORT_STORAGE_KEY])
-                ? stored[REPORT_STORAGE_KEY]
-                : [];
-            reports.push({ tabId, storedAt: new Date().toISOString(), report });
-            if (reports.length > REPORT_LIMIT) {
-                reports.splice(0, reports.length - REPORT_LIMIT);
+            try {
+                const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.get(REPORT_STORAGE_KEY);
+                const previous = Array.isArray(stored[REPORT_STORAGE_KEY])
+                    ? stored[REPORT_STORAGE_KEY]
+                    : [];
+                const reports = [entry];
+                // 计算完整 storage 对象的大小，包含键名、数组和封装信息。
+                let bytes = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticBytes)({ [REPORT_STORAGE_KEY]: reports });
+                for (let i = previous.length - 1; i >= 0 && reports.length < REPORT_LIMIT; i--) {
+                    const old = previous[i];
+                    const bounded = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)(old && typeof old === 'object' && !Array.isArray(old)
+                        ? old
+                        : { report: old }, _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.report);
+                    const size = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticBytes)(bounded) + 1;
+                    if (bytes + size > _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.retention)
+                        break;
+                    reports.unshift(bounded);
+                    bytes += size;
+                }
+                await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.set({ [REPORT_STORAGE_KEY]: reports });
+                return { stored: true };
             }
-            await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().storage.local.set({ [REPORT_STORAGE_KEY]: reports });
+            catch {
+                // 不重试同一份大报告，也不让遥测异常拒绝原始下载消息。
+                return { stored: false, reason: 'diagnostic-storage-unavailable' };
+            }
+            finally {
+                this.pendingReports--;
+            }
         };
         const result = this.persistQueue.then(write, write);
         this.persistQueue = result.then(() => undefined, () => undefined);
@@ -713,58 +951,66 @@ class ManageFollowing {
                 this.storage();
             }
         });
-        webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.onMessage.addListener(async (msg, sender) => {
-            if (!this.isMsg(msg)) {
-                return false;
-            }
-            if (msg.msg === 'requestFollowingData') {
-                this.dispatchFollowingList(sender?.tab);
-            }
-            if (msg.msg === 'resetFollowingData') {
-                this.clearData();
-            }
-            if (msg.msg === 'needUpdateFollowingData') {
-                if (this.uploadStatus === 'locked') {
-                    // 查询上次执行更新任务的标签页还是否存在，如果不存在，
-                    // 则改为让这次发起请求的标签页执行更新任务
-                    const tabs = await this.findAllPixivTab();
-                    const find = tabs.find((tab) => tab.id === this.updateTaskTabID);
-                    if (!find) {
-                        this.updateTaskTabID = sender.tab.id;
-                    }
-                    else {
-                        // 如果上次执行更新任务的标签页依然存在，且状态锁定，则拒绝这次请求
-                        return;
-                    }
-                }
-                else {
+        webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.onMessage.addListener((msg, sender) => {
+            // 不处理的消息必须同步返回，否则 polyfill 会抢先用空 Promise 回应其他监听器。
+            if (!this.isMsg(msg))
+                return undefined;
+            return this.handleMessage(msg, sender);
+        });
+        this.bindFollowingRequests();
+    }
+    /** 仅为关注列表消息保留异步处理与更新锁行为。 */
+    async handleMessage(msg, sender) {
+        if (msg.msg === 'requestFollowingData') {
+            this.dispatchFollowingList(sender?.tab);
+        }
+        if (msg.msg === 'resetFollowingData') {
+            this.clearData();
+        }
+        if (msg.msg === 'needUpdateFollowingData') {
+            if (this.uploadStatus === 'locked') {
+                // 查询上次执行更新任务的标签页还是否存在，如果不存在，
+                // 则改为让这次发起请求的标签页执行更新任务
+                const tabs = await this.findAllPixivTab();
+                const find = tabs.find((tab) => tab.id === this.updateTaskTabID);
+                if (!find) {
                     this.updateTaskTabID = sender.tab.id;
                 }
-                this.uploadStatus = 'locked';
-                webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().tabs.sendMessage(this.updateTaskTabID, {
-                    msg: 'updateFollowingData',
-                });
-            }
-            if (msg.msg === 'setFollowingData') {
-                // 当前台获取新的关注列表完成之后，会发送此消息。
-                // 如果发送消息的页面和发起请求的页面是同一个，则解除锁定状态
-                if (sender.tab.id === this.updateTaskTabID) {
-                    this.uploadStatus = 'idle';
-                }
-                // 不管数据是否来自于发起请求的页面都更新数据。因为有些操作可能会直接更新数据，没有事先请求批准的环节
-                // set 操作不会被放入等待队列中，而且总是会被立即执行
-                // 这是因为在请求数据的过程中可能产生了其他操作，set 操作的数据可能已经是旧的了
-                // 所以需要先应用 set 里的数据，然后再执行其他操作，在旧数据的基础上进行修改
-                await this.setData(msg.data);
-                // 如果队列中没有等待的操作，则立即派发数据并储存数据
-                // 如果有等待的操作，则不派发和储存数据，因为稍后队列执行完毕后也会派发和储存数据
-                // 这是为了避免重复派发和储存数据，避免影响性能
-                if (this.queue.length === 0) {
-                    this.dispatchFollowingList();
-                    this.storage();
+                else {
+                    // 如果上次执行更新任务的标签页依然存在，且状态锁定，则拒绝这次请求
+                    return;
                 }
             }
-        });
+            else {
+                this.updateTaskTabID = sender.tab.id;
+            }
+            this.uploadStatus = 'locked';
+            webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().tabs.sendMessage(this.updateTaskTabID, {
+                msg: 'updateFollowingData',
+            });
+        }
+        if (msg.msg === 'setFollowingData') {
+            // 当前台获取新的关注列表完成之后，会发送此消息。
+            // 如果发送消息的页面和发起请求的页面是同一个，则解除锁定状态
+            if (sender.tab.id === this.updateTaskTabID) {
+                this.uploadStatus = 'idle';
+            }
+            // 不管数据是否来自于发起请求的页面都更新数据。因为有些操作可能会直接更新数据，没有事先请求批准的环节
+            // set 操作不会被放入等待队列中，而且总是会被立即执行
+            // 这是因为在请求数据的过程中可能产生了其他操作，set 操作的数据可能已经是旧的了
+            // 所以需要先应用 set 里的数据，然后再执行其他操作，在旧数据的基础上进行修改
+            await this.setData(msg.data);
+            // 如果队列中没有等待的操作，则立即派发数据并储存数据
+            // 如果有等待的操作，则不派发和储存数据，因为稍后队列执行完毕后也会派发和储存数据
+            // 这是为了避免重复派发和储存数据，避免影响性能
+            if (this.queue.length === 0) {
+                this.dispatchFollowingList();
+                this.storage();
+            }
+        }
+    }
+    /** 监听关注请求，并启动原有的队列与维护计时器。 */
+    bindFollowingRequests() {
         // 监听用户新增或取消一个关注的请求
         // 由于某些逻辑相似，就添加到一个监听器里了
         webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().webRequest.onBeforeRequest.addListener((details) => {
@@ -870,9 +1116,27 @@ class ManageFollowing {
             await _backgroundAPI__WEBPACK_IMPORTED_MODULE_1__.backgroundAPI.sleep(100);
         }
     }
-    // 收到消息时的类型守卫
+    /** 只接受本模块实际处理的消息；忽略空值、畸形数据和其他模块的协议。 */
     isMsg(msg) {
-        return !!msg.msg;
+        if (!msg || typeof msg !== 'object' || !('msg' in msg))
+            return false;
+        if (msg.msg === 'requestFollowingData' ||
+            msg.msg === 'resetFollowingData' ||
+            msg.msg === 'needUpdateFollowingData')
+            return true;
+        if (msg.msg !== 'setFollowingData' || !('data' in msg))
+            return false;
+        const data = msg.data;
+        return (!!data &&
+            typeof data === 'object' &&
+            'user' in data &&
+            typeof data.user === 'string' &&
+            'following' in data &&
+            Array.isArray(data.following) &&
+            'followedUsersInfo' in data &&
+            Array.isArray(data.followedUsersInfo) &&
+            'total' in data &&
+            typeof data.total === 'number');
     }
     /**向前台脚本派发数据
      * 可以指定向哪个 tab 派发
@@ -2495,6 +2759,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_4__);
 /* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
 /* harmony import */ var _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! ./DownloadWorkerDiagnostics */ "./src/ts/serviceWorker/DownloadWorkerDiagnostics.ts");
+/* harmony import */ var _download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_7__ = __webpack_require__(/*! ../download/DiagnosticSerialization */ "./src/ts/download/DiagnosticSerialization.ts");
+
 
 
 
@@ -2530,19 +2796,26 @@ async function setData(data) {
 }
 /** 立即持久化 worker 侧异常，避免 MV3 worker 休眠后丢失证据。 */
 async function persistDownloadWorkerIncident(tabId, reason, details = {}) {
-    const worker = await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.snapshot(tabId, {
-        memoryBatchNo: batchNo[tabId],
-        memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
-    });
-    await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, {
-        schemaVersion: 1,
-        diagnosticsVersion: 'download-hang-v1',
-        source: 'service-worker',
-        capturedAt: new Date().toISOString(),
-        reason,
-        details,
-        worker,
-    });
+    try {
+        const capturedDetails = (0,_download_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_7__.diagnosticRecord)(details);
+        const worker = await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.snapshot(tabId, {
+            memoryBatchNo: batchNo[tabId],
+            memoryIdListTotal: idList[tabId]?.length || 0,
+            memoryIdList: idList[tabId] || [],
+        });
+        await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, {
+            schemaVersion: 1,
+            diagnosticsVersion: 'download-hang-v1',
+            source: 'service-worker',
+            capturedAt: new Date().toISOString(),
+            reason,
+            details: capturedDetails,
+            worker,
+        });
+    }
+    catch {
+        console.warn('Unable to capture worker download diagnostics');
+    }
 }
 /** 全局下载租约协议使用的消息名称。 */
 const globalDownloadLeaseMsg = {
@@ -2759,20 +3032,29 @@ webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().runtime.onMessage.a
         if (msg.msg === 'get_download_worker_diagnostics') {
             if (tabId === undefined)
                 return { unavailable: true, reason: 'no-tab-id' };
-            const stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage.local.get(['batchNo', 'idList']);
+            let stored = {};
+            let storedReadFailed = false;
+            try {
+                stored = await webextension_polyfill__WEBPACK_IMPORTED_MODULE_4___default().storage.local.get(['batchNo', 'idList']);
+            }
+            catch {
+                storedReadFailed = true;
+            }
             const storedBatchNo = stored.batchNo;
             const storedIdList = stored.idList;
             return _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.snapshot(tabId, {
                 memoryBatchNo: batchNo[tabId],
-                memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
+                storedReadFailed,
+                memoryIdListTotal: idList[tabId]?.length || 0,
+                storedIdListTotal: storedIdList?.[tabId]?.length || 0,
+                memoryIdList: idList[tabId] || [],
                 storedBatchNo: storedBatchNo?.[tabId],
-                storedIdList: storedIdList?.[tabId] ? [...storedIdList[tabId]] : [],
+                storedIdList: storedIdList?.[tabId] || [],
             });
         }
         if (tabId === undefined)
             return { stored: false, reason: 'no-tab-id' };
-        await _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, msg.report);
-        return { stored: true };
+        return _DownloadWorkerDiagnostics__WEBPACK_IMPORTED_MODULE_6__.downloadWorkerDiagnostics.persist(tabId, msg.report);
     }
     // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
     // 不能直接在上面设置类型为 msg: SendToBackEndData，否则会报错。因此需要使用类型守卫，真麻烦

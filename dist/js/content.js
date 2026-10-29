@@ -25451,6 +25451,190 @@ new CheckWarningMessage();
 
 /***/ },
 
+/***/ "./src/ts/download/DiagnosticSerialization.ts"
+/*!****************************************************!*\
+  !*** ./src/ts/download/DiagnosticSerialization.ts ***!
+  \****************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   diagnosticBytes: () => (/* binding */ diagnosticBytes),
+/* harmony export */   diagnosticLimits: () => (/* binding */ diagnosticLimits),
+/* harmony export */   diagnosticRecord: () => (/* binding */ diagnosticRecord),
+/* harmony export */   diagnosticSample: () => (/* binding */ diagnosticSample),
+/* harmony export */   diagnosticText: () => (/* binding */ diagnosticText),
+/* harmony export */   trimDiagnosticEvents: () => (/* binding */ trimDiagnosticEvents)
+/* harmony export */ });
+/** 诊断专用的 UTF-8 JSON 字节预算，不影响下载数据和自动化轮询。 */
+const diagnosticLimits = {
+    detail: 2048,
+    entry: 4096,
+    collection: 24 * 1024,
+    page: 96 * 1024,
+    worker: 96 * 1024,
+    report: 200 * 1024,
+    retention: 512 * 1024,
+    string: 1024,
+    entries: 240,
+};
+/** 计算已经过安全复制的数据的 UTF-8 JSON 字节数。 */
+function diagnosticBytes(value) {
+    try {
+        return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    }
+    catch {
+        return Infinity;
+    }
+}
+/** 按 JSON 编码后的 UTF-8 字节截断文本，且不拆开代理对。 */
+function diagnosticText(text, byteLimit = diagnosticLimits.string) {
+    if (text.length <= byteLimit && diagnosticBytes(text) <= byteLimit)
+        return text;
+    let low = 0;
+    let high = Math.min(text.length, byteLimit);
+    while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (diagnosticBytes(text.slice(0, middle)) + 3 <= byteLimit)
+            low = middle;
+        else
+            high = middle - 1;
+    }
+    if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1]))
+        low--;
+    return text.slice(0, low) + '…';
+}
+/** 深复制诊断对象并限制深度、节点、文本和总字节；不执行自定义 toJSON。 */
+function diagnosticRecord(source, byteLimit = diagnosticLimits.detail) {
+    // 留出固定空间记录截断与序列化失败信息。
+    let remaining = byteLimit - 256;
+    let truncatedValues = 0;
+    let serializationErrors = 0;
+    let nodes = 0;
+    const ancestors = new WeakSet();
+    const copy = (value, depth) => {
+        if (remaining < 8 || ++nodes > 32768 || depth > 8) {
+            truncatedValues++;
+            remaining -= 4;
+            return null;
+        }
+        if (typeof value === 'string') {
+            const text = diagnosticText(value, Math.min(remaining, diagnosticLimits.string));
+            if (text !== value)
+                truncatedValues++;
+            remaining -= diagnosticBytes(text);
+            return text;
+        }
+        if (value === undefined) {
+            remaining -= 4;
+            return null;
+        }
+        if (value === null ||
+            typeof value === 'boolean' ||
+            typeof value === 'number') {
+            remaining -= diagnosticBytes(value);
+            return value;
+        }
+        if (typeof value !== 'object' || ancestors.has(value)) {
+            serializationErrors++;
+            remaining -= 4;
+            return null;
+        }
+        ancestors.add(value);
+        remaining -= 2;
+        const result = Object.create(null);
+        const array = [];
+        try {
+            if (Array.isArray(value)) {
+                for (let i = 0; i < value.length; i++) {
+                    if (remaining < 16 || i >= diagnosticLimits.entries) {
+                        truncatedValues += value.length - i;
+                        break;
+                    }
+                    remaining--;
+                    try {
+                        array.push(copy(value[i], depth + 1));
+                    }
+                    catch {
+                        serializationErrors++;
+                        remaining -= 4;
+                        array.push(null);
+                    }
+                }
+            }
+            else {
+                let count = 0;
+                for (const key in value) {
+                    if (!Object.prototype.hasOwnProperty.call(value, key))
+                        continue;
+                    const keyBytes = key.length > remaining ? Infinity : diagnosticBytes(key);
+                    if (remaining < keyBytes + 16 || ++count > diagnosticLimits.entries) {
+                        truncatedValues++;
+                        break;
+                    }
+                    remaining -= keyBytes + 2;
+                    try {
+                        result[key] = copy(value[key], depth + 1);
+                    }
+                    catch {
+                        serializationErrors++;
+                        remaining -= 4;
+                        result[key] = null;
+                    }
+                }
+            }
+        }
+        catch {
+            serializationErrors++;
+        }
+        ancestors.delete(value);
+        return Array.isArray(value) ? array : result;
+    };
+    const value = copy(source, 0);
+    const result = value && typeof value === 'object' && !Array.isArray(value)
+        ? value
+        : {};
+    result.diagnosticSerialization = {
+        byteLimit,
+        truncatedValues,
+        serializationErrors,
+    };
+    return result;
+}
+/** 从迭代器提取有字节上限的详情，并保留准确的总数和省略数量。 */
+function diagnosticSample(values, total, byteLimit = diagnosticLimits.collection) {
+    const items = [];
+    let bytes = 2;
+    for (const value of values) {
+        const item = diagnosticRecord(value, diagnosticLimits.entry);
+        const size = diagnosticBytes(item) + 1;
+        if (bytes + size > byteLimit || items.length >= diagnosticLimits.entries)
+            break;
+        items.push(item);
+        bytes += size;
+    }
+    return { items, total, omitted: total - items.length };
+}
+/** 原地收缩最近事件环，同时约束条数与序列化字节。 */
+function trimDiagnosticEvents(events) {
+    let bytes = 2;
+    let start = events.length;
+    while (start > 0 && events.length - start < diagnosticLimits.entries) {
+        const size = diagnosticBytes(events[start - 1]) + 1;
+        if (bytes + size > diagnosticLimits.collection)
+            break;
+        bytes += size;
+        start--;
+    }
+    if (start)
+        events.splice(0, start);
+    return start;
+}
+
+
+/***/ },
+
 /***/ "./src/ts/download/Download.ts"
 /*!*************************************!*\
   !*** ./src/ts/download/Download.ts ***!
@@ -26246,21 +26430,23 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _setting_Settings__WEBPACK_IMPORTED_MODULE_8__ = __webpack_require__(/*! ../setting/Settings */ "./src/ts/setting/Settings.ts");
 /* harmony import */ var _download_Download__WEBPACK_IMPORTED_MODULE_9__ = __webpack_require__(/*! ../download/Download */ "./src/ts/download/Download.ts");
 /* harmony import */ var _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__ = __webpack_require__(/*! ./DownloadDiagnostics */ "./src/ts/download/DownloadDiagnostics.ts");
-/* harmony import */ var _ProgressBar__WEBPACK_IMPORTED_MODULE_11__ = __webpack_require__(/*! ./ProgressBar */ "./src/ts/download/ProgressBar.ts");
-/* harmony import */ var _DownloadStates__WEBPACK_IMPORTED_MODULE_12__ = __webpack_require__(/*! ./DownloadStates */ "./src/ts/download/DownloadStates.ts");
-/* harmony import */ var _ShowDownloadStates__WEBPACK_IMPORTED_MODULE_13__ = __webpack_require__(/*! ./ShowDownloadStates */ "./src/ts/download/ShowDownloadStates.ts");
-/* harmony import */ var _ShowSkipCount__WEBPACK_IMPORTED_MODULE_14__ = __webpack_require__(/*! ./ShowSkipCount */ "./src/ts/download/ShowSkipCount.ts");
-/* harmony import */ var _ShowDuplicateLog__WEBPACK_IMPORTED_MODULE_15__ = __webpack_require__(/*! ./ShowDuplicateLog */ "./src/ts/download/ShowDuplicateLog.ts");
-/* harmony import */ var _ShowConvertCount__WEBPACK_IMPORTED_MODULE_16__ = __webpack_require__(/*! ./ShowConvertCount */ "./src/ts/download/ShowConvertCount.ts");
-/* harmony import */ var _BookmarkAfterDL__WEBPACK_IMPORTED_MODULE_17__ = __webpack_require__(/*! ./BookmarkAfterDL */ "./src/ts/download/BookmarkAfterDL.ts");
-/* harmony import */ var _store_States__WEBPACK_IMPORTED_MODULE_18__ = __webpack_require__(/*! ../store/States */ "./src/ts/store/States.ts");
-/* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_19__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
-/* harmony import */ var _Toast__WEBPACK_IMPORTED_MODULE_20__ = __webpack_require__(/*! ../Toast */ "./src/ts/Toast.ts");
-/* harmony import */ var _utils_Utils__WEBPACK_IMPORTED_MODULE_21__ = __webpack_require__(/*! ../utils/Utils */ "./src/ts/utils/Utils.ts");
-/* harmony import */ var _PageType__WEBPACK_IMPORTED_MODULE_22__ = __webpack_require__(/*! ../PageType */ "./src/ts/PageType.ts");
-/* harmony import */ var _MsgBox__WEBPACK_IMPORTED_MODULE_23__ = __webpack_require__(/*! ../MsgBox */ "./src/ts/MsgBox.ts");
-/* harmony import */ var _CheckWarningMessage__WEBPACK_IMPORTED_MODULE_24__ = __webpack_require__(/*! ./CheckWarningMessage */ "./src/ts/download/CheckWarningMessage.ts");
-/* harmony import */ var _DownloadCountWarning__WEBPACK_IMPORTED_MODULE_25__ = __webpack_require__(/*! ./DownloadCountWarning */ "./src/ts/download/DownloadCountWarning.ts");
+/* harmony import */ var _DownloadDiagnosticSnapshot__WEBPACK_IMPORTED_MODULE_11__ = __webpack_require__(/*! ./DownloadDiagnosticSnapshot */ "./src/ts/download/DownloadDiagnosticSnapshot.ts");
+/* harmony import */ var _ProgressBar__WEBPACK_IMPORTED_MODULE_12__ = __webpack_require__(/*! ./ProgressBar */ "./src/ts/download/ProgressBar.ts");
+/* harmony import */ var _DownloadStates__WEBPACK_IMPORTED_MODULE_13__ = __webpack_require__(/*! ./DownloadStates */ "./src/ts/download/DownloadStates.ts");
+/* harmony import */ var _ShowDownloadStates__WEBPACK_IMPORTED_MODULE_14__ = __webpack_require__(/*! ./ShowDownloadStates */ "./src/ts/download/ShowDownloadStates.ts");
+/* harmony import */ var _ShowSkipCount__WEBPACK_IMPORTED_MODULE_15__ = __webpack_require__(/*! ./ShowSkipCount */ "./src/ts/download/ShowSkipCount.ts");
+/* harmony import */ var _ShowDuplicateLog__WEBPACK_IMPORTED_MODULE_16__ = __webpack_require__(/*! ./ShowDuplicateLog */ "./src/ts/download/ShowDuplicateLog.ts");
+/* harmony import */ var _ShowConvertCount__WEBPACK_IMPORTED_MODULE_17__ = __webpack_require__(/*! ./ShowConvertCount */ "./src/ts/download/ShowConvertCount.ts");
+/* harmony import */ var _BookmarkAfterDL__WEBPACK_IMPORTED_MODULE_18__ = __webpack_require__(/*! ./BookmarkAfterDL */ "./src/ts/download/BookmarkAfterDL.ts");
+/* harmony import */ var _store_States__WEBPACK_IMPORTED_MODULE_19__ = __webpack_require__(/*! ../store/States */ "./src/ts/store/States.ts");
+/* harmony import */ var _Config__WEBPACK_IMPORTED_MODULE_20__ = __webpack_require__(/*! ../Config */ "./src/ts/Config.ts");
+/* harmony import */ var _Toast__WEBPACK_IMPORTED_MODULE_21__ = __webpack_require__(/*! ../Toast */ "./src/ts/Toast.ts");
+/* harmony import */ var _utils_Utils__WEBPACK_IMPORTED_MODULE_22__ = __webpack_require__(/*! ../utils/Utils */ "./src/ts/utils/Utils.ts");
+/* harmony import */ var _PageType__WEBPACK_IMPORTED_MODULE_23__ = __webpack_require__(/*! ../PageType */ "./src/ts/PageType.ts");
+/* harmony import */ var _MsgBox__WEBPACK_IMPORTED_MODULE_24__ = __webpack_require__(/*! ../MsgBox */ "./src/ts/MsgBox.ts");
+/* harmony import */ var _CheckWarningMessage__WEBPACK_IMPORTED_MODULE_25__ = __webpack_require__(/*! ./CheckWarningMessage */ "./src/ts/download/CheckWarningMessage.ts");
+/* harmony import */ var _DownloadCountWarning__WEBPACK_IMPORTED_MODULE_26__ = __webpack_require__(/*! ./DownloadCountWarning */ "./src/ts/download/DownloadCountWarning.ts");
+
 
 
 
@@ -26307,11 +26493,10 @@ class DownloadControl {
             pause: this.pause,
             pauseReason: this.pauseReason,
             stop: this.stop,
-            busy: _store_States__WEBPACK_IMPORTED_MODULE_18__.states.busy,
-            downloading: _store_States__WEBPACK_IMPORTED_MODULE_18__.states.downloading,
-            bookmarkMode: _store_States__WEBPACK_IMPORTED_MODULE_18__.states.bookmarkMode,
-            downloadStates: [..._DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.states],
-            taskList: { ...this.taskList },
+            busy: _store_States__WEBPACK_IMPORTED_MODULE_19__.states.busy,
+            downloading: _store_States__WEBPACK_IMPORTED_MODULE_19__.states.downloading,
+            bookmarkMode: _store_States__WEBPACK_IMPORTED_MODULE_19__.states.bookmarkMode,
+            ...(0,_DownloadDiagnosticSnapshot__WEBPACK_IMPORTED_MODULE_11__.downloadQueueSnapshot)(_DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.states, this.taskList),
         }));
         _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.setAutomationStateProvider(() => ({
             remainingDownload: _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.remainingDownload,
@@ -26319,20 +26504,20 @@ class DownloadControl {
             pause: this.pause,
             pauseReason: this.pauseReason,
             stop: this.stop,
-            busy: _store_States__WEBPACK_IMPORTED_MODULE_18__.states.busy,
-            downloading: _store_States__WEBPACK_IMPORTED_MODULE_18__.states.downloading,
-            bookmarkMode: _store_States__WEBPACK_IMPORTED_MODULE_18__.states.bookmarkMode,
+            busy: _store_States__WEBPACK_IMPORTED_MODULE_19__.states.busy,
+            downloading: _store_States__WEBPACK_IMPORTED_MODULE_19__.states.downloading,
+            bookmarkMode: _store_States__WEBPACK_IMPORTED_MODULE_19__.states.bookmarkMode,
         }));
         const statusTipWrap = this.wrapper.querySelector('.down_status');
-        new _ShowDownloadStates__WEBPACK_IMPORTED_MODULE_13__.ShowDownloadStates(statusTipWrap);
+        new _ShowDownloadStates__WEBPACK_IMPORTED_MODULE_14__.ShowDownloadStates(statusTipWrap);
         const skipTipWrap = this.wrapper.querySelector('.skip_tip');
-        new _ShowSkipCount__WEBPACK_IMPORTED_MODULE_14__.ShowSkipCount(skipTipWrap);
+        new _ShowSkipCount__WEBPACK_IMPORTED_MODULE_15__.ShowSkipCount(skipTipWrap);
         const convertTipWrap = this.wrapper.querySelector('.convert_tip');
-        new _ShowConvertCount__WEBPACK_IMPORTED_MODULE_16__.ShowConvertCount(convertTipWrap);
+        new _ShowConvertCount__WEBPACK_IMPORTED_MODULE_17__.ShowConvertCount(convertTipWrap);
         // 只在 p 站内启用下载后收藏的功能
-        if (_utils_Utils__WEBPACK_IMPORTED_MODULE_21__.Utils.isPixiv()) {
+        if (_utils_Utils__WEBPACK_IMPORTED_MODULE_22__.Utils.isPixiv()) {
             const bmkAfterDLTipWrap = this.wrapper.querySelector('.bmkAfterDL_tip');
-            new _BookmarkAfterDL__WEBPACK_IMPORTED_MODULE_17__.BookmarkAfterDL(bmkAfterDLTipWrap);
+            new _BookmarkAfterDL__WEBPACK_IMPORTED_MODULE_18__.BookmarkAfterDL(bmkAfterDLTipWrap);
         }
     }
     /** readyDownload 的延迟准备结束前，自动化不能开始下载。 */
@@ -26386,7 +26571,7 @@ class DownloadControl {
         ]) {
             window.addEventListener(ev, (ev) => {
                 // 当恢复了未完成的抓取数据时，将下载状态设置为暂停
-                if (!_store_States__WEBPACK_IMPORTED_MODULE_18__.states.busy)
+                if (!_store_States__WEBPACK_IMPORTED_MODULE_19__.states.busy)
                     this.automationPrepared = false;
                 this.pause = ev.type === 'resume';
                 this.pauseReason = this.pause ? 'resume' : null;
@@ -26453,7 +26638,7 @@ class DownloadControl {
                 const tip = _Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_显示作品id和异常的文件名', msg.data.id, msg.data.browserSetFilename || '');
                 // 一个 id 可能产生多个文件，所以可能显示多条提示，这是正常的。不需要给 log 语句添加 key
                 _Log__WEBPACK_IMPORTED_MODULE_6__.log.warning(tip);
-                _MsgBox__WEBPACK_IMPORTED_MODULE_23__.msgBox.once(this.uuidTip, _Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_uuid'), 'show');
+                _MsgBox__WEBPACK_IMPORTED_MODULE_24__.msgBox.once(this.uuidTip, _Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_uuid'), 'show');
                 // 一旦检测到文件名异常，就会暂停下载
                 this.pauseDownload('filename-uuid');
             }
@@ -26515,7 +26700,7 @@ class DownloadControl {
             window.addEventListener(evt, () => {
                 // 如果有等待中的下载任务，则开始下载等待中的任务
                 if (_store_Store__WEBPACK_IMPORTED_MODULE_5__.store.waitingIdList.length === 0) {
-                    _Toast__WEBPACK_IMPORTED_MODULE_20__.toast.success(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_下载完毕'), {
+                    _Toast__WEBPACK_IMPORTED_MODULE_21__.toast.success(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_下载完毕'), {
                         position: 'center',
                     });
                     // 通知后台清除保存的此标签页的 idList
@@ -26566,7 +26751,7 @@ class DownloadControl {
     }
     createResultBtns() {
         // 只在 pixiv 上添加这些按钮
-        if (_utils_Utils__WEBPACK_IMPORTED_MODULE_21__.Utils.isPixiv()) {
+        if (_utils_Utils__WEBPACK_IMPORTED_MODULE_22__.Utils.isPixiv()) {
             // 导入抓取结果
             this.resultBtns.importJSON = _Tools__WEBPACK_IMPORTED_MODULE_4__.Tools.addBtn('exportResult', '_导入抓取结果', '', 'importCrawlResults', 'secondary', 'brand');
             // 导入抓取结果的按钮始终显示，因为它需要始终可用。
@@ -26592,11 +26777,11 @@ class DownloadControl {
     readyDownload(openPanel = true) {
         if ((0,_ManagedCrawlAutomation__WEBPACK_IMPORTED_MODULE_1__.managedCrawlBlocksDownload)())
             return;
-        if (_store_States__WEBPACK_IMPORTED_MODULE_18__.states.busy) {
+        if (_store_States__WEBPACK_IMPORTED_MODULE_19__.states.busy) {
             return;
         }
         if (_store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length === 0) {
-            return _ProgressBar__WEBPACK_IMPORTED_MODULE_11__.progressBar.reset(0);
+            return _ProgressBar__WEBPACK_IMPORTED_MODULE_12__.progressBar.reset(0);
         }
         if (_setting_Settings__WEBPACK_IMPORTED_MODULE_8__.settings.downloadUgoiraFirst) {
             _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.resultMeta.sort(_Tools__WEBPACK_IMPORTED_MODULE_4__.Tools.sortUgoiraFirst);
@@ -26610,16 +26795,16 @@ class DownloadControl {
         this.automationPrepared = true;
         // 是否自动开始下载
         // 在插画漫画搜索页面里，如果启用了“预览搜索页面的筛选结果”
-        if (_PageType__WEBPACK_IMPORTED_MODULE_22__.pageType.type === _PageType__WEBPACK_IMPORTED_MODULE_22__.pageType.list.ArtworkSearch &&
+        if (_PageType__WEBPACK_IMPORTED_MODULE_23__.pageType.type === _PageType__WEBPACK_IMPORTED_MODULE_23__.pageType.list.ArtworkSearch &&
             _setting_Settings__WEBPACK_IMPORTED_MODULE_8__.settings.previewResult) {
             // 对于普通下载任务，阻止自动下载
-            if (!_store_States__WEBPACK_IMPORTED_MODULE_18__.states.quickCrawl && !_store_States__WEBPACK_IMPORTED_MODULE_18__.states.crawlTagList) {
+            if (!_store_States__WEBPACK_IMPORTED_MODULE_19__.states.quickCrawl && !_store_States__WEBPACK_IMPORTED_MODULE_19__.states.crawlTagList) {
                 openPanel && _EVT__WEBPACK_IMPORTED_MODULE_3__.EVT.fire('openSettingsPanel');
                 return;
             }
         }
         // 处理快速下载任务
-        if (_store_States__WEBPACK_IMPORTED_MODULE_18__.states.quickCrawl || _store_States__WEBPACK_IMPORTED_MODULE_18__.states.crawlTagList) {
+        if (_store_States__WEBPACK_IMPORTED_MODULE_19__.states.quickCrawl || _store_States__WEBPACK_IMPORTED_MODULE_19__.states.crawlTagList) {
             if (_setting_Settings__WEBPACK_IMPORTED_MODULE_8__.settings.autoStartDownloadForQuickDownload) {
                 this.startDownload();
             }
@@ -26642,26 +26827,26 @@ class DownloadControl {
     startDownload() {
         if ((0,_ManagedCrawlAutomation__WEBPACK_IMPORTED_MODULE_1__.managedCrawlBlocksDownload)())
             return;
-        if (_store_States__WEBPACK_IMPORTED_MODULE_18__.states.busy) {
-            return _Toast__WEBPACK_IMPORTED_MODULE_20__.toast.error(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_当前任务尚未完成'));
+        if (_store_States__WEBPACK_IMPORTED_MODULE_19__.states.busy) {
+            return _Toast__WEBPACK_IMPORTED_MODULE_21__.toast.error(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_当前任务尚未完成'));
         }
         if (_store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length === 0) {
-            return _Toast__WEBPACK_IMPORTED_MODULE_20__.toast.error(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_没有可用的抓取结果'));
+            return _Toast__WEBPACK_IMPORTED_MODULE_21__.toast.error(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_没有可用的抓取结果'));
         }
         if (this.pause) {
             // 从上次中断的位置继续下载
             // 把“使用中”的下载状态重置为“未使用”
-            _DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.resume();
+            _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.resume();
         }
         else {
             // 如果之前没有暂停任务，也没有进入恢复模式，则重新下载
             // 初始化下载状态列表
-            _DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.init();
+            _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.init();
         }
         this.reset();
         this.taskBatch = Date.now(); // 修改本批下载任务的标记
         this.taskList = {}; // 重置下载任务列表
-        _MsgBox__WEBPACK_IMPORTED_MODULE_23__.msgBox.resetOnce(this.uuidTip);
+        _MsgBox__WEBPACK_IMPORTED_MODULE_24__.msgBox.resetOnce(this.uuidTip);
         this.setDownloaded();
         this.setDownloadThread();
         this.automationPrepared = true;
@@ -26672,11 +26857,11 @@ class DownloadControl {
                 this.createDownload(i);
             }, 0);
         }
-        _Toast__WEBPACK_IMPORTED_MODULE_20__.toast.show(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_开始下载'));
+        _Toast__WEBPACK_IMPORTED_MODULE_21__.toast.show(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_开始下载'));
         _Log__WEBPACK_IMPORTED_MODULE_6__.log.log(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_正在下载中'));
-        if (_Config__WEBPACK_IMPORTED_MODULE_19__.Config.mobile) {
+        if (_Config__WEBPACK_IMPORTED_MODULE_20__.Config.mobile) {
             _Log__WEBPACK_IMPORTED_MODULE_6__.log.warning(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_移动端浏览器可能不会建立文件夹的说明'));
-            if (_Config__WEBPACK_IMPORTED_MODULE_19__.Config.isFirefox) {
+            if (_Config__WEBPACK_IMPORTED_MODULE_20__.Config.isFirefox) {
                 _Log__WEBPACK_IMPORTED_MODULE_6__.log.warning(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_在移动版Firefox上提示无法可靠的批量下载'));
             }
         }
@@ -26700,7 +26885,7 @@ class DownloadControl {
         }
         if (this.pause === false) {
             // 如果正在下载中
-            if (_store_States__WEBPACK_IMPORTED_MODULE_18__.states.busy) {
+            if (_store_States__WEBPACK_IMPORTED_MODULE_19__.states.busy) {
                 this.pause = true;
                 this.pauseReason = reason;
                 _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.finishAll('download-paused');
@@ -26742,12 +26927,12 @@ class DownloadControl {
         }
     }
     setDownloaded() {
-        this.downloaded = _DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.downloadedCount();
+        this.downloaded = _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.downloadedCount();
         // 显示下载进度
         const text = `${this.downloaded} / ${_store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length}`;
         _Log__WEBPACK_IMPORTED_MODULE_6__.log.log('➡️' + text, 'downloadProgress');
         // 设置总下载进度条
-        _ProgressBar__WEBPACK_IMPORTED_MODULE_11__.progressBar.setTotalProgress(this.downloaded);
+        _ProgressBar__WEBPACK_IMPORTED_MODULE_12__.progressBar.setTotalProgress(this.downloaded);
         _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.remainingDownload = _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length - this.downloaded;
         // 所有文件正常下载完毕（跳过下载的文件也算正常下载）
         if (this.downloaded === _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length) {
@@ -26767,11 +26952,11 @@ class DownloadControl {
     setDownloadThread() {
         const setThread = _setting_Settings__WEBPACK_IMPORTED_MODULE_8__.settings.downloadThread;
         if (setThread < 1 ||
-            setThread > _Config__WEBPACK_IMPORTED_MODULE_19__.Config.downloadThreadMax ||
+            setThread > _Config__WEBPACK_IMPORTED_MODULE_20__.Config.downloadThreadMax ||
             isNaN(setThread)) {
             // 如果数值非法，则重设为默认值
-            this.thread = _Config__WEBPACK_IMPORTED_MODULE_19__.Config.downloadThreadMax;
-            (0,_setting_Settings__WEBPACK_IMPORTED_MODULE_8__.setSetting)('downloadThread', _Config__WEBPACK_IMPORTED_MODULE_19__.Config.downloadThreadMax);
+            this.thread = _Config__WEBPACK_IMPORTED_MODULE_20__.Config.downloadThreadMax;
+            (0,_setting_Settings__WEBPACK_IMPORTED_MODULE_8__.setSetting)('downloadThread', _Config__WEBPACK_IMPORTED_MODULE_20__.Config.downloadThreadMax);
         }
         else {
             this.thread = setThread; // 设置为用户输入的值
@@ -26781,16 +26966,16 @@ class DownloadControl {
             this.thread = _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length - this.downloaded;
         }
         // 重设下载进度条
-        _ProgressBar__WEBPACK_IMPORTED_MODULE_11__.progressBar.reset(this.thread, this.downloaded);
+        _ProgressBar__WEBPACK_IMPORTED_MODULE_12__.progressBar.reset(this.thread, this.downloaded);
     }
     async saveFileError(data) {
         if (this.pause || this.stop) {
             return false;
         }
-        await _utils_Utils__WEBPACK_IMPORTED_MODULE_21__.Utils.sleep(3000);
+        await _utils_Utils__WEBPACK_IMPORTED_MODULE_22__.Utils.sleep(3000);
         const task = this.taskList[data.id];
         // 复位这个任务的状态
-        _DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.setState(task.index, -1);
+        _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.setState(task.index, -1);
         // 建立下载任务，再次下载它
         this.createDownload(task.progressBarIndex);
     }
@@ -26798,7 +26983,7 @@ class DownloadControl {
         const task = this.taskList[data.id];
         try {
             // 更改这个任务状态为“已完成”
-            _DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.setState(task.index, 1);
+            _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.setState(task.index, 1);
             // 统计已下载数量
             this.setDownloaded();
             // 是否继续下载
@@ -26836,7 +27021,7 @@ class DownloadControl {
     }
     // 查找需要进行下载的作品，建立下载
     createDownload(progressBarIndex) {
-        const index = _DownloadStates__WEBPACK_IMPORTED_MODULE_12__.downloadStates.getFirstDownloadItem();
+        const index = _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.getFirstDownloadItem();
         if (index === undefined) {
             // 当已经没有需要下载的作品时，检查是否带着错误完成了下载
             // 如果下载过程中没有出错，就不会执行到这个分支
@@ -26864,14 +27049,14 @@ class DownloadControl {
     async checkCompleteWithError() {
         if (!this.pause &&
             !this.stop &&
-            _store_States__WEBPACK_IMPORTED_MODULE_18__.states.downloading &&
+            _store_States__WEBPACK_IMPORTED_MODULE_19__.states.downloading &&
             this.errorIdList.length > 0 &&
             this.downloaded + this.errorIdList.length === _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result.length) {
             // 进入暂停状态，等待一段时间后自动开始下载，重试下载出错的文件
             const taskBatch = this.taskBatch;
             this.pauseDownload('retry-errors');
             _Log__WEBPACK_IMPORTED_MODULE_6__.log.log(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_稍后会重试下载失败的文件'));
-            await _utils_Utils__WEBPACK_IMPORTED_MODULE_21__.Utils.sleep(2000);
+            await _utils_Utils__WEBPACK_IMPORTED_MODULE_22__.Utils.sleep(2000);
             // 用户/自动化暂停、停止或队列替换后，旧重试不能启动当前队列。
             if (this.pause &&
                 this.pauseReason === 'retry-errors' &&
@@ -26943,6 +27128,78 @@ new DownloadCountWarning();
 
 /***/ },
 
+/***/ "./src/ts/download/DownloadDiagnosticSnapshot.ts"
+/*!*******************************************************!*\
+  !*** ./src/ts/download/DownloadDiagnosticSnapshot.ts ***!
+  \*******************************************************/
+(__unused_webpack_module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   downloadQueueSnapshot: () => (/* binding */ downloadQueueSnapshot)
+/* harmony export */ });
+/* harmony import */ var _DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./DiagnosticSerialization */ "./src/ts/download/DiagnosticSerialization.ts");
+
+/** 仅在完整诊断时扫描队列；优先保留活动项，再保留最近项，不克隆整个队列。 */
+function downloadQueueSnapshot(states, tasks) {
+    const activeStates = [];
+    const recentStates = [];
+    const activeTasks = [];
+    const recentTasks = [];
+    let taskTotal = 0;
+    const counts = {
+        total: states.length,
+        pending: 0,
+        inProgress: 0,
+        completed: 0,
+    };
+    for (let index = 0; index < states.length; index++) {
+        const state = states[index];
+        if (state === -1)
+            counts.pending++;
+        else if (state === 0)
+            counts.inProgress++;
+        else if (state === 1)
+            counts.completed++;
+        if (state === 0 && activeStates.length < 120)
+            activeStates.push({ index, state });
+        else {
+            recentStates.push({ index, state });
+            if (recentStates.length > 120)
+                recentStates.shift();
+        }
+    }
+    for (const id in tasks) {
+        if (!Object.prototype.hasOwnProperty.call(tasks, id))
+            continue;
+        const task = tasks[id];
+        taskTotal++;
+        if (states[task.index] === 0 && activeTasks.length < 120) {
+            activeTasks.push({ id, ...task });
+        }
+        else {
+            recentTasks.push({ id, ...task });
+            if (recentTasks.length > 120)
+                recentTasks.shift();
+        }
+    }
+    const stateSample = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_0__.diagnosticSample)([...activeStates, ...recentStates], states.length, 12 * 1024);
+    const taskSample = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_0__.diagnosticSample)([...activeTasks, ...recentTasks.reverse()], taskTotal, 12 * 1024);
+    return {
+        downloadStateSummary: counts,
+        downloadStates: stateSample.items,
+        downloadStatesTotal: stateSample.total,
+        downloadStatesOmitted: stateSample.omitted,
+        taskList: taskSample.items,
+        taskListTotal: taskSample.total,
+        taskListOmitted: taskSample.omitted,
+    };
+}
+
+
+/***/ },
+
 /***/ "./src/ts/download/DownloadDiagnostics.ts"
 /*!************************************************!*\
   !*** ./src/ts/download/DownloadDiagnostics.ts ***!
@@ -26957,11 +27214,13 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ });
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! webextension-polyfill */ "../../PixivBatchDownloader/node_modules/webextension-polyfill/dist/browser-polyfill.js");
 /* harmony import */ var webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(webextension_polyfill__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var _DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./DiagnosticSerialization */ "./src/ts/download/DiagnosticSerialization.ts");
+
 
 /** 单个诊断阶段允许无进展的最长时间。 */
 const DOWNLOAD_DIAGNOSTIC_TIMEOUT_MS = 300000;
-/** 页面侧最近事件的最大保留数量。 */
-const EVENT_LIMIT = 240;
+/** 页面侧活动诊断的上限，防止生命周期遗漏形成无界记录与计时器。 */
+const ACTIVE_LIMIT = 256;
 /** 下载进度事件写入诊断环形缓冲区的最小间隔。 */
 const PROGRESS_EVENT_INTERVAL_MS = 30000;
 /** 有字节进展时刷新卡住计时器的最小间隔。 */
@@ -26978,6 +27237,10 @@ function isGetDownloadDiagnosticsMessage(msg) {
 class DownloadDiagnostics {
     /** 当前页面内诊断 id 的递增序号。 */
     sequence = 0;
+    /** 由于诊断容量限制而移除的任务数，不影响实际下载。 */
+    evictedTasks = 0;
+    /** 由于条数或字节限制而移除的历史事件数。 */
+    omittedEvents = 0;
     /** 当前仍在运行的页面侧下载诊断任务。 */
     active = new Map();
     /** 最近的页面侧诊断事件。 */
@@ -27010,11 +27273,18 @@ class DownloadDiagnostics {
     }
     /** 建立一个新的页面侧下载诊断任务。 */
     start(context) {
+        if (this.active.size >= ACTIVE_LIMIT) {
+            const oldest = this.active.keys().next().value;
+            this.clearWatchdog(oldest);
+            this.active.delete(oldest);
+            this.evictedTasks++;
+        }
         const diagnosticId = `${context.taskBatch}:${context.index}:${++this.sequence}`;
         const now = performance.now();
         const at = new Date().toISOString();
         this.active.set(diagnosticId, {
             ...context,
+            workId: (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(context.workId),
             diagnosticId,
             startedAt: at,
             startedMs: now,
@@ -27032,6 +27302,7 @@ class DownloadDiagnostics {
         const task = this.active.get(diagnosticId);
         if (!task)
             return;
+        stage = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(stage);
         const now = performance.now();
         task.stage = stage;
         task.stageAt = new Date().toISOString();
@@ -27044,7 +27315,7 @@ class DownloadDiagnostics {
         if (task.timeline.length > 32)
             task.timeline.shift();
         if (typeof details?.fileName === 'string')
-            task.fileName = details.fileName;
+            task.fileName = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(details.fileName);
         this.record(diagnosticId, stage, details);
         this.arm(diagnosticId);
     }
@@ -27059,7 +27330,7 @@ class DownloadDiagnostics {
         task.lastProgressAt = new Date().toISOString();
         task.lastProgressMs = now;
         if (fileName)
-            task.fileName = fileName;
+            task.fileName = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(fileName);
         if (task.lastWatchdogRefreshMs === undefined ||
             now - task.lastWatchdogRefreshMs >= WATCHDOG_REFRESH_INTERVAL_MS) {
             task.lastWatchdogRefreshMs = now;
@@ -27087,20 +27358,50 @@ class DownloadDiagnostics {
     }
     /** 把未知异常转换为可序列化的诊断信息。 */
     errorDetails(error) {
-        if (error && typeof error === 'object') {
-            const value = error;
-            return {
-                name: typeof value.name === 'string' ? value.name : 'Error',
-                message: typeof value.message === 'string' ? value.message : String(error),
-                stack: typeof value.stack === 'string' ? value.stack : undefined,
-            };
+        try {
+            if (error && typeof error === 'object') {
+                const value = error;
+                return (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)({
+                    name: typeof value.name === 'string' ? value.name : 'Error',
+                    message: typeof value.message === 'string' ? value.message : String(error),
+                    stack: typeof value.stack === 'string' ? value.stack : undefined,
+                });
+            }
+            return (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)({ name: 'Error', message: String(error) });
         }
-        return { name: 'Error', message: String(error) };
+        catch {
+            return { name: 'Error', message: '诊断异常信息不可读取' };
+        }
     }
     /** 同步捕获当前页面和下载控制器状态。 */
     pageSnapshot() {
         const now = performance.now();
-        return {
+        const tasks = this.active.values();
+        const active = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticSample)((function* () {
+            for (const task of tasks)
+                yield {
+                    ...task,
+                    startedMs: undefined,
+                    stageMs: undefined,
+                    lastProgressMs: undefined,
+                    lastProgressEventMs: undefined,
+                    lastWatchdogRefreshMs: undefined,
+                    elapsedMs: Math.round(now - task.startedMs),
+                    stageElapsedMs: Math.round(now - task.stageMs),
+                    lastProgressAgeMs: task.lastProgressMs === undefined
+                        ? undefined
+                        : Math.round(now - task.lastProgressMs),
+                };
+        })(), this.active.size);
+        const recent = (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticSample)(this.events.slice().reverse(), this.events.length);
+        let controller;
+        try {
+            controller = this.pageStateProvider();
+        }
+        catch {
+            controller = { unavailable: true };
+        }
+        return (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)({
             schemaVersion: 1,
             diagnosticsVersion: 'download-hang-v1',
             capturedAt: new Date().toISOString(),
@@ -27109,22 +27410,14 @@ class DownloadDiagnostics {
                 title: document.title,
                 visibilityState: document.visibilityState,
             },
-            controller: this.pageStateProvider(),
-            activeTasks: [...this.active.values()].map((task) => ({
-                ...task,
-                startedMs: undefined,
-                stageMs: undefined,
-                lastProgressMs: undefined,
-                lastProgressEventMs: undefined,
-                lastWatchdogRefreshMs: undefined,
-                elapsedMs: Math.round(now - task.startedMs),
-                stageElapsedMs: Math.round(now - task.stageMs),
-                lastProgressAgeMs: task.lastProgressMs === undefined
-                    ? undefined
-                    : Math.round(now - task.lastProgressMs),
-            })),
-            recentEvents: this.events.slice(),
-        };
+            controller,
+            activeTasks: active.items,
+            activeTasksTotal: active.total,
+            activeTasksOmitted: active.omitted,
+            evictedTasks: this.evictedTasks,
+            recentEvents: recent.items.reverse(),
+            recentEventsOmitted: this.omittedEvents + recent.omitted,
+        }, _DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.page);
     }
     /** 把固定的页面快照与异步 service worker 快照组合成诊断报告。 */
     async getReport(page = this.pageSnapshot()) {
@@ -27137,7 +27430,7 @@ class DownloadDiagnostics {
         catch (error) {
             worker = { unavailable: true, error: this.errorDetails(error) };
         }
-        return { ...page, worker };
+        return (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)({ ...page, worker }, _DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticLimits.report);
     }
     /** 向有界页面事件缓冲区追加一个诊断事件。 */
     record(diagnosticId, stage, details) {
@@ -27146,12 +27439,10 @@ class DownloadDiagnostics {
             at: new Date().toISOString(),
             elapsedMs: task ? Math.round(performance.now() - task.startedMs) : 0,
             diagnosticId,
-            stage,
-            details,
+            stage: (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticText)(stage),
+            details: details ? (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.diagnosticRecord)(details) : undefined,
         });
-        if (this.events.length > EVENT_LIMIT) {
-            this.events.splice(0, this.events.length - EVENT_LIMIT);
-        }
+        this.omittedEvents += (0,_DiagnosticSerialization__WEBPACK_IMPORTED_MODULE_1__.trimDiagnosticEvents)(this.events);
     }
     /** 为任务当前阶段启动或重置卡住看门狗。 */
     arm(diagnosticId) {
@@ -27181,10 +27472,10 @@ class DownloadDiagnostics {
     }
     /** 在阶段超时时先保留页面状态，再异步组合并持久化完整报告。 */
     async persistHangSnapshot(diagnosticId) {
-        const page = this.pageSnapshot();
-        this.writeFallbackSnapshot(page);
-        console.warn('[Powerful Pixiv Downloader] suspected download hang', page);
         try {
+            const page = this.pageSnapshot();
+            this.writeFallbackSnapshot(page);
+            console.warn('[Powerful Pixiv Downloader] suspected download hang', page);
             const report = await this.getReport(page);
             await webextension_polyfill__WEBPACK_IMPORTED_MODULE_0___default().runtime.sendMessage({
                 msg: 'record_download_hang_diagnostic',
@@ -27192,8 +27483,8 @@ class DownloadDiagnostics {
                 report,
             });
         }
-        catch (error) {
-            console.error('Unable to persist download hang diagnostics', error);
+        catch {
+            console.error('Unable to persist download hang diagnostics');
         }
     }
     /** 将页面侧回退快照写入 DOM，避免扩展消息链本身故障时丢失证据。 */

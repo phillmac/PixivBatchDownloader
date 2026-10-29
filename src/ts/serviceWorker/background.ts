@@ -6,6 +6,7 @@ import { DonwloadListData, SendToBackEndData } from '../download/DownloadType'
 import browser from 'webextension-polyfill'
 import { Config } from '../Config'
 import { downloadWorkerDiagnostics } from './DownloadWorkerDiagnostics'
+import { diagnosticRecord } from '../download/DiagnosticSerialization'
 
 // 当点击扩展图标时，显示/隐藏下载面板
 browser.action.onClicked.addListener(function (tab) {
@@ -70,19 +71,25 @@ async function persistDownloadWorkerIncident(
   reason: string,
   details: Record<string, unknown> = {}
 ) {
-  const worker = await downloadWorkerDiagnostics.snapshot(tabId, {
-    memoryBatchNo: batchNo[tabId],
-    memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
-  })
-  await downloadWorkerDiagnostics.persist(tabId, {
-    schemaVersion: 1,
-    diagnosticsVersion: 'download-hang-v1',
-    source: 'service-worker',
-    capturedAt: new Date().toISOString(),
-    reason,
-    details,
-    worker,
-  })
+  try {
+    const capturedDetails = diagnosticRecord(details)
+    const worker = await downloadWorkerDiagnostics.snapshot(tabId, {
+      memoryBatchNo: batchNo[tabId],
+      memoryIdListTotal: idList[tabId]?.length || 0,
+      memoryIdList: idList[tabId] || [],
+    })
+    await downloadWorkerDiagnostics.persist(tabId, {
+      schemaVersion: 2,
+      diagnosticsVersion: 'download-hang-v2-bounded',
+      source: 'service-worker',
+      capturedAt: new Date().toISOString(),
+      reason,
+      details: capturedDetails,
+      worker,
+    })
+  } catch {
+    console.warn('Unable to capture worker download diagnostics')
+  }
 }
 
 /** 全局下载租约协议使用的消息名称。 */
@@ -404,20 +411,28 @@ browser.runtime.onMessage.addListener(async function (
   if (isDownloadDiagnosticMessage(msg)) {
     if (msg.msg === 'get_download_worker_diagnostics') {
       if (tabId === undefined) return { unavailable: true, reason: 'no-tab-id' }
-      const stored = await browser.storage.local.get(['batchNo', 'idList'])
+      let stored: Record<string, unknown> = {}
+      let storedReadFailed = false
+      try {
+        stored = await browser.storage.local.get(['batchNo', 'idList'])
+      } catch {
+        storedReadFailed = true
+      }
       const storedBatchNo = stored.batchNo as batchNoType | undefined
       const storedIdList = stored.idList as idListType | undefined
       return downloadWorkerDiagnostics.snapshot(tabId, {
         memoryBatchNo: batchNo[tabId],
-        memoryIdList: idList[tabId] ? [...idList[tabId]] : [],
+        storedReadFailed,
+        memoryIdListTotal: idList[tabId]?.length || 0,
+        storedIdListTotal: storedIdList?.[tabId]?.length || 0,
+        memoryIdList: idList[tabId] || [],
         storedBatchNo: storedBatchNo?.[tabId],
-        storedIdList: storedIdList?.[tabId] ? [...storedIdList[tabId]] : [],
+        storedIdList: storedIdList?.[tabId] || [],
       })
     }
 
     if (tabId === undefined) return { stored: false, reason: 'no-tab-id' }
-    await downloadWorkerDiagnostics.persist(tabId, msg.report)
-    return { stored: true }
+    return downloadWorkerDiagnostics.persist(tabId, msg.report)
   }
 
   // msg 是 SendToBackEndData 类型，但是 webextension-polyfill 的 msg 是 unknown，
