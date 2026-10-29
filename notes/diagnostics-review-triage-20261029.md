@@ -76,7 +76,7 @@ new tests model competing Promise responses rather than merely asserting source 
 ### Final integrated validation
 
 After integrating merged distinct-overlap PR #24 and the roadmap, the combined
-candidate passed287/287 serial Node tests, TypeScript noEmit, webpack, packaging
+candidate passed 285/285 serial Node tests, TypeScript noEmit, webpack, packaging
 and git diff checks. The generated source-map conflict was resolved by rebuilding
 from merged TypeScript, not hand-editing generated output. ZIP/dist/source-worker
 bytes match for all six core bundles/workers. Runtime deployment remains pending.
