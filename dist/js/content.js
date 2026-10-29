@@ -25724,6 +25724,7 @@ class Download {
     }
     progressBarIndex;
     downloadStatesIndex;
+    /** 当前下载尝试的诊断身份，跨跳过事件和保存消息传递。 */
     diagnosticId;
     retry = 0; // 重试次数
     /** 全局下载租约丢失后的重启次数，防止多个慢请求无限互相抢占。 */
@@ -25739,14 +25740,20 @@ class Download {
     /** 跳过下载这个文件。可以传入用于提示的文本 */
     skipDownload(data, msg) {
         this.skip = true;
-        _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.finish(this.diagnosticId, 'skipped', {
+        _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.enter(this.diagnosticId, 'skip-advancement-pending', {
             reason: data.reason,
         });
         if (msg) {
             _Log__WEBPACK_IMPORTED_MODULE_2__.log.warning('🚫' + msg);
         }
         if (_store_States__WEBPACK_IMPORTED_MODULE_15__.states.downloading) {
-            _EVT__WEBPACK_IMPORTED_MODULE_1__.EVT.fire('skipDownload', data);
+            _EVT__WEBPACK_IMPORTED_MODULE_1__.EVT.fire('skipDownload', { ...data, diagnosticId: this.diagnosticId });
+        }
+        else {
+            // 下载已取消时不派发跳过事件，也不再期待控制器推进此尝试。
+            _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.finish(this.diagnosticId, 'skip-canceled', {
+                reason: data.reason,
+            });
         }
     }
     /** 在下载前检查一些过滤条件，以确认是否应该下载这个文件 */
@@ -25780,6 +25787,7 @@ class Download {
         // 检查通过，下载这个文件
         this.download(arg);
     }
+    /** 准备文件并交给原生保存流程；终止的尝试单独结束诊断。 */
     async download(arg) {
         const result = arg.result;
         // 获取文件名
@@ -25911,9 +25919,11 @@ class Download {
                 // 如果不需要转换会返回 null，此时继续使用 file
                 const convertResult = await this.convertUgoira(result, file, _fileName);
                 file = convertResult || file;
-                _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.enter(this.diagnosticId, 'conversion-complete', {
-                    blobBytes: file.size,
-                });
+                if (!this.error) {
+                    _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.enter(this.diagnosticId, 'conversion-complete', {
+                        blobBytes: file.size,
+                    });
+                }
                 const lastName = this.lastUgoiraFileName;
                 if (lastName && lastName !== _fileName) {
                     _fileName = lastName;
@@ -25963,6 +25973,10 @@ class Download {
                     _ProgressBar__WEBPACK_IMPORTED_MODULE_7__.progressBar.errorColor(this.progressBarIndex, true);
                     this.error = true;
                     _EVT__WEBPACK_IMPORTED_MODULE_1__.EVT.fire('downloadError', arg.id);
+                    // 原生错误处理已接管，此尝试不再发送保存消息。
+                    _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.finish(this.diagnosticId, 'global-lease-lost', {
+                        retry: this.leaseLossRetry,
+                    });
                     return;
                 }
                 return this.download(arg);
@@ -25987,11 +26001,18 @@ class Download {
             this.retry++;
             if (this.retry >= _Config__WEBPACK_IMPORTED_MODULE_13__.Config.retryMax) {
                 // 重试达到最大次数
-                _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.finish(this.diagnosticId, 'retry-max', {
+                _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.enter(this.diagnosticId, 'retry-max', {
                     status,
                     retry: this.retry,
                 });
                 this.afterReTryMax(status, arg.id);
+                // 404/500 走跳过事件，由控制器确认推进；其余分支已终止此尝试。
+                if (status !== 404 && status !== 500) {
+                    _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.finish(this.diagnosticId, 'retry-max', {
+                        status,
+                        retry: this.retry,
+                    });
+                }
             }
             else {
                 // 开始重试
@@ -26166,6 +26187,11 @@ class Download {
                     this.error = true;
                     // 转换动图出错时，只要出错 1 次就会暂时跳过它，等下载完其他文件再重试它
                     _EVT__WEBPACK_IMPORTED_MODULE_1__.EVT.fire('downloadError', result.id);
+                    // 转换异常已被消费，此尝试不会进入原生文件保存流程。
+                    _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_19__.downloadDiagnostics.finish(this.diagnosticId, 'conversion-error', {
+                        artworkId: result.idNum,
+                        format,
+                    });
                     file = null;
                 }
             }
@@ -26569,6 +26595,7 @@ class DownloadControl {
     isDownloadedMsg(msg) {
         return !!msg.msg;
     }
+    /** 绑定原生下载事件；仅在推进或重试交接成功后结束诊断。 */
     bindEvents() {
         window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_3__.EVT.list.crawlStart, () => {
             this.automationPrepared = false;
@@ -26605,7 +26632,12 @@ class DownloadControl {
         window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_3__.EVT.list.skipDownload, (ev) => {
             // 跳过下载的文件不会触发 downloadSuccess 事件
             const data = ev.detail.data;
-            this.downloadOrSkipAFile(data);
+            const advanced = this.downloadOrSkipAFile(data);
+            if (advanced && data.diagnosticId) {
+                _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.finish(data.diagnosticId, 'skipped', {
+                    reason: data.reason,
+                });
+            }
         });
         window.addEventListener(_EVT__WEBPACK_IMPORTED_MODULE_3__.EVT.list.downloadError, (ev) => {
             const id = ev.detail.data;
@@ -26687,7 +26719,7 @@ class DownloadControl {
             }
             else if (msg.msg === 'download_err') {
                 if (msg.data.diagnosticId) {
-                    _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.finish(msg.data.diagnosticId, 'page-download-error', { browserDownloadId: msg.data.browserDownloadId, error: msg.err });
+                    _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.enter(msg.data.diagnosticId, 'page-download-error', { browserDownloadId: msg.data.browserDownloadId, error: msg.err });
                 }
                 // 浏览器把文件保存到本地失败
                 // 用户操作导致下载取消的情况，跳过这个文件，不再重试保存它。触发条件如：
@@ -26695,7 +26727,10 @@ class DownloadControl {
                 // 用户让 IDM 转接这个下载时
                 if (msg.err === 'USER_CANCELED') {
                     _Log__WEBPACK_IMPORTED_MODULE_6__.log.error(_Language__WEBPACK_IMPORTED_MODULE_7__.lang.transl('_user_canceled_tip', _Tools__WEBPACK_IMPORTED_MODULE_4__.Tools.createWorkLink(msg.data.id), msg.err || 'unknown'));
-                    this.downloadOrSkipAFile(msg.data);
+                    const advanced = this.downloadOrSkipAFile(msg.data);
+                    if (advanced && msg.data.diagnosticId) {
+                        _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.finish(msg.data.diagnosticId, 'page-download-canceled', { browserDownloadId: msg.data.browserDownloadId, error: msg.err });
+                    }
                     return;
                 }
                 // 其他原因，下载器会重试保存这个文件
@@ -26706,7 +26741,12 @@ class DownloadControl {
                 _EVT__WEBPACK_IMPORTED_MODULE_3__.EVT.fire('saveFileError');
                 // 重新下载这个文件
                 // 但并不确定能否如预期一样重新下载这个文件
-                this.saveFileError(msg.data);
+                void this.saveFileError(msg.data).catch((error) => {
+                    console.error('重试保存文件失败', error);
+                    if (msg.data.diagnosticId) {
+                        _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.enter(msg.data.diagnosticId, 'page-save-retry-rejected', { error: _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.errorDetails(error) });
+                    }
+                });
             }
         });
         // 下载完成、抓取结果为空或托管抓取撤销写入权限后，推进等待任务
@@ -26987,16 +27027,28 @@ class DownloadControl {
         // 重设下载进度条
         _ProgressBar__WEBPACK_IMPORTED_MODULE_12__.progressBar.reset(this.thread, this.downloaded);
     }
+    /** 保持原生重试延迟，在新下载实例接管后才结束旧尝试的诊断。 */
     async saveFileError(data) {
         if (this.pause || this.stop) {
             return false;
+        }
+        if (data.diagnosticId) {
+            _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.enter(data.diagnosticId, 'page-save-retry-pending', {
+                browserDownloadId: data.browserDownloadId,
+            });
         }
         await _utils_Utils__WEBPACK_IMPORTED_MODULE_22__.Utils.sleep(3000);
         const task = this.taskList[data.id];
         // 复位这个任务的状态
         _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.setState(task.index, -1);
         // 建立下载任务，再次下载它
-        this.createDownload(task.progressBarIndex);
+        const started = this.createDownload(task.progressBarIndex);
+        if (started && data.diagnosticId) {
+            _DownloadDiagnostics__WEBPACK_IMPORTED_MODULE_10__.downloadDiagnostics.finish(data.diagnosticId, 'page-save-retry-started', {
+                browserDownloadId: data.browserDownloadId,
+            });
+        }
+        return started;
     }
     downloadOrSkipAFile(data) {
         const task = this.taskList[data.id];
@@ -27038,13 +27090,14 @@ class DownloadControl {
             return false;
         }
     }
-    // 查找需要进行下载的作品，建立下载
+    /** 查找并建立下载；返回是否已将任务交给新的 Download 实例。 */
     createDownload(progressBarIndex) {
         const index = _DownloadStates__WEBPACK_IMPORTED_MODULE_13__.downloadStates.getFirstDownloadItem();
         if (index === undefined) {
             // 当已经没有需要下载的作品时，检查是否带着错误完成了下载
             // 如果下载过程中没有出错，就不会执行到这个分支
-            return this.checkCompleteWithError();
+            this.checkCompleteWithError();
+            return false;
         }
         else {
             const workData = _store_Store__WEBPACK_IMPORTED_MODULE_5__.store.result[index];
@@ -27062,6 +27115,7 @@ class DownloadControl {
             };
             // 建立下载
             new _download_Download__WEBPACK_IMPORTED_MODULE_9__.Download(progressBarIndex, argument, index);
+            return true;
         }
     }
     // 在有下载出错的情况下，是否已经完成了下载

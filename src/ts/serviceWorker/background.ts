@@ -2,7 +2,11 @@ import { handleSettingPatch } from './SettingPersistence'
 import './CrawlRateCoordinator'
 import './ManageFollowing'
 import './CheckDownloadCount'
-import { DonwloadListData, SendToBackEndData } from '../download/DownloadType'
+import {
+  DonwloadListData,
+  DonwloadSuccessData,
+  SendToBackEndData,
+} from '../download/DownloadType'
 import browser from 'webextension-polyfill'
 import { Config } from '../Config'
 import { downloadWorkerDiagnostics } from './DownloadWorkerDiagnostics'
@@ -90,6 +94,64 @@ async function persistDownloadWorkerIncident(
   } catch {
     console.warn('Unable to capture worker download diagnostics')
   }
+}
+
+/** 跟踪结果消息的实际交付；不等待交付或诊断存储来清理原生下载账目。 */
+function deliverDownloadResult(
+  tabId: number,
+  result: {
+    msg: string
+    data: Pick<DonwloadSuccessData, 'id' | 'diagnosticId' | 'browserDownloadId'>
+    err: string
+  },
+  details: Record<string, unknown> = {}
+) {
+  const evidence = {
+    ...details,
+    workId: result.data.id,
+    diagnosticId: result.data.diagnosticId,
+    browserDownloadId: result.data.browserDownloadId,
+    resultMessage: result.msg,
+    nativeError: result.err,
+  }
+  downloadWorkerDiagnostics.enter(
+    tabId,
+    result.data.diagnosticId,
+    'result-message-pending',
+    evidence
+  )
+  browser.tabs.sendMessage(tabId, result).then(
+    () => {
+      downloadWorkerDiagnostics.finish(
+        tabId,
+        result.data.diagnosticId,
+        'result-message-resolved',
+        evidence
+      )
+    },
+    (error: unknown) => {
+      console.error('回发 downloaded 消息失败', error)
+      const rejected = { ...evidence, error: String(error) }
+      downloadWorkerDiagnostics.enter(
+        tabId,
+        result.data.diagnosticId,
+        'result-message-rejected',
+        rejected
+      )
+      // 快照在第一次 await 之前复制活动任务和事件，保留失败交付的证据。
+      void persistDownloadWorkerIncident(
+        tabId,
+        'result-message-rejected',
+        rejected
+      )
+      downloadWorkerDiagnostics.finish(
+        tabId,
+        result.data.diagnosticId,
+        'result-delivery-failed',
+        rejected
+      )
+    }
+  )
 }
 
 /** 全局下载租约协议使用的消息名称。 */
@@ -597,20 +659,13 @@ browser.runtime.onMessage.addListener(async function (
       },
       err: '',
     }
-    downloadWorkerDiagnostics.finish(
+    downloadWorkerDiagnostics.enter(
       tabId,
       msg.diagnosticId,
       'a-download-simulated-complete',
       { workId: msg.id, fileName: msg.fileName }
     )
-    browser.tabs.sendMessage(tabId, data).catch((error) => {
-      console.error('回发 downloaded 消息失败', error)
-      void persistDownloadWorkerIncident(tabId, 'result-message-rejected', {
-        workId: msg.id,
-        diagnosticId: msg.diagnosticId,
-        error: String(error),
-      })
-    })
+    deliverDownloadResult(tabId, data, { fileName: msg.fileName })
   }
 
   if (msg.msg === 'clearDownloadsTempData') {
@@ -687,7 +742,7 @@ if (!Config.downloadsAPIDisabled) {
 
       if (detail.state && detail.state.current === 'complete') {
         msg = 'downloaded'
-        downloadWorkerDiagnostics.finish(
+        downloadWorkerDiagnostics.enter(
           _dlData.tabId,
           _dlData.diagnosticId,
           'browser-download-complete',
@@ -701,7 +756,7 @@ if (!Config.downloadsAPIDisabled) {
       if (detail.error && detail.error.current) {
         msg = 'download_err'
         err = detail.error.current
-        downloadWorkerDiagnostics.finish(
+        downloadWorkerDiagnostics.enter(
           _dlData.tabId,
           _dlData.diagnosticId,
           'browser-download-error',
@@ -718,22 +773,18 @@ if (!Config.downloadsAPIDisabled) {
       if (msg) {
         // 返回信息
         if (!_dlData.noReply) {
-          browser.tabs
-            .sendMessage(_dlData.tabId, { msg, data: _dlData, err })
-            .catch((error) => {
-              console.error('回发 downloaded 消息失败', error)
-              void persistDownloadWorkerIncident(
-                _dlData.tabId,
-                'result-message-rejected',
-                {
-                  workId: _dlData.id,
-                  diagnosticId: _dlData.diagnosticId,
-                  browserDownloadId: detail.id,
-                  resultMessage: msg,
-                  error: String(error),
-                }
-              )
-            })
+          deliverDownloadResult(_dlData.tabId, { msg, data: _dlData, err })
+        } else {
+          downloadWorkerDiagnostics.finish(
+            _dlData.tabId,
+            _dlData.diagnosticId,
+            'result-not-required',
+            {
+              browserDownloadId: detail.id,
+              resultMessage: msg,
+              nativeError: err,
+            }
+          )
         }
 
         // 吊销前后台生成的 blob URL

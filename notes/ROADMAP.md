@@ -26,8 +26,8 @@ queue generations, pacing, resumable downloads and final membership checks.
 | ID | Work | Current status | Acceptance |
 | --- | --- | --- | --- |
 | PPBD-01 | Distinct known-overlap boundary | Merged source in #24; not deployed | Three repetitions of one ID must not stop discovery; tests across responses and unknown resets; preserve valid distinct overlap and exhaustion |
-| PPBD-02 | Diagnostic routing, byte budgets, immutable capture and tab identity | Candidate implemented/tested on this branch; not deployed | Competing unrelated listener cannot win replies; snapshots/storage bounded by bytes; captured timeline stable across await; equal per-tab IDs isolated |
-| PPBD-03 | Terminal diagnostic lifecycle audit | Pending triage | Conversion errors, skip advancement, worker delivery, retry handoff and lease loss each classified, tested and fixed or proven superseded |
+| PPBD-02 | Diagnostic routing, byte budgets, immutable capture and tab identity | Merged #25; source only, not deployed | Competing unrelated listener cannot win replies; snapshots/storage bounded by bytes; captured timeline stable across await; equal per-tab IDs isolated |
+| PPBD-03 | Terminal diagnostic lifecycle audit | Five-path candidate: 309 full tests pass; review/deployment pending | Conversion errors, skip advancement, worker delivery, retry handoff and lease loss each classified, tested and fixed or proven superseded |
 | PPBD-04 | Automated validation and paired release manifest | Recommended next | Standard test/typecheck/non-mutating-format scripts, CI, webpack/package and ZIP/dist/static-worker equality; explicit candidate/deployed provenance |
 | UPSTREAM-01 | Selective upstream sync | Open; latest upstream not reviewed here | Inspect commits individually and include only worthwhile compatible changes; no blanket merge |
 | SPA-22 | Search list-page/SPA navigation PR #22 | DEFERRED by user | Reproduce against current build in isolated/idle browser; do not mix into active bookmark work |
@@ -86,3 +86,14 @@ Node tests plus typecheck/build/package/worker parity. See
 [the nine-finding triage ledger](diagnostics-review-triage-20261029.md): four
 instrumentation issues addressed; five terminal lifecycle paths remain PPBD-03.
 Production stays on its existing release until a safe page-boundary deployment.
+
+
+### Review follow-through
+
+PPBD #25 merged as `628b8afc` after the exact-head hosted review completed clean;
+its four older PR #3 threads are resolved with merge/test evidence. The remaining
+five terminal paths now have a separate candidate and actual TypeScript VM
+regressions; see the lifecycle hardening note. Dotfiles #297 merged as `55c3cb7`
+after fixing Python-loader compatibility and nondeterministic inode-test setup;
+all seven matrix jobs pass. Old #168 remains open for unported progress logging.
+All these release statuses are source-only: no active EU browser/mover deployment.

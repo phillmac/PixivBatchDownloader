@@ -53,6 +53,7 @@ class Download {
 
   private progressBarIndex: number
   private downloadStatesIndex: number
+  /** 当前下载尝试的诊断身份，跨跳过事件和保存消息传递。 */
   private readonly diagnosticId: string
 
   private retry = 0 // 重试次数
@@ -72,14 +73,19 @@ class Download {
   /** 跳过下载这个文件。可以传入用于提示的文本 */
   private skipDownload(data: DonwloadSkipData, msg?: string) {
     this.skip = true
-    downloadDiagnostics.finish(this.diagnosticId, 'skipped', {
+    downloadDiagnostics.enter(this.diagnosticId, 'skip-advancement-pending', {
       reason: data.reason,
     })
     if (msg) {
       log.warning('🚫' + msg)
     }
     if (states.downloading) {
-      EVT.fire('skipDownload', data)
+      EVT.fire('skipDownload', { ...data, diagnosticId: this.diagnosticId })
+    } else {
+      // 下载已取消时不派发跳过事件，也不再期待控制器推进此尝试。
+      downloadDiagnostics.finish(this.diagnosticId, 'skip-canceled', {
+        reason: data.reason,
+      })
     }
   }
 
@@ -121,6 +127,7 @@ class Download {
     this.download(arg)
   }
 
+  /** 准备文件并交给原生保存流程；终止的尝试单独结束诊断。 */
   private async download(arg: downloadArgument): Promise<void> {
     const result = arg.result
     // 获取文件名
@@ -279,9 +286,11 @@ class Download {
         // 如果不需要转换会返回 null，此时继续使用 file
         const convertResult = await this.convertUgoira(result, file, _fileName)
         file = convertResult || file
-        downloadDiagnostics.enter(this.diagnosticId, 'conversion-complete', {
-          blobBytes: file.size,
-        })
+        if (!this.error) {
+          downloadDiagnostics.enter(this.diagnosticId, 'conversion-complete', {
+            blobBytes: file.size,
+          })
+        }
         const lastName = this.lastUgoiraFileName
         if (lastName && lastName !== _fileName) {
           _fileName = lastName
@@ -341,6 +350,10 @@ class Download {
           progressBar.errorColor(this.progressBarIndex, true)
           this.error = true
           EVT.fire('downloadError', arg.id)
+          // 原生错误处理已接管，此尝试不再发送保存消息。
+          downloadDiagnostics.finish(this.diagnosticId, 'global-lease-lost', {
+            retry: this.leaseLossRetry,
+          })
           return
         }
         return this.download(arg)
@@ -370,11 +383,18 @@ class Download {
 
       if (this.retry >= Config.retryMax) {
         // 重试达到最大次数
-        downloadDiagnostics.finish(this.diagnosticId, 'retry-max', {
+        downloadDiagnostics.enter(this.diagnosticId, 'retry-max', {
           status,
           retry: this.retry,
         })
         this.afterReTryMax(status, arg.id)
+        // 404/500 走跳过事件，由控制器确认推进；其余分支已终止此尝试。
+        if (status !== 404 && status !== 500) {
+          downloadDiagnostics.finish(this.diagnosticId, 'retry-max', {
+            status,
+            retry: this.retry,
+          })
+        }
       } else {
         // 开始重试
         return this.download(arg)
@@ -584,6 +604,11 @@ class Download {
           this.error = true
           // 转换动图出错时，只要出错 1 次就会暂时跳过它，等下载完其他文件再重试它
           EVT.fire('downloadError', result.id)
+          // 转换异常已被消费，此尝试不会进入原生文件保存流程。
+          downloadDiagnostics.finish(this.diagnosticId, 'conversion-error', {
+            artworkId: result.idNum,
+            format,
+          })
           file = null
         }
       }

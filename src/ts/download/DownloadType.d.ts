@@ -55,6 +55,8 @@ export interface DonwloadSuccessData {
 
 export interface DonwloadSkipData {
   id: string
+  /** 用于在控制器确认跳过推进后结束对应的诊断任务。 */
+  diagnosticId?: string
   type?: Result['type']
   reason:
     | 'duplicate'
