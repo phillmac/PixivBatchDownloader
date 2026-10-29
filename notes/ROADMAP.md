@@ -25,8 +25,8 @@ queue generations, pacing, resumable downloads and final membership checks.
 
 | ID | Work | Current status | Acceptance |
 | --- | --- | --- | --- |
-| PPBD-01 | Distinct known-overlap boundary | Confirmed bug; isolated implementation underway | Three repetitions of one ID must not stop discovery; tests across responses and unknown resets; preserve valid distinct overlap and exhaustion |
-| PPBD-02 | Diagnostic routing, byte budgets, immutable capture and tab identity | Targeted implementation underway | Competing unrelated listener cannot win replies; snapshots/storage bounded by bytes; captured timeline stable across await; equal per-tab IDs isolated |
+| PPBD-01 | Distinct known-overlap boundary | Merged source in #24; not deployed | Three repetitions of one ID must not stop discovery; tests across responses and unknown resets; preserve valid distinct overlap and exhaustion |
+| PPBD-02 | Diagnostic routing, byte budgets, immutable capture and tab identity | Candidate implemented/tested on this branch; not deployed | Competing unrelated listener cannot win replies; snapshots/storage bounded by bytes; captured timeline stable across await; equal per-tab IDs isolated |
 | PPBD-03 | Terminal diagnostic lifecycle audit | Pending triage | Conversion errors, skip advancement, worker delivery, retry handoff and lease loss each classified, tested and fixed or proven superseded |
 | PPBD-04 | Automated validation and paired release manifest | Recommended next | Standard test/typecheck/non-mutating-format scripts, CI, webpack/package and ZIP/dist/static-worker equality; explicit candidate/deployed provenance |
 | UPSTREAM-01 | Selective upstream sync | Open; latest upstream not reviewed here | Inspect commits individually and include only worthwhile compatible changes; no blanket merge |
@@ -75,3 +75,14 @@ acceptance in Dotfiles before deployment.
 October27 development record, not a current release gate or worktree pointer.
 Its archive commits remain recoverable. Existing accepted automation and progress
 watchdogs are the baseline; this roadmap asks for targeted hardening, not a rewrite.
+
+
+## 29 October delivery update
+
+Roadmap/handoff changes merged in PPBD #23 and Dotfiles #296. PPBD #24 fixes the
+distinct/replayed-overlap bug (271 tests before integration) and is source-merged,
+not deployed. The diagnostic candidate is integrated with it and passes 285 serial
+Node tests plus typecheck/build/package/worker parity. See
+[the nine-finding triage ledger](diagnostics-review-triage-20261029.md): four
+instrumentation issues addressed; five terminal lifecycle paths remain PPBD-03.
+Production stays on its existing release until a safe page-boundary deployment.

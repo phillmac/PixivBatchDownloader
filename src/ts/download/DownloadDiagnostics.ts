@@ -1,9 +1,16 @@
 import browser from 'webextension-polyfill'
+import {
+  diagnosticLimits,
+  diagnosticRecord,
+  diagnosticSample,
+  diagnosticText,
+  trimDiagnosticEvents,
+} from './DiagnosticSerialization'
 
 /** 单个诊断阶段允许无进展的最长时间。 */
 export const DOWNLOAD_DIAGNOSTIC_TIMEOUT_MS = 300000
-/** 页面侧最近事件的最大保留数量。 */
-const EVENT_LIMIT = 240
+/** 页面侧活动诊断的上限，防止生命周期遗漏形成无界记录与计时器。 */
+const ACTIVE_LIMIT = 256
 /** 下载进度事件写入诊断环形缓冲区的最小间隔。 */
 const PROGRESS_EVENT_INTERVAL_MS = 30000
 /** 有字节进展时刷新卡住计时器的最小间隔。 */
@@ -21,7 +28,7 @@ export interface DownloadDiagnosticContext {
 }
 
 /** 页面侧诊断事件。 */
-interface DiagnosticEvent {
+interface DiagnosticEvent extends Record<string, unknown> {
   at: string
   elapsedMs: number
   diagnosticId: string
@@ -72,6 +79,10 @@ function isGetDownloadDiagnosticsMessage(
 class DownloadDiagnostics {
   /** 当前页面内诊断 id 的递增序号。 */
   private sequence = 0
+  /** 由于诊断容量限制而移除的任务数，不影响实际下载。 */
+  private evictedTasks = 0
+  /** 由于条数或字节限制而移除的历史事件数。 */
+  private omittedEvents = 0
   /** 当前仍在运行的页面侧下载诊断任务。 */
   private readonly active = new Map<string, ActiveTask>()
   /** 最近的页面侧诊断事件。 */
@@ -109,11 +120,18 @@ class DownloadDiagnostics {
 
   /** 建立一个新的页面侧下载诊断任务。 */
   public start(context: DownloadDiagnosticContext) {
+    if (this.active.size >= ACTIVE_LIMIT) {
+      const oldest = this.active.keys().next().value!
+      this.clearWatchdog(oldest)
+      this.active.delete(oldest)
+      this.evictedTasks++
+    }
     const diagnosticId = `${context.taskBatch}:${context.index}:${++this.sequence}`
     const now = performance.now()
     const at = new Date().toISOString()
     this.active.set(diagnosticId, {
       ...context,
+      workId: diagnosticText(context.workId),
       diagnosticId,
       startedAt: at,
       startedMs: now,
@@ -135,6 +153,7 @@ class DownloadDiagnostics {
   ) {
     const task = this.active.get(diagnosticId)
     if (!task) return
+    stage = diagnosticText(stage)
     const now = performance.now()
     task.stage = stage
     task.stageAt = new Date().toISOString()
@@ -145,7 +164,8 @@ class DownloadDiagnostics {
       elapsedMs: Math.round(now - task.startedMs),
     })
     if (task.timeline.length > 32) task.timeline.shift()
-    if (typeof details?.fileName === 'string') task.fileName = details.fileName
+    if (typeof details?.fileName === 'string')
+      task.fileName = diagnosticText(details.fileName)
     this.record(diagnosticId, stage, details)
     this.arm(diagnosticId)
   }
@@ -164,7 +184,7 @@ class DownloadDiagnostics {
     task.total = total
     task.lastProgressAt = new Date().toISOString()
     task.lastProgressMs = now
-    if (fileName) task.fileName = fileName
+    if (fileName) task.fileName = diagnosticText(fileName)
 
     if (
       task.lastWatchdogRefreshMs === undefined ||
@@ -204,47 +224,76 @@ class DownloadDiagnostics {
 
   /** 把未知异常转换为可序列化的诊断信息。 */
   public errorDetails(error: unknown) {
-    if (error && typeof error === 'object') {
-      const value = error as Record<string, unknown>
-      return {
-        name: typeof value.name === 'string' ? value.name : 'Error',
-        message:
-          typeof value.message === 'string' ? value.message : String(error),
-        stack: typeof value.stack === 'string' ? value.stack : undefined,
+    try {
+      if (error && typeof error === 'object') {
+        const value = error as Record<string, unknown>
+        return diagnosticRecord({
+          name: typeof value.name === 'string' ? value.name : 'Error',
+          message:
+            typeof value.message === 'string' ? value.message : String(error),
+          stack: typeof value.stack === 'string' ? value.stack : undefined,
+        })
       }
+      return diagnosticRecord({ name: 'Error', message: String(error) })
+    } catch {
+      return { name: 'Error', message: '诊断异常信息不可读取' }
     }
-    return { name: 'Error', message: String(error) }
   }
 
   /** 同步捕获当前页面和下载控制器状态。 */
   public pageSnapshot() {
     const now = performance.now()
-    return {
-      schemaVersion: 1,
-      diagnosticsVersion: 'download-hang-v1',
-      capturedAt: new Date().toISOString(),
-      page: {
-        url: location.href,
-        title: document.title,
-        visibilityState: document.visibilityState,
-      },
-      controller: this.pageStateProvider(),
-      activeTasks: [...this.active.values()].map((task) => ({
-        ...task,
-        startedMs: undefined,
-        stageMs: undefined,
-        lastProgressMs: undefined,
-        lastProgressEventMs: undefined,
-        lastWatchdogRefreshMs: undefined,
-        elapsedMs: Math.round(now - task.startedMs),
-        stageElapsedMs: Math.round(now - task.stageMs),
-        lastProgressAgeMs:
-          task.lastProgressMs === undefined
-            ? undefined
-            : Math.round(now - task.lastProgressMs),
-      })),
-      recentEvents: this.events.slice(),
+    const tasks = this.active.values()
+    const active = diagnosticSample(
+      (function* () {
+        for (const task of tasks)
+          yield {
+            ...task,
+            startedMs: undefined,
+            stageMs: undefined,
+            lastProgressMs: undefined,
+            lastProgressEventMs: undefined,
+            lastWatchdogRefreshMs: undefined,
+            elapsedMs: Math.round(now - task.startedMs),
+            stageElapsedMs: Math.round(now - task.stageMs),
+            lastProgressAgeMs:
+              task.lastProgressMs === undefined
+                ? undefined
+                : Math.round(now - task.lastProgressMs),
+          }
+      })(),
+      this.active.size
+    )
+    const recent = diagnosticSample(
+      this.events.slice().reverse(),
+      this.events.length
+    )
+    let controller: Record<string, unknown>
+    try {
+      controller = this.pageStateProvider()
+    } catch {
+      controller = { unavailable: true }
     }
+    return diagnosticRecord(
+      {
+        schemaVersion: 2,
+        diagnosticsVersion: 'download-hang-v2-bounded',
+        capturedAt: new Date().toISOString(),
+        page: {
+          url: location.href,
+          title: document.title,
+          visibilityState: document.visibilityState,
+        },
+        controller,
+        activeTasks: active.items,
+        activeTasksTotal: active.total,
+        activeTasksOmitted: active.omitted,
+        evictedTasks: this.evictedTasks,
+        recentEvents: recent.items.reverse(),
+        recentEventsOmitted: this.omittedEvents + recent.omitted,
+      },
+      diagnosticLimits.page
+    )
   }
 
   /** 把固定的页面快照与异步 service worker 快照组合成诊断报告。 */
@@ -257,7 +306,7 @@ class DownloadDiagnostics {
     } catch (error) {
       worker = { unavailable: true, error: this.errorDetails(error) }
     }
-    return { ...page, worker }
+    return diagnosticRecord({ ...page, worker }, diagnosticLimits.report)
   }
 
   /** 向有界页面事件缓冲区追加一个诊断事件。 */
@@ -271,12 +320,10 @@ class DownloadDiagnostics {
       at: new Date().toISOString(),
       elapsedMs: task ? Math.round(performance.now() - task.startedMs) : 0,
       diagnosticId,
-      stage,
-      details,
+      stage: diagnosticText(stage),
+      details: details ? diagnosticRecord(details) : undefined,
     })
-    if (this.events.length > EVENT_LIMIT) {
-      this.events.splice(0, this.events.length - EVENT_LIMIT)
-    }
+    this.omittedEvents += trimDiagnosticEvents(this.events)
   }
 
   /** 为任务当前阶段启动或重置卡住看门狗。 */
@@ -306,18 +353,18 @@ class DownloadDiagnostics {
 
   /** 在阶段超时时先保留页面状态，再异步组合并持久化完整报告。 */
   private async persistHangSnapshot(diagnosticId: string) {
-    const page = this.pageSnapshot()
-    this.writeFallbackSnapshot(page)
-    console.warn('[Powerful Pixiv Downloader] suspected download hang', page)
     try {
+      const page = this.pageSnapshot()
+      this.writeFallbackSnapshot(page)
+      console.warn('[Powerful Pixiv Downloader] suspected download hang', page)
       const report = await this.getReport(page)
       await browser.runtime.sendMessage({
         msg: 'record_download_hang_diagnostic',
         diagnosticId,
         report,
       })
-    } catch (error) {
-      console.error('Unable to persist download hang diagnostics', error)
+    } catch {
+      console.error('Unable to persist download hang diagnostics')
     }
   }
 

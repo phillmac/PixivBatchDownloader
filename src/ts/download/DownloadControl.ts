@@ -16,6 +16,7 @@ import { lang } from '../Language'
 import { setSetting, settings } from '../setting/Settings'
 import { Download } from '../download/Download'
 import { downloadDiagnostics } from './DownloadDiagnostics'
+import { downloadQueueSnapshot } from './DownloadDiagnosticSnapshot'
 import { progressBar } from './ProgressBar'
 import { downloadStates } from './DownloadStates'
 import { ShowDownloadStates } from './ShowDownloadStates'
@@ -58,8 +59,7 @@ class DownloadControl {
       busy: states.busy,
       downloading: states.downloading,
       bookmarkMode: states.bookmarkMode,
-      downloadStates: [...downloadStates.states],
-      taskList: { ...this.taskList },
+      ...downloadQueueSnapshot(downloadStates.states, this.taskList),
     }))
     downloadDiagnostics.setAutomationStateProvider(() => ({
       remainingDownload: store.remainingDownload,

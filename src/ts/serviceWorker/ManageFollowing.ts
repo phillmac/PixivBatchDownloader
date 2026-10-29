@@ -25,66 +25,77 @@ class ManageFollowing {
     })
 
     browser.runtime.onMessage.addListener(
-      async (msg: unknown, sender: browser.Runtime.MessageSender) => {
-        if (!this.isMsg(msg)) {
-          return false
-        }
-
-        if (msg.msg === 'requestFollowingData') {
-          this.dispatchFollowingList(sender?.tab)
-        }
-
-        if (msg.msg === 'resetFollowingData') {
-          this.clearData()
-        }
-
-        if (msg.msg === 'needUpdateFollowingData') {
-          if (this.uploadStatus === 'locked') {
-            // 查询上次执行更新任务的标签页还是否存在，如果不存在，
-            // 则改为让这次发起请求的标签页执行更新任务
-            const tabs = await this.findAllPixivTab()
-            const find = tabs.find((tab) => tab.id === this.updateTaskTabID)
-            if (!find) {
-              this.updateTaskTabID = sender!.tab!.id!
-            } else {
-              // 如果上次执行更新任务的标签页依然存在，且状态锁定，则拒绝这次请求
-              return
-            }
-          } else {
-            this.updateTaskTabID = sender!.tab!.id!
-          }
-
-          this.uploadStatus = 'locked'
-
-          browser.tabs.sendMessage(this.updateTaskTabID, {
-            msg: 'updateFollowingData',
-          })
-        }
-
-        if (msg.msg === 'setFollowingData') {
-          // 当前台获取新的关注列表完成之后，会发送此消息。
-          // 如果发送消息的页面和发起请求的页面是同一个，则解除锁定状态
-          if (sender!.tab!.id === this.updateTaskTabID) {
-            this.uploadStatus = 'idle'
-          }
-          // 不管数据是否来自于发起请求的页面都更新数据。因为有些操作可能会直接更新数据，没有事先请求批准的环节
-
-          // set 操作不会被放入等待队列中，而且总是会被立即执行
-          // 这是因为在请求数据的过程中可能产生了其他操作，set 操作的数据可能已经是旧的了
-          // 所以需要先应用 set 里的数据，然后再执行其他操作，在旧数据的基础上进行修改
-          await this.setData(msg.data)
-
-          // 如果队列中没有等待的操作，则立即派发数据并储存数据
-          // 如果有等待的操作，则不派发和储存数据，因为稍后队列执行完毕后也会派发和储存数据
-          // 这是为了避免重复派发和储存数据，避免影响性能
-          if (this.queue.length === 0) {
-            this.dispatchFollowingList()
-            this.storage()
-          }
-        }
+      (msg: unknown, sender: browser.Runtime.MessageSender) => {
+        // 不处理的消息必须同步返回，否则 polyfill 会抢先用空 Promise 回应其他监听器。
+        if (!this.isMsg(msg)) return undefined
+        return this.handleMessage(msg, sender)
       }
     )
 
+    this.bindFollowingRequests()
+  }
+
+  /** 仅为关注列表消息保留异步处理与更新锁行为。 */
+  private async handleMessage(
+    msg: BackgroundMsg,
+    sender: browser.Runtime.MessageSender
+  ) {
+    if (msg.msg === 'requestFollowingData') {
+      this.dispatchFollowingList(sender?.tab)
+    }
+
+    if (msg.msg === 'resetFollowingData') {
+      this.clearData()
+    }
+
+    if (msg.msg === 'needUpdateFollowingData') {
+      if (this.uploadStatus === 'locked') {
+        // 查询上次执行更新任务的标签页还是否存在，如果不存在，
+        // 则改为让这次发起请求的标签页执行更新任务
+        const tabs = await this.findAllPixivTab()
+        const find = tabs.find((tab) => tab.id === this.updateTaskTabID)
+        if (!find) {
+          this.updateTaskTabID = sender!.tab!.id!
+        } else {
+          // 如果上次执行更新任务的标签页依然存在，且状态锁定，则拒绝这次请求
+          return
+        }
+      } else {
+        this.updateTaskTabID = sender!.tab!.id!
+      }
+
+      this.uploadStatus = 'locked'
+
+      browser.tabs.sendMessage(this.updateTaskTabID, {
+        msg: 'updateFollowingData',
+      })
+    }
+
+    if (msg.msg === 'setFollowingData') {
+      // 当前台获取新的关注列表完成之后，会发送此消息。
+      // 如果发送消息的页面和发起请求的页面是同一个，则解除锁定状态
+      if (sender!.tab!.id === this.updateTaskTabID) {
+        this.uploadStatus = 'idle'
+      }
+      // 不管数据是否来自于发起请求的页面都更新数据。因为有些操作可能会直接更新数据，没有事先请求批准的环节
+
+      // set 操作不会被放入等待队列中，而且总是会被立即执行
+      // 这是因为在请求数据的过程中可能产生了其他操作，set 操作的数据可能已经是旧的了
+      // 所以需要先应用 set 里的数据，然后再执行其他操作，在旧数据的基础上进行修改
+      await this.setData(msg.data)
+
+      // 如果队列中没有等待的操作，则立即派发数据并储存数据
+      // 如果有等待的操作，则不派发和储存数据，因为稍后队列执行完毕后也会派发和储存数据
+      // 这是为了避免重复派发和储存数据，避免影响性能
+      if (this.queue.length === 0) {
+        this.dispatchFollowingList()
+        this.storage()
+      }
+    }
+  }
+
+  /** 监听关注请求，并启动原有的队列与维护计时器。 */
+  private bindFollowingRequests() {
     // 监听用户新增或取消一个关注的请求
     // 由于某些逻辑相似，就添加到一个监听器里了
     browser.webRequest.onBeforeRequest.addListener(
@@ -209,9 +220,29 @@ class ManageFollowing {
     }
   }
 
-  // 收到消息时的类型守卫
-  private isMsg(msg: any): msg is BackgroundMsg {
-    return !!msg.msg
+  /** 只接受本模块实际处理的消息；忽略空值、畸形数据和其他模块的协议。 */
+  private isMsg(msg: unknown): msg is BackgroundMsg {
+    if (!msg || typeof msg !== 'object' || !('msg' in msg)) return false
+    if (
+      msg.msg === 'requestFollowingData' ||
+      msg.msg === 'resetFollowingData' ||
+      msg.msg === 'needUpdateFollowingData'
+    )
+      return true
+    if (msg.msg !== 'setFollowingData' || !('data' in msg)) return false
+    const data = msg.data
+    return (
+      !!data &&
+      typeof data === 'object' &&
+      'user' in data &&
+      typeof data.user === 'string' &&
+      'following' in data &&
+      Array.isArray(data.following) &&
+      'followedUsersInfo' in data &&
+      Array.isArray(data.followedUsersInfo) &&
+      'total' in data &&
+      typeof data.total === 'number'
+    )
   }
 
   /**向前台脚本派发数据
