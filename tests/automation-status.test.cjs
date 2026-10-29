@@ -3017,6 +3017,64 @@ test('descending bookmarks process the boundary-completing work before stopping'
   assert.deepEqual(Array.from(snapshot.boundaryIds), ['100', '99', '98'])
 })
 
+test('duplicate bookmark IDs retain later unknown works and independent filter order', async () => {
+  const h = crawlHarness()
+  const task = h.start(false)
+  const url = h.context.window.location.href
+  h.knownOverlap.configureKnownOverlap(url, ['101', '102', '103'], 3)
+  h.knownOverlap.startKnownOverlap(url)
+  let calls = 0
+  h.API.getBookmarkData = async () => ({
+    body: {
+      works:
+        ++calls === 1
+          ? ['101', '101', '101', '999'].map((id) => ({
+              id,
+              illustType: 0,
+            }))
+          : [],
+    },
+  })
+  const filtered = []
+  h.filter.check = async ({ id }) => {
+    filtered.push(id)
+    return id === '999'
+  }
+  const Class = h.load('crawlMixedPage/InitBookmarkPage.ts').InitBookmarkPage
+  const producer = Object.create(Class.prototype)
+  const finished = deferred()
+  Object.assign(producer, {
+    generation: task.generation,
+    type: 'illusts',
+    idList: [],
+    offset: 0,
+    isHide: false,
+    order: 'desc',
+    mode: 'all',
+    work_tag: '',
+    bm: '',
+    requsetNumber: 4,
+    onceRequest: 100,
+    filteredNumber: 0,
+  })
+  producer.getIdListFinished = () => finished.resolve()
+  producer.getIdList()
+  await finished.promise
+
+  assert.equal(calls, 2)
+  assert.deepEqual(filtered, ['101', '101', '101', '999'])
+  assert.deepEqual(
+    Array.from(h.store.idList, (item) => item.id),
+    ['999']
+  )
+  const snapshot = h.knownOverlap.getKnownOverlapSnapshot(url)
+  assert.equal(snapshot.boundaryReached, false)
+  assert.equal(snapshot.scannedCount, 4)
+  assert.equal(snapshot.knownSeenCount, 3)
+  assert.equal(snapshot.unknownCount, 1)
+  assert.equal(snapshot.stopReason, 'source-exhausted')
+})
+
 test('ascending bookmarks preserve known IDs and scan through them instead of early stopping', async () => {
   const h = crawlHarness()
   const task = h.start(false)
