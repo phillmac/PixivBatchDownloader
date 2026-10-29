@@ -2,7 +2,9 @@
 
 ## Scope and disposition
 
-This is a source candidate, **not deployed**. Baseline reviewed: `824256f9`.
+The four PPBD-02 fixes are source-merged in PR #25 (`628b8afc`), **not deployed**.
+The five PPBD-03 lifecycle fixes below are a separate tested source candidate.
+Original audit baseline: `824256f9`.
 The active EU reverse walk, its settings, downloads and checkpoint are unchanged.
 Both requested skip controls remain ON; the hourly continuation task stays disabled.
 
@@ -12,21 +14,22 @@ serially with `NODE_OPTIONS=--max-old-space-size=512` and `--test-concurrency=1`
 
 | Existing PR #3 finding | Current-source evidence | Disposition |
 | --- | --- | --- |
-| Competing following listener swallows worker reply | `ManageFollowing` used an async outer listener for unrelated `msg` objects | Fixed in candidate: synchronous exact-name routing; 4 tests cover delayed diagnostic reply, null/malformed payloads and native following reservation/set/reset |
-| Diagnostic snapshots/retention unbounded by bytes | Full controller arrays/task map and report count alone did not constrain serialized size | Fixed in candidate: sampled details plus totals, bounded deep copy, per-report/collection/retention byte budgets and bounded persistence backlog |
-| Captured timeline copied by reference | Page snapshot's task spread retained live nested timeline references | Fixed in candidate: bounded deep copy before worker await; mutation-during-await regression |
-| Global worker task IDs collide between tabs | Active map used only `taskBatch:index:sequence` | Fixed in candidate: worker map key includes tab ID; equal IDs in different tabs survive independent completion |
-| Conversion failure task never finishes | `Download.ts` conversion-error cancellation returns after conversion-complete without terminal finish | Confirmed static path remains; defer to PPBD-03 with a native conversion-error regression |
-| Skip diagnostics finished before advancement | `Download.skipDownload` finishes before `EVT.fire('skipDownload')` | Confirmed static path remains; need controller acknowledgement/error regression before changing lifecycle |
-| Worker task finishes before result delivery | `background.ts` finishes at browser-complete/error or simulated completion before sendMessage promise settles | Confirmed static path remains; test pending/rejected delivery, then retain task through handoff |
-| Error completion precedes retry/skip | `DownloadControl` calls finish in download_err before USER_CANCELED advance or delayed retry | Confirmed static path remains; test actual advancement failure and retry acknowledgement |
-| Terminal lease loss retains stale diagnostics | Lease retry-max records stage, raises downloadError, returns without finish | Confirmed static path remains; test terminal vs retry transitions and avoid hiding a real stalled handoff |
+| Competing following listener swallows worker reply | `ManageFollowing` used an async outer listener for unrelated `msg` objects | Merged in #25: synchronous exact-name routing; 4 tests cover delayed diagnostic reply, null/malformed payloads and native following reservation/set/reset |
+| Diagnostic snapshots/retention unbounded by bytes | Full controller arrays/task map and report count alone did not constrain serialized size | Merged in #25: sampled details plus totals, bounded deep copy, per-report/collection/retention byte budgets and bounded persistence backlog |
+| Captured timeline copied by reference | Page snapshot's task spread retained live nested timeline references | Merged in #25: bounded deep copy before worker await; mutation-during-await regression |
+| Global worker task IDs collide between tabs | Active map used only `taskBatch:index:sequence` | Merged in #25: worker map key includes tab ID; equal IDs in different tabs survive independent completion |
+| Conversion failure task never finishes | `Download.ts` conversion-error cancellation returns after conversion-complete without terminal finish | Fixed in PPBD-03 candidate: actual conversion failure/success/no-conversion paths tested |
+| Skip diagnostics finished before advancement | `Download.skipDownload` finishes before `EVT.fire('skipDownload')` | Fixed in PPBD-03 candidate: typed diagnosticId and controller advancement acknowledgement; false/throw/missing-listener tested |
+| Worker task finishes before result delivery | `background.ts` finishes at browser-complete/error or simulated completion before sendMessage promise settles | Fixed in PPBD-03 candidate: pending/resolved/rejected native and simulated delivery tested |
+| Error completion precedes retry/skip | `DownloadControl` calls finish in download_err before USER_CANCELED advance or delayed retry | Fixed in PPBD-03 candidate: canceled advance and delayed/rejected/no-task retry handoff tested |
+| Terminal lease loss retains stale diagnostics | Lease retry-max records stage, raises downloadError, returns without finish | Fixed in PPBD-03 candidate: terminal/nonterminal and throwing native handoff tested |
 
-Static confirmation is not a live-browser reproduction. None of these nine old
-review threads is marked resolved merely because this note exists. Resolve only
-with a merged regression-backed fix or evidence that the finding is superseded.
-The five terminal lifecycle findings deliberately remain a separate change, so
-this instrumentation pass does not casually rewrite native download progression.
+Static confirmation is not a live-browser reproduction. The four #25 threads were resolved only after their regression-backed merge.
+The remaining five are not resolved merely because this candidate note exists;
+resolve them only after an accepted merge or evidence of supersession.
+The five terminal lifecycle findings remain a separate scoped change. See
+[the lifecycle evidence](diagnostic-lifecycle-hardening-20261029.md) for exact
+completion rules and regressions.
 
 ## Bounded report contract
 

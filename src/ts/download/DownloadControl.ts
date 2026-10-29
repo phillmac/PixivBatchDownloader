@@ -145,6 +145,7 @@ class DownloadControl {
     return !!msg.msg
   }
 
+  /** 绑定原生下载事件；仅在推进或重试交接成功后结束诊断。 */
   private bindEvents() {
     window.addEventListener(EVT.list.crawlStart, () => {
       this.automationPrepared = false
@@ -183,7 +184,12 @@ class DownloadControl {
     window.addEventListener(EVT.list.skipDownload, (ev: CustomEventInit) => {
       // 跳过下载的文件不会触发 downloadSuccess 事件
       const data = ev.detail.data as DonwloadSkipData
-      this.downloadOrSkipAFile(data)
+      const advanced = this.downloadOrSkipAFile(data)
+      if (advanced && data.diagnosticId) {
+        downloadDiagnostics.finish(data.diagnosticId, 'skipped', {
+          reason: data.reason,
+        })
+      }
     })
 
     window.addEventListener(EVT.list.downloadError, (ev: CustomEventInit) => {
@@ -292,7 +298,7 @@ class DownloadControl {
         // console.log('downloaded', msg.data.id )
       } else if (msg.msg === 'download_err') {
         if (msg.data.diagnosticId) {
-          downloadDiagnostics.finish(
+          downloadDiagnostics.enter(
             msg.data.diagnosticId,
             'page-download-error',
             { browserDownloadId: msg.data.browserDownloadId, error: msg.err }
@@ -312,7 +318,14 @@ class DownloadControl {
             )
           )
 
-          this.downloadOrSkipAFile(msg.data)
+          const advanced = this.downloadOrSkipAFile(msg.data)
+          if (advanced && msg.data.diagnosticId) {
+            downloadDiagnostics.finish(
+              msg.data.diagnosticId,
+              'page-download-canceled',
+              { browserDownloadId: msg.data.browserDownloadId, error: msg.err }
+            )
+          }
           return
         }
 
@@ -332,7 +345,16 @@ class DownloadControl {
         EVT.fire('saveFileError')
         // 重新下载这个文件
         // 但并不确定能否如预期一样重新下载这个文件
-        this.saveFileError(msg.data)
+        void this.saveFileError(msg.data).catch((error: unknown) => {
+          console.error('重试保存文件失败', error)
+          if (msg.data.diagnosticId) {
+            downloadDiagnostics.enter(
+              msg.data.diagnosticId,
+              'page-save-retry-rejected',
+              { error: downloadDiagnostics.errorDetails(error) }
+            )
+          }
+        })
       }
     })
 
@@ -728,17 +750,29 @@ class DownloadControl {
     progressBar.reset(this.thread, this.downloaded)
   }
 
+  /** 保持原生重试延迟，在新下载实例接管后才结束旧尝试的诊断。 */
   private async saveFileError(data: DonwloadSuccessData) {
     if (this.pause || this.stop) {
       return false
     }
 
+    if (data.diagnosticId) {
+      downloadDiagnostics.enter(data.diagnosticId, 'page-save-retry-pending', {
+        browserDownloadId: data.browserDownloadId,
+      })
+    }
     await Utils.sleep(3000)
     const task = this.taskList[data.id]
     // 复位这个任务的状态
     downloadStates.setState(task.index, -1)
     // 建立下载任务，再次下载它
-    this.createDownload(task.progressBarIndex)
+    const started = this.createDownload(task.progressBarIndex)
+    if (started && data.diagnosticId) {
+      downloadDiagnostics.finish(data.diagnosticId, 'page-save-retry-started', {
+        browserDownloadId: data.browserDownloadId,
+      })
+    }
+    return started
   }
 
   private downloadOrSkipAFile(data: DonwloadSuccessData | DonwloadSkipData) {
@@ -783,13 +817,14 @@ class DownloadControl {
     }
   }
 
-  // 查找需要进行下载的作品，建立下载
+  /** 查找并建立下载；返回是否已将任务交给新的 Download 实例。 */
   private createDownload(progressBarIndex: number) {
     const index = downloadStates.getFirstDownloadItem()
     if (index === undefined) {
       // 当已经没有需要下载的作品时，检查是否带着错误完成了下载
       // 如果下载过程中没有出错，就不会执行到这个分支
-      return this.checkCompleteWithError()
+      this.checkCompleteWithError()
+      return false
     } else {
       const workData = store.result[index]
       const argument: downloadArgument = {
@@ -808,6 +843,7 @@ class DownloadControl {
 
       // 建立下载
       new Download(progressBarIndex, argument, index)
+      return true
     }
   }
 
