@@ -1,0 +1,37 @@
+name: Check npm packages for known compromises
+description: Check the locked dependency graph against the current Cobenian compromise list.
+inputs:
+  required-locks:
+    description: Tracked npm lockfiles which must exist, one relative path per line.
+    required: true
+  directory:
+    description: Checked-out project directory.
+    default: .
+  extra-packages:
+    description: Additional exact npm package@version pairs installed by CI, one per line.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Fetch package intelligence and check tracked npm locks
+      shell: bash
+      env:
+        REQUIRED_LOCKS: ${{ inputs.required-locks }}
+        SCAN_DIRECTORY: ${{ inputs.directory }}
+        EXTRA_PACKAGES: ${{ inputs.extra-packages }}
+      run: |
+        set -euo pipefail
+        feed=$(mktemp "$RUNNER_TEMP/npm-compromise.XXXXXX")
+        trap 'rm -f -- "$feed"' EXIT
+        curl --disable --fail --silent --show-error --proto '=https' \
+          --connect-timeout 10 --max-time 30 --retry 3 --retry-max-time 100 \
+          --max-filesize 8388608 --output "$feed" \
+          https://raw.githubusercontent.com/Cobenian/shai-hulud-detect/main/compromised-packages.txt
+        locks=()
+        while IFS= read -r path; do
+          if [[ -n "$path" ]]; then locks+=(--require-lock "$path"); fi
+        done <<< "$REQUIRED_LOCKS"
+        while IFS= read -r spec; do
+          if [[ -n "$spec" ]]; then locks+=(--package "$spec"); fi
+        done <<< "$EXTRA_PACKAGES"
+        python3 -I "$GITHUB_ACTION_PATH/scan.py" --feed "$feed" --root "$SCAN_DIRECTORY" "${locks[@]}"
