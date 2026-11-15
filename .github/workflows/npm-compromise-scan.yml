@@ -1,0 +1,37 @@
+name: npm compromise scan
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 20 * * *'
+  workflow_call:
+    inputs:
+      revision:
+        description: Exact revision the calling job will build.
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Check out the revision to scan
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+          persist-credentials: false
+      - name: Check locked npm versions
+        uses: phillmac/PixivBatchDownloader/.github/actions/npm-compromise-scan@302b9abd4987790d9b6c0122ab7d2b1b911bdfea
+        with:
+          required-locks: |
+            package-lock.json
+      - name: Exercise scanner regression fixtures
+        run: python3 -I -m unittest discover -s .github/actions/npm-compromise-scan -p 'test_*.py'
+      - name: Verify npm accepts the committed lock
+        run: npm ci --dry-run --ignore-scripts --no-audit --no-fund
